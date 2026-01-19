@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-search.json",
+  "title": "WA Robot Search Response",
+  "description": "Schema for the data field when calling 'wa robot search <query>'. Returns FTS search results.",
+  "type": "object",
+  "required": ["query", "results", "total_matches"],
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The FTS5 query that was executed"
+    },
+    "results": {
+      "type": "array",
+      "description": "Matching segments ordered by relevance (BM25)",
+      "items": {
+        "$ref": "#/$defs/search_result"
+      }
+    },
+    "total_matches": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of matches (may exceed returned results if limited)"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum results returned"
+    },
+    "pane_filter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "If set, results were filtered to this pane_id"
+    },
+    "time_filter": {
+      "type": "object",
+      "description": "If set, results were filtered to this time range",
+      "properties": {
+        "after": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) - results after this time"
+        },
+        "before": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) - results before this time"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "search_result": {
+      "type": "object",
+      "description": "A single search result with snippet and metadata",
+      "required": ["segment_id", "pane_id", "captured_at", "snippet"],
+      "properties": {
+        "segment_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique segment identifier"
+        },
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pane the segment was captured from"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sequence number within the pane"
+        },
+        "captured_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when the segment was captured"
+        },
+        "snippet": {
+          "type": "string",
+          "description": "Relevant portion of the segment with match highlights (FTS5 snippet)"
+        },
+        "bm25_score": {
+          "type": "number",
+          "description": "BM25 relevance score (lower is more relevant)"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

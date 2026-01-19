@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-send.json",
+  "title": "WA Robot Send Response",
+  "description": "Schema for the data field when calling 'wa robot send <pane_id> <text>'. Confirms text was sent.",
+  "type": "object",
+  "required": ["pane_id", "sent", "policy_decision"],
+  "properties": {
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The pane ID text was sent to"
+    },
+    "sent": {
+      "type": "boolean",
+      "description": "Whether the text was actually sent (false if dry_run or policy denied)"
+    },
+    "text_length": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Length of text that was sent (redacted content not counted)"
+    },
+    "policy_decision": {
+      "type": "string",
+      "enum": ["allow", "deny", "require_approval"],
+      "description": "The policy decision for this send action"
+    },
+    "policy_reason": {
+      "type": "string",
+      "description": "Explanation of the policy decision"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "True if this was a dry-run (no actual send occurred)"
+    },
+    "wait_for_result": {
+      "$ref": "#/$defs/wait_result",
+      "description": "If --wait-for was specified, the result of waiting for confirmation"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "wait_result": {
+      "type": "object",
+      "description": "Result of waiting for a condition after send",
+      "required": ["condition", "matched"],
+      "properties": {
+        "condition": {
+          "type": "string",
+          "description": "What was being waited for (e.g., 'prompt_boundary', pattern rule_id)"
+        },
+        "matched": {
+          "type": "boolean",
+          "description": "Whether the condition was satisfied"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Timeout that was used"
+        },
+        "waited_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How long the wait actually took"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-reserve.json",
+  "title": "WA Robot Reserve Response",
+  "description": "Schema for the data field when calling 'wa robot reserve <pane_id>'. Creates a pane reservation.",
+  "type": "object",
+  "required": ["pane_id", "reservation_id", "created"],
+  "properties": {
+    "pane_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The pane ID that was reserved"
+    },
+    "reservation_id": {
+      "type": "string",
+      "description": "Unique identifier for this reservation"
+    },
+    "created": {
+      "type": "boolean",
+      "description": "True if a new reservation was created, false if extended/renewed"
+    },
+    "owner_kind": {
+      "type": "string",
+      "enum": ["human", "robot", "mcp", "workflow"],
+      "description": "Type of actor making the reservation"
+    },
+    "owner_id": {
+      "type": "string",
+      "description": "Identifier of the reservation owner"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Reason provided for the reservation"
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Time-to-live in seconds"
+    },
+    "exclusive": {
+      "type": "boolean",
+      "description": "Whether this is an exclusive reservation"
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) when reservation expires"
+    },
+    "conflict": {
+      "$ref": "#/$defs/conflict_info",
+      "description": "Present if the reservation failed due to a conflict"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "conflict_info": {
+      "type": "object",
+      "description": "Details about a reservation conflict",
+      "required": ["existing_owner_kind", "existing_owner_id", "existing_expires_at"],
+      "properties": {
+        "existing_owner_kind": {
+          "type": "string",
+          "enum": ["human", "robot", "mcp", "workflow"]
+        },
+        "existing_owner_id": {
+          "type": "string"
+        },
+        "existing_reason": {
+          "type": "string"
+        },
+        "existing_expires_at": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

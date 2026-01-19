@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-list.json",
+  "title": "WA Robot Rules List Response",
+  "description": "Schema for the data field when calling 'wa robot rules list'. Lists pattern detection rules.",
+  "type": "object",
+  "required": ["packs", "total_rules"],
+  "properties": {
+    "packs": {
+      "type": "array",
+      "description": "Pattern packs and their rules",
+      "items": {
+        "$ref": "#/$defs/pack"
+      }
+    },
+    "total_rules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of rules across all packs"
+    },
+    "enabled_packs": {
+      "type": "array",
+      "description": "List of enabled pack IDs",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "pack": {
+      "type": "object",
+      "description": "A pattern pack containing detection rules",
+      "required": ["id", "name", "enabled", "rules"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Pack identifier (e.g., 'core.codex')"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable pack name"
+        },
+        "description": {
+          "type": "string",
+          "description": "Pack description"
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the pack is currently enabled"
+        },
+        "version": {
+          "type": "string",
+          "description": "Pack version"
+        },
+        "rules": {
+          "type": "array",
+          "description": "Rules in this pack",
+          "items": {
+            "$ref": "#/$defs/rule"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rule": {
+      "type": "object",
+      "description": "A pattern detection rule",
+      "required": ["id", "event_type", "severity"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Full rule ID (e.g., 'core.codex:usage_warning_25')"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Event type produced (e.g., 'usage.warning')"
+        },
+        "description": {
+          "type": "string",
+          "description": "What this rule detects"
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"]
+        },
+        "agent_type": {
+          "type": "string",
+          "enum": ["codex", "claude_code", "gemini", "wezterm", "any"],
+          "description": "Agent type this rule applies to"
+        },
+        "extracts": {
+          "type": "array",
+          "description": "Field names extracted by this rule",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

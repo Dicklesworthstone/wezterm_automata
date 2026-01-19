@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-reservations.json",
+  "title": "WA Robot Reservations Response",
+  "description": "Schema for the data field when calling 'wa robot reservations'. Lists pane reservations.",
+  "type": "object",
+  "required": ["reservations"],
+  "properties": {
+    "reservations": {
+      "type": "array",
+      "description": "Active reservations",
+      "items": {
+        "$ref": "#/$defs/reservation"
+      }
+    },
+    "pane_filter": {
+      "type": "integer",
+      "description": "If set, only reservations for this pane_id were returned"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "reservation": {
+      "type": "object",
+      "description": "A pane reservation",
+      "required": ["pane_id", "owner_kind", "owner_id", "created_at", "expires_at"],
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reserved pane ID"
+        },
+        "owner_kind": {
+          "type": "string",
+          "enum": ["human", "robot", "mcp", "workflow"],
+          "description": "Type of actor holding the reservation"
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Identifier of the reservation owner"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the pane was reserved (e.g., issue ID)"
+        },
+        "created_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when reservation was created"
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when reservation expires"
+        },
+        "exclusive": {
+          "type": "boolean",
+          "description": "True if this is an exclusive reservation"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-events.json",
+  "title": "WA Robot Events Response",
+  "description": "Schema for the data field when calling 'wa robot events'. Returns recent detected events.",
+  "type": "object",
+  "required": ["events"],
+  "properties": {
+    "events": {
+      "type": "array",
+      "description": "Recent events ordered by detection time (newest first)",
+      "items": {
+        "$ref": "#/$defs/event"
+      }
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum events returned"
+    },
+    "pane_filter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "If set, events were filtered to this pane_id"
+    },
+    "type_filter": {
+      "type": "string",
+      "description": "If set, events were filtered to this event_type"
+    },
+    "unhandled_only": {
+      "type": "boolean",
+      "description": "If true, only unhandled events were returned"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "event": {
+      "type": "object",
+      "description": "A detected event from pattern matching",
+      "required": ["id", "pane_id", "rule_id", "agent_type", "event_type", "severity", "detected_at"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique event identifier"
+        },
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pane where the event was detected"
+        },
+        "rule_id": {
+          "type": "string",
+          "description": "Pattern rule that matched (e.g., 'core.codex:usage_warning_25')"
+        },
+        "agent_type": {
+          "type": "string",
+          "enum": ["codex", "claude_code", "gemini", "wezterm", "unknown"],
+          "description": "Type of agent detected in the pane"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Category of event (e.g., 'usage.warning', 'session.compaction')"
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"],
+          "description": "Event severity level"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Detection confidence (0.0 to 1.0)"
+        },
+        "extracted": {
+          "type": "object",
+          "description": "Values extracted from the matched pattern (e.g., percentage, token counts)",
+          "additionalProperties": true
+        },
+        "matched_text": {
+          "type": "string",
+          "description": "The text that matched the pattern (may be redacted)"
+        },
+        "detected_at": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when the event was detected"
+        },
+        "handled_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when the event was handled (null if unhandled)"
+        },
+        "handled_by_workflow_id": {
+          "type": ["string", "null"],
+          "description": "ID of the workflow execution that handled this event"
+        },
+        "suggested_action": {
+          "type": "string",
+          "description": "Recommended action for this event type"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

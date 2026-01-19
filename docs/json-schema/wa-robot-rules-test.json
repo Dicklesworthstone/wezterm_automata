@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-test.json",
+  "title": "WA Robot Rules Test Response",
+  "description": "Schema for the data field when calling 'wa robot rules test <content>'. Tests pattern detection on input.",
+  "type": "object",
+  "required": ["input_length", "detections", "elapsed_us"],
+  "properties": {
+    "input_length": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Length of input content tested"
+    },
+    "detections": {
+      "type": "array",
+      "description": "All patterns that matched the input",
+      "items": {
+        "$ref": "#/$defs/detection"
+      }
+    },
+    "elapsed_us": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time taken for pattern detection in microseconds"
+    },
+    "quick_rejected": {
+      "type": "boolean",
+      "description": "True if the input was quick-rejected (no keywords found)"
+    },
+    "packs_tested": {
+      "type": "array",
+      "description": "Pack IDs that were tested",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "detection": {
+      "type": "object",
+      "description": "A pattern match result",
+      "required": ["rule_id", "event_type", "severity", "confidence"],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "description": "Full rule ID that matched"
+        },
+        "event_type": {
+          "type": "string",
+          "description": "Event type produced"
+        },
+        "agent_type": {
+          "type": "string",
+          "enum": ["codex", "claude_code", "gemini", "wezterm", "unknown"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "extracted": {
+          "type": "object",
+          "description": "Values extracted by the pattern",
+          "additionalProperties": true
+        },
+        "matched_span": {
+          "type": "object",
+          "description": "Where in the input the pattern matched",
+          "properties": {
+            "start": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "end": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "match_time_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Time taken for this specific rule in microseconds"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

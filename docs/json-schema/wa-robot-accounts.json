@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-accounts.json",
+  "title": "WA Robot Accounts Response",
+  "description": "Schema for the data field when calling 'wa robot accounts'. Lists AI coding service accounts and their usage.",
+  "type": "object",
+  "required": ["accounts", "last_refresh"],
+  "properties": {
+    "accounts": {
+      "type": "array",
+      "description": "All configured accounts",
+      "items": {
+        "$ref": "#/$defs/account"
+      }
+    },
+    "last_refresh": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Unix timestamp (ms) of last caut refresh (null if never refreshed)"
+    },
+    "selected_account": {
+      "type": "string",
+      "description": "Currently selected account ID for automatic failover"
+    },
+    "selection_reason": {
+      "type": "string",
+      "description": "Why this account was selected (e.g., 'highest percent remaining')"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "account": {
+      "type": "object",
+      "description": "A configured AI service account",
+      "required": ["id", "service", "status"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique account identifier"
+        },
+        "service": {
+          "type": "string",
+          "enum": ["openai", "anthropic", "google"],
+          "description": "The AI service provider"
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable account label"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["available", "at_limit", "auth_required", "disabled", "unknown"],
+          "description": "Current account status"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage_info",
+          "description": "Usage information (if available)"
+        },
+        "last_used_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when this account was last used"
+        },
+        "auth_expires_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when authentication expires"
+        }
+      },
+      "additionalProperties": false
+    },
+    "usage_info": {
+      "type": "object",
+      "description": "Account usage details",
+      "properties": {
+        "percent_remaining": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Percentage of quota remaining"
+        },
+        "limit_type": {
+          "type": "string",
+          "description": "Type of limit (e.g., '20h', 'tokens', 'requests')"
+        },
+        "resets_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Unix timestamp (ms) when usage resets"
+        },
+        "current_usage": {
+          "type": "string",
+          "description": "Human-readable current usage (e.g., '15h used of 20h')"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
