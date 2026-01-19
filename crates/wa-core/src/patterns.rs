@@ -690,7 +690,7 @@ impl PatternEngine {
         #[cfg(test)]
         {
             let match_count = matcher.find_overlapping_iter(text).count();
-            eprintln!("detect: Aho-Corasick found {} matches in text", match_count);
+            eprintln!("detect: Aho-Corasick found {match_count} matches in text");
         }
 
         // Use find_overlapping_iter to detect all anchors, including ones that overlap
@@ -1327,40 +1327,7 @@ mod tests {
     fn detect_gemini_usage_reached() {
         let engine = PatternEngine::new();
         let text = "Usage limit reached for all Pro models. Please wait before continuing.";
-
-        // Debug: check if the rule exists
-        let gemini_rules: Vec<_> = engine.rules().iter()
-            .filter(|r| r.id.starts_with("gemini."))
-            .collect();
-        eprintln!("Gemini rules: {gemini_rules:?}");
-
-        // Check if the anchor is present
-        let target_anchor = "Usage limit reached for all Pro models";
-        eprintln!("Target anchor present in anchor_list: {}", engine.anchor_list.contains(&target_anchor.to_string()));
-        eprintln!("Target anchor present in anchor_to_rules: {:?}", engine.anchor_to_rules.get(target_anchor));
-
-        // Debug: test the Aho-Corasick matcher directly (with overlapping iteration)
-        if let Some(matcher) = engine.anchor_matcher.as_ref() {
-            eprintln!("Matcher patterns count: {}", matcher.patterns_len());
-            let matches: Vec<_> = matcher.find_overlapping_iter(text).collect();
-            eprintln!("Aho-Corasick matches (overlapping): {matches:?}");
-            for m in &matches {
-                eprintln!("  Match pattern {} at {}..{}: {:?}",
-                    m.pattern().as_usize(),
-                    m.start(), m.end(),
-                    engine.anchor_list.get(m.pattern().as_usize()));
-            }
-        } else {
-            eprintln!("No anchor matcher!");
-        }
-
-        // Debug: check quick_reject
-        let quick_ok = engine.quick_reject(text);
-        eprintln!("quick_reject result: {quick_ok}");
-
         let detections = engine.detect(text);
-        eprintln!("Detections: {detections:?}");
-
         let detection = detections.iter().find(|d| d.rule_id == "gemini.usage.reached");
         assert!(detection.is_some(), "Should match gemini.usage.reached");
         assert_eq!(detection.unwrap().severity, Severity::Critical);

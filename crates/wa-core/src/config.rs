@@ -787,9 +787,7 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 // Provide a fallback for dirs crate
 mod dirs {
     pub fn home_dir() -> Option<std::path::PathBuf> {
-        std::env::var("HOME")
-            .ok()
-            .map(std::path::PathBuf::from)
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
     }
 }
 
