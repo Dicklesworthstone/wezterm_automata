@@ -43,6 +43,93 @@ use tokio::sync::broadcast;
 
 use crate::patterns::Detection;
 
+/// Payload for user-var events received via IPC from shell hooks.
+///
+/// WezTerm allows setting user-defined variables via OSC 1337, which
+/// shell hooks use to signal events like command start/end.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserVarPayload {
+    /// Raw value (typically base64-encoded JSON)
+    pub value: String,
+    /// Decoded event type, if parsing succeeded
+    pub event_type: Option<String>,
+    /// Decoded event data, if parsing succeeded
+    pub event_data: Option<serde_json::Value>,
+}
+
+impl UserVarPayload {
+    /// Attempt to decode the value as base64-encoded JSON.
+    ///
+    /// # Arguments
+    /// * `value` - The raw value string (typically base64-encoded JSON)
+    /// * `lenient` - If true, returns Ok with partial data on decode failures
+    ///
+    /// # Errors
+    /// Returns `UserVarError::ParseFailed` if decoding fails and `lenient` is false.
+    pub fn decode(value: &str, lenient: bool) -> Result<Self, UserVarError> {
+        use base64::Engine;
+
+        let mut payload = Self {
+            value: value.to_string(),
+            event_type: None,
+            event_data: None,
+        };
+
+        // Try to decode as base64
+        match base64::engine::general_purpose::STANDARD.decode(value) {
+            Ok(bytes) => {
+                match String::from_utf8(bytes) {
+                    Ok(json_str) => {
+                        match serde_json::from_str::<serde_json::Value>(&json_str) {
+                            Ok(data) => {
+                                payload.event_type =
+                                    data.get("type").and_then(|v| v.as_str()).map(String::from);
+                                payload.event_data = Some(data);
+                            }
+                            Err(e) if !lenient => {
+                                return Err(UserVarError::ParseFailed(format!("invalid JSON: {e}")));
+                            }
+                            Err(_) => {} // lenient mode - continue with partial data
+                        }
+                    }
+                    Err(e) if !lenient => {
+                        return Err(UserVarError::ParseFailed(format!("invalid UTF-8: {e}")));
+                    }
+                    Err(_) => {} // lenient mode - continue with raw value
+                }
+            }
+            Err(e) if !lenient => {
+                return Err(UserVarError::ParseFailed(format!("invalid base64: {e}")));
+            }
+            Err(_) => {} // lenient mode - continue with raw value
+        }
+
+        Ok(payload)
+    }
+}
+
+/// Errors that can occur when processing user-var events.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum UserVarError {
+    /// Watcher daemon is not running
+    #[error("watcher daemon is not running (socket: {socket_path})")]
+    WatcherNotRunning {
+        /// Path to the IPC socket that wasn't found
+        socket_path: String,
+    },
+
+    /// Failed to send event to watcher via IPC
+    #[error("failed to send event via IPC: {message}")]
+    IpcSendFailed {
+        /// Error message describing what failed
+        message: String,
+    },
+
+    /// Failed to parse user-var payload
+    #[error("failed to parse user-var payload: {0}")]
+    ParseFailed(String),
+}
+
 /// Event types that flow through the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -58,7 +145,12 @@ pub enum Event {
     GapDetected { pane_id: u64, reason: String },
 
     /// Pattern detected
-    PatternDetected { pane_id: u64, detection: Detection },
+    PatternDetected {
+        pane_id: u64,
+        detection: Detection,
+        /// Storage event ID (if persisted), for marking as handled by workflows
+        event_id: Option<i64>,
+    },
 
     /// Pane discovered
     PaneDiscovered {
@@ -90,6 +182,14 @@ pub enum Event {
         success: bool,
         reason: Option<String>,
     },
+
+    /// User-var event received via IPC from shell hook
+    UserVarReceived {
+        pane_id: u64,
+        /// Variable name (e.g., "WA_EVENT")
+        name: String,
+        payload: UserVarPayload,
+    },
 }
 
 impl Event {
@@ -105,6 +205,7 @@ impl Event {
             Self::WorkflowStarted { .. } => "workflow_started",
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
+            Self::UserVarReceived { .. } => "user_var_received",
         }
     }
 
@@ -117,7 +218,8 @@ impl Event {
             | Self::PatternDetected { pane_id, .. }
             | Self::PaneDiscovered { pane_id, .. }
             | Self::PaneDisappeared { pane_id }
-            | Self::WorkflowStarted { pane_id, .. } => Some(*pane_id),
+            | Self::WorkflowStarted { pane_id, .. }
+            | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
             Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
         }
     }
@@ -312,7 +414,8 @@ impl EventBus {
             | Event::PaneDisappeared { .. }
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
-            | Event::WorkflowCompleted { .. } => {
+            | Event::WorkflowCompleted { .. }
+            | Event::UserVarReceived { .. } => {
                 self.send_routed(event, &self.signal_sender, &self.signal_times)
             }
         };
@@ -653,6 +756,7 @@ mod tests {
         let _ = bus.publish(Event::PatternDetected {
             pane_id: 1,
             detection,
+            event_id: None,
         });
 
         let event = detection_sub.recv().await.unwrap();
