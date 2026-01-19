@@ -2033,8 +2033,13 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
                 trigger_event_id: row.get(3)?,
                 current_step: {
                     let val: i64 = row.get(4)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val as usize
+                    usize::try_from(val).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            4,
+                            "current_step".to_string(),
+                            rusqlite::types::Type::Integer,
+                        )
+                    })?
                 },
                 status: row.get(5)?,
                 wait_condition,
@@ -2851,7 +2856,10 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let snippet = results[0].snippet.as_ref().expect("Should have snippet");
-        assert!(snippet.contains("[[error]]"), "Snippet should contain highlighted term: {}", snippet);
+        assert!(
+            snippet.contains("[[error]]"),
+            "Snippet should contain highlighted term: {snippet}"
+        );
     }
 
     #[test]
