@@ -50,3 +50,6 @@ temp/
 # Generated documentation (build on demand)
 doc/
 .ntm/
+
+# E2E test artifacts (runtime)
+e2e-artifacts/
