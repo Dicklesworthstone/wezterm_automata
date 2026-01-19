@@ -258,6 +258,8 @@ pub struct PaneCursor {
     pub last_hash: Option<u64>,
     /// Whether we're in a known gap state
     pub in_gap: bool,
+    /// Whether we're currently in alternate screen buffer
+    pub in_alt_screen: bool,
 }
 
 impl PaneCursor {
@@ -270,12 +272,20 @@ impl PaneCursor {
             last_snapshot: String::new(),
             last_hash: None,
             in_gap: false,
+            in_alt_screen: false,
         }
     }
 
     /// Process a new pane snapshot and return a captured segment if something changed.
     ///
     /// This assigns a monotonically increasing per-pane sequence number (`seq`).
+    ///
+    /// # Gap Detection
+    ///
+    /// Gaps are detected in the following scenarios:
+    /// 1. **Overlap failure**: Delta extraction couldn't find matching content
+    /// 2. **Alt-screen toggle**: Detected `ESC[?1049h/l` or `ESC[?47h/l` sequences
+    ///    indicating the terminal switched between normal and alternate screen buffers
     pub fn capture_snapshot(
         &mut self,
         current_snapshot: &str,
@@ -287,11 +297,53 @@ impl PaneCursor {
 
         let current_hash = hash_text(current_snapshot);
 
+        // Check for alt-screen changes before delta extraction
+        let alt_screen_changes = detect_alt_screen_changes(current_snapshot);
+        let had_alt_screen_change = !alt_screen_changes.is_empty();
+
+        // Update alt-screen tracking based on final state
+        for change in &alt_screen_changes {
+            match change {
+                AltScreenChange::Entered => self.in_alt_screen = true,
+                AltScreenChange::Exited => self.in_alt_screen = false,
+            }
+        }
+
         let delta = extract_delta(&self.last_snapshot, current_snapshot, overlap_size);
 
         // Update snapshot state regardless; capture is derived from these snapshots.
         self.last_snapshot = current_snapshot.to_string();
         self.last_hash = Some(current_hash);
+
+        // If alt-screen changed, force a gap even if delta extraction succeeded
+        // because the content relationship is broken
+        if had_alt_screen_change {
+            self.in_gap = true;
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.saturating_add(1);
+
+            let reason = if alt_screen_changes
+                .last()
+                .is_some_and(|c| *c == AltScreenChange::Entered)
+            {
+                "alt_screen_entered".to_string()
+            } else {
+                "alt_screen_exited".to_string()
+            };
+
+            let content = match delta {
+                DeltaResult::Content(c) => c,
+                DeltaResult::NoChange => String::new(),
+                DeltaResult::Gap { content, .. } => content,
+            };
+
+            return Some(CapturedSegment {
+                pane_id: self.pane_id,
+                seq,
+                content,
+                kind: CapturedSegmentKind::Gap { reason },
+            });
+        }
 
         match delta {
             DeltaResult::NoChange => None,
@@ -796,6 +848,15 @@ impl ShellState {
     pub fn is_command_running(&self) -> bool {
         matches!(self, Self::CommandRunning)
     }
+
+    /// Check if the shell is idle (at prompt, ready for commands, not running anything)
+    ///
+    /// This is equivalent to `is_at_prompt()` but with a name that better conveys
+    /// the "nothing happening, ready for input" semantics.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.is_at_prompt()
+    }
 }
 
 /// Per-pane state tracker for OSC 133 markers.
@@ -1001,6 +1062,7 @@ pub enum AltScreenChange {
 /// A vector of alt-screen changes in order of occurrence. Multiple changes
 /// can occur if a program rapidly enters and exits alternate screen.
 #[must_use]
+#[allow(clippy::items_after_statements)]
 pub fn detect_alt_screen_changes(text: &str) -> Vec<AltScreenChange> {
     use memchr::memmem;
 
@@ -1841,5 +1903,135 @@ mod tests {
 
         assert_eq!(state.state, ShellState::CommandRunning);
         assert_eq!(state.markers_seen, 3);
+    }
+
+    // =========================================================================
+    // Alt-Screen Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn detect_alt_screen_enter_1049() {
+        // DECSET 1049 - most common alternate screen sequence
+        let changes = detect_alt_screen_changes("\x1b[?1049h");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0], AltScreenChange::Entered);
+    }
+
+    #[test]
+    fn detect_alt_screen_exit_1049() {
+        let changes = detect_alt_screen_changes("\x1b[?1049l");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0], AltScreenChange::Exited);
+    }
+
+    #[test]
+    fn detect_alt_screen_enter_47() {
+        // DECSET 47 - older alternate screen sequence
+        let changes = detect_alt_screen_changes("\x1b[?47h");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0], AltScreenChange::Entered);
+    }
+
+    #[test]
+    fn detect_alt_screen_exit_47() {
+        let changes = detect_alt_screen_changes("\x1b[?47l");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0], AltScreenChange::Exited);
+    }
+
+    #[test]
+    fn detect_alt_screen_embedded_in_text() {
+        // vim startup: clears screen, enters alt screen, then displays content
+        let text = "some output\x1b[?1049hvim content here";
+        let changes = detect_alt_screen_changes(text);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0], AltScreenChange::Entered);
+    }
+
+    #[test]
+    fn detect_alt_screen_multiple_transitions() {
+        // Rapidly entering and exiting (e.g., quick peek with less then quit)
+        let text = "before\x1b[?1049hcontent\x1b[?1049lafter";
+        let changes = detect_alt_screen_changes(text);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0], AltScreenChange::Entered);
+        assert_eq!(changes[1], AltScreenChange::Exited);
+    }
+
+    #[test]
+    fn has_alt_screen_change_positive() {
+        assert!(has_alt_screen_change("\x1b[?1049h"));
+        assert!(has_alt_screen_change("\x1b[?1049l"));
+        assert!(has_alt_screen_change("\x1b[?47h"));
+        assert!(has_alt_screen_change("\x1b[?47l"));
+        assert!(has_alt_screen_change("text\x1b[?1049hmore"));
+    }
+
+    #[test]
+    fn has_alt_screen_change_negative() {
+        assert!(!has_alt_screen_change(""));
+        assert!(!has_alt_screen_change("hello world"));
+        assert!(!has_alt_screen_change("\x1b[H")); // cursor home, not alt screen
+        assert!(!has_alt_screen_change("\x1b[2J")); // clear screen, not alt screen
+    }
+
+    #[test]
+    fn cursor_detects_alt_screen_enter_as_gap() {
+        let mut cursor = PaneCursor::new(1);
+        assert!(!cursor.in_alt_screen);
+
+        // Initial content
+        let seg0 = cursor
+            .capture_snapshot("$ ls\nfile1\nfile2\n", 1024)
+            .expect("first capture");
+        assert_eq!(seg0.kind, CapturedSegmentKind::Delta);
+
+        // Simulate entering vim (alt screen)
+        let seg1 = cursor
+            .capture_snapshot("$ ls\nfile1\nfile2\n\x1b[?1049hvim window", 1024)
+            .expect("alt screen capture");
+
+        // Should be detected as a gap
+        assert!(matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_entered"));
+        assert!(cursor.in_alt_screen);
+        assert!(cursor.in_gap);
+    }
+
+    #[test]
+    fn cursor_detects_alt_screen_exit_as_gap() {
+        let mut cursor = PaneCursor::new(1);
+
+        // Start in alt screen
+        cursor.in_alt_screen = true;
+
+        let _seg0 = cursor
+            .capture_snapshot("vim content", 1024)
+            .expect("first capture in alt screen");
+
+        // Exit vim (alt screen exit)
+        let seg1 = cursor
+            .capture_snapshot("vim content\x1b[?1049l$ ", 1024)
+            .expect("alt screen exit capture");
+
+        assert!(matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_exited"));
+        assert!(!cursor.in_alt_screen);
+    }
+
+    #[test]
+    fn cursor_tracks_alt_screen_state() {
+        let mut cursor = PaneCursor::new(1);
+        assert!(!cursor.in_alt_screen);
+
+        // Enter alt screen
+        cursor.capture_snapshot("\x1b[?1049hcontent", 1024);
+        assert!(cursor.in_alt_screen);
+
+        // Still in alt screen
+        cursor.capture_snapshot("\x1b[?1049hcontent update", 1024);
+        assert!(cursor.in_alt_screen);
+
+        // Exit alt screen
+        cursor.capture_snapshot("\x1b[?1049hcontent update\x1b[?1049l$ prompt", 1024);
+        assert!(!cursor.in_alt_screen);
     }
 }

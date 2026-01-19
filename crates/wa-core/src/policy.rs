@@ -192,18 +192,30 @@ impl ActorKind {
 
 /// Pane capability snapshot for policy evaluation
 ///
-/// This is a minimal stub. Full implementation in wa-4vx.8.8 will derive
-/// these from OSC 133 markers, alt-screen detection, and heuristics.
+/// This provides deterministic state about a pane for policy decisions.
+/// Capabilities are derived from:
+/// - OSC 133 markers (shell integration for prompt/command state)
+/// - Alt-screen detection (ESC[?1049h/l sequences)
+/// - Gap detection (capture discontinuities)
+///
+/// # Safety Behavior
+///
+/// When `alt_screen` is `None` (unknown), policy should default to deny or
+/// require approval for `SendText` actions, since we cannot safely determine
+/// if input is appropriate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PaneCapabilities {
-    /// Whether a shell prompt is currently active
+    /// Whether a shell prompt is currently active (from OSC 133)
     pub prompt_active: bool,
-    /// Whether a command is currently running
+    /// Whether a command is currently running (from OSC 133)
     pub command_running: bool,
     /// Whether the pane is in alternate screen mode (vim, less, etc.)
-    pub alt_screen: bool,
-    /// Whether there's a recent capture gap
+    /// - `Some(true)` - confidently detected alt-screen active
+    /// - `Some(false)` - confidently detected normal screen
+    /// - `None` - unknown state (should trigger conservative policy)
+    pub alt_screen: Option<bool>,
+    /// Whether there's a recent capture gap (cleared after verified prompt boundary)
     pub has_recent_gap: bool,
     /// Whether the pane is reserved by another workflow
     pub is_reserved: bool,
@@ -212,11 +224,12 @@ pub struct PaneCapabilities {
 }
 
 impl PaneCapabilities {
-    /// Create capabilities for a pane with an active prompt
+    /// Create capabilities for a pane with an active prompt (normal screen)
     #[must_use]
     pub fn prompt() -> Self {
         Self {
             prompt_active: true,
+            alt_screen: Some(false),
             ..Default::default()
         }
     }
@@ -226,6 +239,7 @@ impl PaneCapabilities {
     pub fn running() -> Self {
         Self {
             command_running: true,
+            alt_screen: Some(false),
             ..Default::default()
         }
     }
@@ -234,6 +248,73 @@ impl PaneCapabilities {
     #[must_use]
     pub fn unknown() -> Self {
         Self::default()
+    }
+
+    /// Create capabilities for alt-screen mode (vim, less, htop, etc.)
+    #[must_use]
+    pub fn alt_screen() -> Self {
+        Self {
+            alt_screen: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// Check if we have confident knowledge of the pane state
+    ///
+    /// Returns false if alt_screen is unknown, meaning policy should be conservative.
+    #[must_use]
+    pub fn is_state_known(&self) -> bool {
+        self.alt_screen.is_some()
+    }
+
+    /// Check if it's safe to send input (prompt active, not in alt-screen, no recent gap)
+    ///
+    /// This is a convenience method for common policy checks.
+    #[must_use]
+    pub fn is_input_safe(&self) -> bool {
+        self.prompt_active
+            && !self.command_running
+            && self.alt_screen == Some(false)
+            && !self.has_recent_gap
+            && !self.is_reserved
+    }
+
+    /// Mark that a verified prompt boundary was seen (clears recent_gap)
+    pub fn clear_gap_on_prompt(&mut self) {
+        if self.prompt_active {
+            self.has_recent_gap = false;
+        }
+    }
+
+    /// Derive capabilities from ingest state
+    ///
+    /// This combines signals from:
+    /// - OSC 133 markers (shell state)
+    /// - Cursor state (alt-screen, gap)
+    ///
+    /// # Arguments
+    ///
+    /// * `osc_state` - OSC 133 marker state (or None if not tracked)
+    /// * `in_alt_screen` - Whether the pane is in alt-screen mode (from cursor)
+    /// * `in_gap` - Whether there's an unresolved capture gap
+    #[must_use]
+    pub fn from_ingest_state(
+        osc_state: Option<&crate::ingest::Osc133State>,
+        in_alt_screen: Option<bool>,
+        in_gap: bool,
+    ) -> Self {
+        let (prompt_active, command_running) = osc_state.map_or((false, false), |state| {
+            (state.state.is_at_prompt(), state.state.is_command_running())
+        });
+
+        Self {
+            prompt_active,
+            command_running,
+            alt_screen: in_alt_screen,
+            has_recent_gap: in_gap,
+            is_reserved: false,
+            reserved_by: None,
+        }
     }
 }
 
@@ -2107,5 +2188,156 @@ mod tests {
         let redacted = engine.redact_secrets(text);
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("sk-abc"));
+    }
+
+    // ========================================================================
+    // PaneCapabilities Tests
+    // ========================================================================
+
+    #[test]
+    fn pane_capabilities_prompt_is_input_safe() {
+        let caps = PaneCapabilities::prompt();
+        assert!(caps.prompt_active);
+        assert!(!caps.command_running);
+        assert_eq!(caps.alt_screen, Some(false));
+        assert!(caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_running_is_not_input_safe() {
+        let caps = PaneCapabilities::running();
+        assert!(!caps.prompt_active);
+        assert!(caps.command_running);
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_unknown_alt_screen_is_not_safe() {
+        let caps = PaneCapabilities::unknown();
+        assert!(!caps.is_state_known());
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_alt_screen_is_not_input_safe() {
+        let caps = PaneCapabilities::alt_screen();
+        assert_eq!(caps.alt_screen, Some(true));
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_gap_prevents_input() {
+        let mut caps = PaneCapabilities::prompt();
+        caps.has_recent_gap = true;
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_reservation_prevents_input() {
+        let mut caps = PaneCapabilities::prompt();
+        caps.is_reserved = true;
+        caps.reserved_by = Some("other_workflow".to_string());
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_clear_gap_on_prompt() {
+        let mut caps = PaneCapabilities::prompt();
+        caps.has_recent_gap = true;
+        assert!(caps.has_recent_gap);
+
+        caps.clear_gap_on_prompt();
+        assert!(!caps.has_recent_gap);
+    }
+
+    #[test]
+    fn pane_capabilities_clear_gap_requires_prompt() {
+        let mut caps = PaneCapabilities::running();
+        caps.has_recent_gap = true;
+
+        caps.clear_gap_on_prompt();
+        // Gap not cleared because not at prompt
+        assert!(caps.has_recent_gap);
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_at_prompt() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::PromptActive;
+
+        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(false), false);
+
+        assert!(caps.prompt_active);
+        assert!(!caps.command_running);
+        assert_eq!(caps.alt_screen, Some(false));
+        assert!(!caps.has_recent_gap);
+        assert!(caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_command_running() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::CommandRunning;
+
+        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(false), false);
+
+        assert!(!caps.prompt_active);
+        assert!(caps.command_running);
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_with_gap() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::PromptActive;
+
+        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(false), true);
+
+        assert!(caps.prompt_active);
+        assert!(caps.has_recent_gap);
+        assert!(!caps.is_input_safe()); // Gap prevents safe input
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_alt_screen() {
+        use crate::ingest::Osc133State;
+
+        let osc_state = Osc133State::new();
+
+        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(true), false);
+
+        assert_eq!(caps.alt_screen, Some(true));
+        assert!(!caps.is_input_safe());
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_unknown_alt_screen() {
+        use crate::ingest::{Osc133State, ShellState};
+
+        let mut osc_state = Osc133State::new();
+        osc_state.state = ShellState::PromptActive;
+
+        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), None, false);
+
+        assert!(caps.prompt_active);
+        assert_eq!(caps.alt_screen, None);
+        assert!(!caps.is_state_known());
+        assert!(!caps.is_input_safe()); // Unknown alt-screen is not safe
+    }
+
+    #[test]
+    fn pane_capabilities_from_ingest_state_no_osc() {
+        let caps = PaneCapabilities::from_ingest_state(None, Some(false), false);
+
+        assert!(!caps.prompt_active);
+        assert!(!caps.command_running);
+        assert_eq!(caps.alt_screen, Some(false));
+        assert!(!caps.is_input_safe()); // No prompt active
     }
 }
