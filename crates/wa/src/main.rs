@@ -284,11 +284,7 @@ async fn main() -> anyhow::Result<()> {
                 RobotCommands::State => {
                     // TODO: Implement state command
                     let response: RobotResponse<Vec<wa_core::wezterm::PaneInfo>> =
-                        RobotResponse::error(
-                            "Not yet implemented",
-                            None,
-                            elapsed_ms(start),
-                        );
+                        RobotResponse::error("Not yet implemented", None, elapsed_ms(start));
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
                 RobotCommands::GetText { pane_id } => {
@@ -313,7 +309,9 @@ async fn main() -> anyhow::Result<()> {
                     timeout,
                 } => {
                     let response: RobotResponse<()> = RobotResponse::error(
-                        format!("wait-for on pane {pane_id} for rule {rule_id} (timeout {timeout}ms) not yet implemented"),
+                        format!(
+                            "wait-for on pane {pane_id} for rule {rule_id} (timeout {timeout}ms) not yet implemented"
+                        ),
                         None,
                         elapsed_ms(start),
                     );
