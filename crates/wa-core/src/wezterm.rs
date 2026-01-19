@@ -330,6 +330,7 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 200;
 /// - `NotRunning`: wezterm process not running
 /// - `PaneNotFound`: specified pane ID doesn't exist
 /// - `Timeout`: command took too long
+#[derive(Clone)]
 pub struct WeztermClient {
     /// Optional socket path override (WEZTERM_UNIX_SOCKET)
     socket_path: Option<String>,

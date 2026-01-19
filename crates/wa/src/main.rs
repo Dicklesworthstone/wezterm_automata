@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use wa_core::logging::{LogConfig, LogError, init_logging};
 
 /// WezTerm Automata - Terminal hypervisor for AI agents
 #[derive(Parser)]
@@ -43,6 +43,14 @@ enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(long)]
         foreground: bool,
+
+        /// Discovery poll interval in milliseconds
+        #[arg(long, default_value = "5000")]
+        poll_interval: u64,
+
+        /// Disable pattern detection
+        #[arg(long)]
+        no_patterns: bool,
     },
 
     /// Robot mode commands (JSON I/O)
@@ -294,6 +302,64 @@ struct RobotCommandInfo {
     description: &'static str,
 }
 
+/// Pane state for CLI output (list and robot state commands)
+#[derive(serde::Serialize)]
+struct PaneState {
+    pane_id: u64,
+    tab_id: u64,
+    window_id: u64,
+    domain: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    observed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ignore_reason: Option<String>,
+}
+
+impl PaneState {
+    fn from_pane_info(
+        info: &wa_core::wezterm::PaneInfo,
+        filter: &wa_core::config::PaneFilterConfig,
+    ) -> Self {
+        let domain = info.inferred_domain();
+        let title = info.title.clone().unwrap_or_default();
+        let cwd = info.cwd.clone().unwrap_or_default();
+
+        let ignore_reason = filter.check_pane(&domain, &title, &cwd);
+
+        Self {
+            pane_id: info.pane_id,
+            tab_id: info.tab_id,
+            window_id: info.window_id,
+            domain,
+            title: info.title.clone(),
+            cwd: info.cwd.clone(),
+            observed: ignore_reason.is_none(),
+            ignore_reason,
+        }
+    }
+
+    fn format_human(&self) -> String {
+        let status = if self.observed {
+            "observed"
+        } else {
+            "ignored"
+        };
+        let reason = self
+            .ignore_reason
+            .as_ref()
+            .map(|r| format!(" ({})", r))
+            .unwrap_or_default();
+        let title = self.title.as_deref().unwrap_or("(untitled)");
+        let cwd = self.cwd.as_deref().unwrap_or("(unknown)");
+
+        format!(
+            "  {:>4}  {:>10}  {:<20}  {:<40}  {}{}",
+            self.pane_id, status, title, cwd, self.domain, reason
+        )
+    }
+}
+
 fn redact_for_output(text: &str) -> String {
     static REDACTOR: LazyLock<wa_core::policy::Redactor> =
         LazyLock::new(wa_core::policy::Redactor::new);
@@ -408,14 +474,10 @@ struct RobotContext {
 }
 
 fn build_robot_context(
-    config_path: Option<&str>,
-    workspace: Option<&str>,
+    config: &wa_core::config::Config,
+    workspace_root: &Path,
 ) -> anyhow::Result<RobotContext> {
-    let overrides = wa_core::config::ConfigOverrides::default();
-    let path = config_path.map(Path::new);
-    let config = wa_core::config::Config::load_with_overrides(path, path.is_some(), &overrides)?;
-    let workspace_path = workspace.map(Path::new);
-    let effective = config.effective_config(workspace_path)?;
+    let effective = config.effective_config(Some(workspace_root))?;
     Ok(RobotContext { effective })
 }
 
@@ -467,17 +529,55 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn init_logging(verbose: bool) {
-    let filter = if verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
+fn init_logging_from_config(
+    config: &wa_core::config::Config,
+    workspace_root: Option<&Path>,
+) -> anyhow::Result<()> {
+    let log_file = config
+        .general
+        .log_file
+        .as_ref()
+        .map(|path| resolve_log_path(path, workspace_root));
+
+    let log_config = LogConfig {
+        level: config.general.log_level.clone(),
+        format: config.general.log_format,
+        file: log_file,
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    match init_logging(&log_config) {
+        Ok(()) | Err(LogError::AlreadyInitialized) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    if let Some(root) = workspace_root {
+        tracing::info!(workspace = %root.display(), "Workspace resolved");
+    }
+
+    Ok(())
+}
+
+fn resolve_log_path(path: &str, workspace_root: Option<&Path>) -> std::path::PathBuf {
+    let candidate = std::path::PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else if let Some(root) = workspace_root {
+        root.join(candidate)
+    } else {
+        candidate
+    }
+}
+
+fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
+    for warning in warnings {
+        tracing::warn!(
+            label = warning.label,
+            path = %warning.path.display(),
+            actual_mode = format!("{:o}", warning.actual_mode),
+            expected_mode = format!("{:o}", warning.expected_mode),
+            "Permissions too open"
+        );
+    }
 }
 
 #[tokio::main]
@@ -529,20 +629,68 @@ async fn main() -> anyhow::Result<()> {
         command,
     } = cli;
 
-    init_logging(verbose);
+    let mut overrides = wa_core::config::ConfigOverrides::default();
+    if verbose {
+        overrides.log_level = Some("debug".to_string());
+    }
+
+    let config_path = config.as_deref().map(Path::new);
+    let config = match wa_core::config::Config::load_with_overrides(
+        config_path,
+        config_path.is_some(),
+        &overrides,
+    ) {
+        Ok(config) => config,
+        Err(err) => {
+            if robot_mode {
+                let response = RobotResponse::<()>::error_with_code(
+                    ROBOT_ERR_CONFIG,
+                    format!("Failed to load config: {err}"),
+                    Some("Check --config/--workspace or WA_WORKSPACE.".to_string()),
+                    elapsed_ms(start),
+                );
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+    };
+
+    let workspace_path = workspace.as_deref().map(Path::new);
+    let workspace_root = config.resolve_workspace_root(workspace_path)?;
+    let layout = config.workspace_layout(Some(&workspace_root))?;
+    let resolved_config_path = wa_core::config::resolve_config_path(config_path);
+    let log_file_path = config
+        .general
+        .log_file
+        .as_ref()
+        .map(|path| resolve_log_path(path, Some(&workspace_root)));
+
+    init_logging_from_config(&config, Some(&workspace_root))?;
+    layout.ensure_directories()?;
+    let permission_warnings = wa_core::config::collect_permission_warnings(
+        &layout,
+        resolved_config_path.as_deref(),
+        log_file_path.as_deref(),
+    );
+    emit_permission_warnings(&permission_warnings);
 
     match command {
         Some(Commands::Watch {
             auto_handle,
             foreground,
+            poll_interval,
+            no_patterns,
         }) => {
-            tracing::info!(
-                "Starting watcher (auto_handle={}, foreground={})",
+            run_watcher(
+                &layout,
+                &config,
                 auto_handle,
-                foreground
-            );
-            // TODO: Implement watcher
-            println!("Watcher not yet implemented");
+                foreground,
+                poll_interval,
+                no_patterns,
+            )
+            .await?;
         }
 
         Some(Commands::Robot { command }) => {
@@ -555,7 +703,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
                 other => {
-                    let _ctx = match build_robot_context(config.as_deref(), workspace.as_deref()) {
+                    let _ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
                         Err(err) => {
                             let response = RobotResponse::<()>::error_with_code(
@@ -663,9 +811,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::Search { query, limit, pane }) => {
+            let redacted_query = redact_for_output(&query);
             tracing::info!(
                 "Searching for '{}' (limit={}, pane={:?})",
-                query,
+                redacted_query,
                 limit,
                 pane
             );
@@ -770,8 +919,24 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Doctor) => {
             println!("Running diagnostics...");
             println!("  [OK] wa-core loaded");
-            // TODO: Add more checks
-            println!("All checks passed!");
+            if permission_warnings.is_empty() {
+                println!("  [OK] filesystem permissions");
+                println!("All checks passed!");
+            } else {
+                for warning in &permission_warnings {
+                    println!(
+                        "WARNING: {} permissions too open ({:o})",
+                        warning.label, warning.actual_mode
+                    );
+                    println!("  Path: {}", warning.path.display());
+                    println!(
+                        "  Recommended: chmod {:o} {}",
+                        warning.expected_mode,
+                        warning.path.display()
+                    );
+                }
+                println!("Diagnostics completed with warnings.");
+            }
         }
 
         Some(Commands::Setup { command }) => match command {

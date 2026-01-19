@@ -45,6 +45,8 @@
 pub use crate::config::LogFormat;
 use serde::{Deserialize, Serialize};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::Level;
@@ -98,6 +100,27 @@ pub enum LogError {
     SetSubscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
 }
 
+fn ensure_parent_dir(path: &std::path::Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let existed = parent.exists();
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            if !existed {
+                let permissions = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(parent, permissions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_permissions(path: &std::path::Path, mode: u32) -> io::Result<()> {
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions)
+}
+
 /// Initialize the global logging subscriber
 ///
 /// This function should be called once at application startup.
@@ -127,13 +150,16 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
 
     // Handle optional file output
     let file_writer = if let Some(path) = &config.file {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        ensure_parent_dir(path)?;
+        let existed = path.exists();
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
+        #[cfg(unix)]
+        if !existed {
+            set_file_permissions(path, 0o600)?;
+        }
         Some(file)
     } else {
         None
@@ -168,7 +194,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
             let subscriber = tracing_subscriber::registry().with(env_filter).with(
                 fmt::layer()
                     .json()
-                    .with_timer(SystemTime::default())
+                    .with_timer(SystemTime)
                     .with_target(true)
                     .with_current_span(true)
                     .with_span_list(false)
@@ -180,7 +206,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
                 let file_layer = fmt::layer()
                     .json()
                     .with_writer(file)
-                    .with_timer(SystemTime::default())
+                    .with_timer(SystemTime)
                     .with_target(true)
                     .with_current_span(true)
                     .flatten_event(true);
@@ -244,11 +270,11 @@ pub enum LogLevel {
 impl From<LogLevel> for Level {
     fn from(level: LogLevel) -> Self {
         match level {
-            LogLevel::Trace => Level::TRACE,
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Error => Level::ERROR,
+            LogLevel::Trace => Self::TRACE,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Error => Self::ERROR,
         }
     }
 }
@@ -373,7 +399,7 @@ mod tests {
             .with(
                 fmt::layer()
                     .json()
-                    .with_timer(SystemTime::default())
+                    .with_timer(SystemTime)
                     .with_target(true)
                     .with_current_span(true)
                     .flatten_event(true)
@@ -393,7 +419,10 @@ mod tests {
             parsed.get("workspace").and_then(|v| v.as_str()),
             Some("test")
         );
-        assert_eq!(parsed.get("pane_id").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(
+            parsed.get("pane_id").and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
     }
 
     #[test]
@@ -404,7 +433,7 @@ mod tests {
             .with(
                 fmt::layer()
                     .json()
-                    .with_timer(SystemTime::default())
+                    .with_timer(SystemTime)
                     .with_target(true)
                     .flatten_event(true)
                     .with_writer(writer.clone()),

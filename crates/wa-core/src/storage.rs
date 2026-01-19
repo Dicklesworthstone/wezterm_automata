@@ -23,8 +23,10 @@
 //!
 //! FTS5 virtual table `output_segments_fts` enables full-text search.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use rusqlite::{
@@ -41,7 +43,11 @@ use crate::policy::Redactor;
 // Schema Definition
 // =============================================================================
 
-/// Current schema version for migration tracking
+/// Current schema version for migration tracking.
+///
+/// This is the target version that new databases will be initialized to,
+/// and existing databases will be migrated to.
+/// Uses SQLite's PRAGMA user_version for atomic version tracking.
 pub const SCHEMA_VERSION: i32 = 1;
 
 /// Schema initialization SQL
@@ -289,6 +295,48 @@ CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments 
     INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
 END;
 "#;
+
+// =============================================================================
+// Schema Migrations
+// =============================================================================
+
+/// A schema migration
+#[derive(Debug, Clone)]
+pub struct Migration {
+    /// Target version after this migration is applied
+    pub version: i32,
+    /// Human-readable description
+    pub description: &'static str,
+    /// SQL to execute for the upgrade
+    pub up_sql: &'static str,
+}
+
+/// Registry of all migrations.
+///
+/// Migrations are applied in order. Each migration's `version` field indicates
+/// the schema version AFTER the migration is applied.
+///
+/// # Adding New Migrations
+///
+/// 1. Increment `SCHEMA_VERSION` constant
+/// 2. Add a new `Migration` entry here with `version = SCHEMA_VERSION`
+/// 3. Write idempotent SQL (use IF NOT EXISTS, IF EXISTS where appropriate)
+/// 4. Add upgrade test using fixture from previous version
+static MIGRATIONS: &[Migration] = &[
+    // Version 1: Initial schema (baseline)
+    // No migration SQL needed - SCHEMA_SQL creates the full schema
+    Migration {
+        version: 1,
+        description: "Initial schema",
+        up_sql: "", // Empty - baseline schema is created via SCHEMA_SQL
+    },
+    // Future migrations go here:
+    // Migration {
+    //     version: 2,
+    //     description: "Add foo column to bar table",
+    //     up_sql: "ALTER TABLE bar ADD COLUMN foo TEXT;",
+    // },
+];
 
 // =============================================================================
 // Data Structures
@@ -614,45 +662,131 @@ impl ApprovalTokenRecord {
 }
 
 // =============================================================================
-// Schema Initialization
+// Schema Initialization & Migrations
 // =============================================================================
 
-/// Initialize the database schema
+/// Get the current schema version from PRAGMA user_version.
 ///
-/// Creates all tables, indexes, triggers, and FTS if they don't exist.
-/// Safe to call on an existing database.
+/// Returns 0 for fresh databases that haven't been initialized.
+pub fn get_user_version(conn: &Connection) -> Result<i32> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| StorageError::Database(format!("Failed to read user_version: {e}")).into())
+}
+
+/// Set the schema version using PRAGMA user_version.
+fn set_user_version(conn: &Connection, version: i32) -> Result<()> {
+    // PRAGMA doesn't support parameters, so we format directly
+    // Version is an i32, so no SQL injection risk
+    conn.execute_batch(&format!("PRAGMA user_version = {version}"))
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!("Failed to set user_version: {e}")).into()
+        })
+}
+
+/// Record a migration in the schema_version audit table.
+fn record_migration(conn: &Connection, version: i32, description: &str) -> Result<()> {
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    conn.execute(
+        "INSERT INTO schema_version (version, applied_at, description) VALUES (?1, ?2, ?3)",
+        params![version, now_ms, description],
+    )
+    .map_err(|e| StorageError::MigrationFailed(format!("Failed to record migration: {e}")))?;
+
+    Ok(())
+}
+
+/// Initialize or migrate the database schema.
+///
+/// This function handles both fresh databases and existing databases that
+/// need migration to a newer schema version.
+///
+/// # Behavior
+///
+/// - Fresh database (user_version = 0): Creates all tables via SCHEMA_SQL
+/// - Existing database (user_version < SCHEMA_VERSION): Applies pending migrations
+/// - Up-to-date database (user_version = SCHEMA_VERSION): No-op
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The database has a newer schema than this code supports
+/// - Any migration fails to apply
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
-        .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+    let current = get_user_version(conn)?;
 
-    // Record schema version if not already present
-    let existing: Option<i32> = conn
-        .query_row(
-            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+    if current > SCHEMA_VERSION {
+        return Err(StorageError::MigrationFailed(format!(
+            "Database schema version ({current}) is newer than supported ({SCHEMA_VERSION}). \
+             Please upgrade wa to a newer version."
+        ))
+        .into());
+    }
 
-    if existing.is_none() {
-        #[allow(clippy::cast_possible_truncation)]
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64) // Safe: won't overflow until year 292,277,026
-            .unwrap_or(0);
+    if current == SCHEMA_VERSION {
+        // Already up to date
+        return Ok(());
+    }
 
-        conn.execute(
-            "INSERT INTO schema_version (version, applied_at, description) VALUES (?1, ?2, ?3)",
-            params![SCHEMA_VERSION, now_ms, "Initial schema"],
-        )
-        .map_err(|e| StorageError::MigrationFailed(format!("Version insert failed: {e}")))?;
+    // Fresh database: create base schema first
+    if current == 0 {
+        conn.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+    }
+
+    // Apply pending migrations
+    run_migrations(conn, current)?;
+
+    Ok(())
+}
+
+/// Apply all pending migrations from the current version to SCHEMA_VERSION.
+///
+/// Each migration is applied in order, and the user_version is updated after
+/// each successful migration. This ensures that if a migration fails partway
+/// through, the database version correctly reflects which migrations have
+/// been applied.
+fn run_migrations(conn: &Connection, from_version: i32) -> Result<()> {
+    for migration in MIGRATIONS {
+        if migration.version <= from_version {
+            // Already applied
+            continue;
+        }
+
+        // Apply migration SQL if non-empty
+        if !migration.up_sql.is_empty() {
+            conn.execute_batch(migration.up_sql).map_err(|e| {
+                StorageError::MigrationFailed(format!(
+                    "Migration to v{} ({}) failed: {e}",
+                    migration.version, migration.description
+                ))
+            })?;
+        }
+
+        // Update version atomically
+        set_user_version(conn, migration.version)?;
+
+        // Record for audit trail
+        record_migration(conn, migration.version, migration.description)?;
+
+        tracing::info!(
+            version = migration.version,
+            description = migration.description,
+            "Applied schema migration"
+        );
     }
 
     Ok(())
 }
 
-/// Get the current schema version
+/// Get the current schema version from the schema_version audit table.
+///
+/// This returns the version from the audit table, which should match
+/// PRAGMA user_version but provides history of when migrations were applied.
 pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     conn.query_row(
         "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
@@ -663,7 +797,7 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     .map_err(|e| StorageError::Database(e.to_string()).into())
 }
 
-/// Check if schema needs initialization
+/// Check if schema needs initialization (fresh database).
 pub fn needs_initialization(conn: &Connection) -> Result<bool> {
     let table_exists: i64 = conn
         .query_row(
@@ -674,6 +808,17 @@ pub fn needs_initialization(conn: &Connection) -> Result<bool> {
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
     Ok(table_exists == 0)
+}
+
+/// Get list of pending migrations that would be applied.
+///
+/// Useful for dry-run scenarios or displaying upgrade information.
+#[must_use]
+pub fn pending_migrations(current_version: i32) -> Vec<&'static Migration> {
+    MIGRATIONS
+        .iter()
+        .filter(|m| m.version > current_version)
+        .collect()
 }
 
 // =============================================================================
@@ -789,6 +934,57 @@ impl Default for StorageConfig {
     }
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let existed = parent.exists();
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::Database(format!("Failed to create directory: {e}")))?;
+            #[cfg(unix)]
+            if !existed {
+                set_permissions(parent, 0o700)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_permissions(path: &Path, mode: u32) -> Result<()> {
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions).map_err(|e| {
+        StorageError::Database(format!(
+            "Failed to set permissions on {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_db_permissions(path: &Path, is_new: bool) -> Result<()> {
+    if is_new {
+        set_permissions(path, 0o600)?;
+    }
+
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    if wal_path.exists() {
+        set_permissions(&wal_path, 0o600)?;
+    }
+
+    let shm_path = std::path::PathBuf::from(format!("{}-shm", path.display()));
+    if shm_path.exists() {
+        set_permissions(&shm_path, 0o600)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
+    Ok(())
+}
+
 // =============================================================================
 // Storage Handle
 // =============================================================================
@@ -798,13 +994,14 @@ impl Default for StorageConfig {
 /// Provides an async API for storage operations. Writes are serialized through
 /// a dedicated writer thread to avoid blocking the async runtime. Reads use
 /// spawn_blocking with WAL mode for concurrent access.
+#[derive(Clone)]
 pub struct StorageHandle {
     /// Sender for write commands
     write_tx: mpsc::Sender<WriteCommand>,
     /// Database path for read connections
     db_path: Arc<String>,
-    /// Writer thread join handle (for shutdown)
-    writer_handle: Option<JoinHandle<()>>,
+    /// Writer thread join handle (for shutdown) - shared to allow Clone
+    writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl StorageHandle {
@@ -822,20 +1019,19 @@ impl StorageHandle {
     /// Create a storage handle with custom configuration
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
-        if let Some(parent) = Path::new(db_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    StorageError::Database(format!("Failed to create directory: {e}"))
-                })?;
-            }
-        }
+        ensure_parent_dir(Path::new(db_path))?;
 
         // Open connection and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
+        let db_existed = Path::new(&db_path_owned).exists();
         let init_result = tokio::task::spawn_blocking(move || -> Result<Connection> {
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
             initialize_schema(&conn)?;
+            #[cfg(unix)]
+            {
+                ensure_db_permissions(Path::new(&db_path_owned), !db_existed)?;
+            }
             Ok(conn)
         })
         .await
@@ -853,7 +1049,7 @@ impl StorageHandle {
         Ok(Self {
             write_tx,
             db_path: Arc::new(db_path.to_string()),
-            writer_handle: Some(writer_handle),
+            writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
         })
     }
 
@@ -1378,7 +1574,8 @@ impl StorageHandle {
     /// Shutdown the storage handle
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
-    pub async fn shutdown(mut self) -> Result<()> {
+    /// Safe to call multiple times - subsequent calls are no-ops.
+    pub async fn shutdown(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         // Send shutdown command
         let _ = self
@@ -1390,7 +1587,7 @@ impl StorageHandle {
         let _ = rx.await;
 
         // Wait for thread to finish
-        if let Some(handle) = self.writer_handle.take() {
+        if let Some(handle) = self.writer_handle.lock().unwrap().take() {
             handle
                 .join()
                 .map_err(|_| StorageError::Database("Writer thread panicked".to_string()))?;
@@ -2937,6 +3134,164 @@ mod tests {
     }
 
     // =========================================================================
+    // Migration System Tests
+    // =========================================================================
+
+    #[test]
+    fn user_version_set_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Fresh DB should have user_version = 0
+        let initial = get_user_version(&conn).unwrap();
+        assert_eq!(initial, 0);
+
+        // After init, should match SCHEMA_VERSION
+        initialize_schema(&conn).unwrap();
+        let after = get_user_version(&conn).unwrap();
+        assert_eq!(after, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn user_version_and_schema_version_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let user_ver = get_user_version(&conn).unwrap();
+        let schema_ver = get_schema_version(&conn).unwrap().unwrap();
+
+        assert_eq!(user_ver, schema_ver);
+        assert_eq!(user_ver, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_version_audit_trail_recorded() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Should have exactly one record for initial schema
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Record should have correct version and non-null timestamp
+        let (version, applied_at, description): (i32, i64, String) = conn
+            .query_row(
+                "SELECT version, applied_at, description FROM schema_version",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(applied_at > 0, "applied_at should be set");
+        assert_eq!(description, "Initial schema");
+    }
+
+    #[test]
+    fn future_schema_version_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Manually set user_version to a future version
+        conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+            .unwrap();
+
+        // Initialization should fail
+        let result = initialize_schema(&conn);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("newer than supported"),
+            "Error should mention version mismatch: {err_str}"
+        );
+    }
+
+    #[test]
+    fn idempotent_init_preserves_version() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Initialize
+        initialize_schema(&conn).unwrap();
+        let version1 = get_user_version(&conn).unwrap();
+
+        // Initialize again (should be no-op)
+        initialize_schema(&conn).unwrap();
+        let version2 = get_user_version(&conn).unwrap();
+
+        assert_eq!(version1, version2);
+        assert_eq!(version1, SCHEMA_VERSION);
+
+        // Audit trail should still have just one record
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pending_migrations_empty_at_current_version() {
+        let pending = pending_migrations(SCHEMA_VERSION);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_migrations_includes_all_from_zero() {
+        let pending = pending_migrations(0);
+        assert_eq!(pending.len(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn migrations_are_sorted_by_version() {
+        let mut prev_version = 0;
+        for migration in MIGRATIONS {
+            assert!(
+                migration.version > prev_version,
+                "Migration versions must be strictly increasing"
+            );
+            prev_version = migration.version;
+        }
+    }
+
+    #[test]
+    fn migration_runner_simulated_upgrade() {
+        // This test simulates what happens when we add a new migration
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create base schema manually (simulating an older database)
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        set_user_version(&conn, 0).unwrap();
+
+        // Tables should exist but version should be 0
+        assert!(!needs_initialization(&conn).unwrap());
+        assert_eq!(get_user_version(&conn).unwrap(), 0);
+
+        // Run initialization (should apply migrations)
+        initialize_schema(&conn).unwrap();
+
+        // Should now be at current version
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn v1_schema_includes_agent_sessions() {
+        // Verify the v1 schema includes agent_sessions table
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "agent_sessions table should exist in v1 schema");
+    }
+
+    // =========================================================================
     // Basic Insert/Query Tests (validates schema correctness)
     // =========================================================================
 
@@ -3460,6 +3815,90 @@ mod tests {
         let rows = query_audit_actions(&conn, &AuditQuery::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, 2_000);
+    }
+
+    #[test]
+    fn audit_query_filters_and_limits() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", 1i64, 1i64, 1],
+        )
+        .unwrap();
+
+        let allow = AuditActionRecord {
+            id: 0,
+            ts: 1_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("ok".to_string()),
+            rule_id: None,
+            input_summary: Some("echo hi".to_string()),
+            verification_summary: None,
+            result: "success".to_string(),
+        };
+        let deny = AuditActionRecord {
+            ts: 2_000,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-123".to_string()),
+            action_kind: "workflow_run".to_string(),
+            policy_decision: "deny".to_string(),
+            decision_reason: Some("blocked".to_string()),
+            result: "denied".to_string(),
+            ..allow.clone()
+        };
+
+        record_audit_action_sync(&conn, &allow).unwrap();
+        record_audit_action_sync(&conn, &deny).unwrap();
+
+        let last_one = query_audit_actions(
+            &conn,
+            &AuditQuery {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(last_one.len(), 1);
+        assert_eq!(last_one[0].ts, 2_000);
+
+        let by_pane = query_audit_actions(
+            &conn,
+            &AuditQuery {
+                pane_id: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_pane.len(), 2);
+
+        let by_workflow = query_audit_actions(
+            &conn,
+            &AuditQuery {
+                actor_id: Some("wf-123".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_workflow.len(), 1);
+        assert_eq!(by_workflow[0].actor_kind, "workflow");
+
+        let denied = query_audit_actions(
+            &conn,
+            &AuditQuery {
+                policy_decision: Some("deny".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].policy_decision, "deny");
     }
 
     #[test]
@@ -4479,6 +4918,18 @@ async fn storage_handle_records_audit_action_redacted() {
     let input = rows[0].input_summary.as_ref().unwrap();
     assert!(input.contains("[REDACTED]"));
     assert!(!input.contains("sk-abc"));
+    let redactor = Redactor::new();
+    for field in [
+        rows[0].decision_reason.as_deref(),
+        rows[0].input_summary.as_deref(),
+        rows[0].verification_summary.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(!field.contains("sk-abc"));
+        assert!(!redactor.contains_secrets(field));
+    }
 
     storage.shutdown().await.unwrap();
 
@@ -4543,6 +4994,8 @@ async fn storage_handle_writer_queue_processes_all() {
 #[cfg(test)]
 mod storage_handle_tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Counter for unique temp DB paths
@@ -4575,6 +5028,37 @@ mod storage_handle_tests {
             ignore_reason: None,
             last_decision_at: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_handle_sets_db_permissions() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        let mode = std::fs::metadata(&db_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        for suffix in ["-wal", "-shm"] {
+            let path = format!("{db_path}{suffix}");
+            if std::path::Path::new(&path).exists() {
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+        }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
     }
 
     #[tokio::test]

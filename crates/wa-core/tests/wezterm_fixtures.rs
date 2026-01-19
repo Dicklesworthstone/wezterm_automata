@@ -2,10 +2,15 @@
 //!
 //! These tests verify that our PaneInfo models correctly parse
 //! various WezTerm CLI output formats.
+//!
+//! To capture a new fixture:
+//!   wezterm cli list --format json > crates/wa-core/tests/fixtures/wezterm_cli/<name>.json
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wa_core::wezterm::PaneInfo;
+
+const FIXTURE_PREVIEW_LIMIT: usize = 240;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,12 +19,32 @@ fn fixtures_dir() -> PathBuf {
         .join("wezterm_cli")
 }
 
+fn fixture_preview(content: &str) -> String {
+    let mut preview = content
+        .chars()
+        .take(FIXTURE_PREVIEW_LIMIT)
+        .collect::<String>();
+    if content.chars().count() > FIXTURE_PREVIEW_LIMIT {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn parse_fixture(path: &Path) -> Result<Vec<PaneInfo>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read fixture {}: {e}", path.display()))?;
+    serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "Failed to parse fixture {}: {e}\nPreview: {}",
+            path.display(),
+            fixture_preview(&content)
+        )
+    })
+}
+
 fn load_fixture(name: &str) -> Vec<PaneInfo> {
     let path = fixtures_dir().join(name);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
+    parse_fixture(&path).unwrap_or_else(|err| panic!("{err}"))
 }
 
 #[test]
@@ -168,15 +193,54 @@ fn inferred_domain_from_cwd() {
 fn all_fixtures_parse_successfully() {
     // Meta-test: ensure all fixtures in the directory parse
     let dir = fixtures_dir();
+    let mut errors = Vec::new();
+    let mut statuses = Vec::new();
+
     for entry in fs::read_dir(&dir).expect("Failed to read fixtures directory") {
         let entry = entry.expect("Failed to read directory entry");
         let path = entry.path();
 
         if path.extension().is_some_and(|ext| ext == "json") {
-            let content = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
-            let _panes: Vec<PaneInfo> = serde_json::from_str(&content)
-                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path.display(), e));
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>");
+            let should_fail = name.ends_with(".invalid.json");
+            let result = parse_fixture(&path);
+
+            match (should_fail, result) {
+                (false, Ok(_)) => statuses.push(format!("PASS {name}")),
+                (true, Err(_)) => statuses.push(format!("PASS {name} (expected failure)")),
+                (false, Err(err)) => {
+                    statuses.push(format!("FAIL {name}"));
+                    errors.push(err);
+                }
+                (true, Ok(_)) => {
+                    statuses.push(format!("FAIL {name} (unexpected parse success)"));
+                    errors.push(format!(
+                        "Fixture {name} is expected to fail but parsed successfully"
+                    ));
+                }
+            }
         }
     }
+
+    assert!(
+        errors.is_empty(),
+        "Fixture failures:\n{}\n\nErrors:\n{}",
+        statuses.join("\n"),
+        errors.join("\n\n")
+    );
+}
+
+#[test]
+fn invalid_fixture_has_actionable_error() {
+    let path = fixtures_dir().join("invalid_fixture.invalid.json");
+    let err = parse_fixture(&path).expect_err("invalid fixture should fail to parse");
+    assert!(err.contains("invalid_fixture.invalid.json"));
+    assert!(err.contains("Preview:"));
+    assert!(
+        err.len() <= 800,
+        "Error should remain bounded for readability"
+    );
 }

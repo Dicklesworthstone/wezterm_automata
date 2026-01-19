@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 // =============================================================================
@@ -59,12 +61,53 @@ pub struct Config {
 // General Config
 // =============================================================================
 
+/// Log format options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable pretty format (default for interactive use)
+    #[default]
+    Pretty,
+    /// Machine-parseable JSON lines (for CI/E2E/ops)
+    Json,
+}
+
+impl std::fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pretty => write!(f, "pretty"),
+            Self::Json => write!(f, "json"),
+        }
+    }
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = crate::error::ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "pretty" => Ok(Self::Pretty),
+            "json" => Ok(Self::Json),
+            other => Err(crate::error::ConfigError::ParseError(format!(
+                "invalid log format: {other} (expected 'pretty' or 'json')"
+            ))),
+        }
+    }
+}
+
 /// General configuration settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Log level: trace, debug, info, warn, error
     pub log_level: String,
+
+    /// Log format: pretty (human-readable) or json (machine-parseable)
+    pub log_format: LogFormat,
+
+    /// Optional log file path (supports ~ expansion)
+    /// When set, logs are written to this file in addition to stderr
+    pub log_file: Option<String>,
 
     /// Data directory path (supports ~ expansion)
     /// Default: ~/.local/share/wa (Linux) or ~/Library/Application Support/wa (macOS)
@@ -78,6 +121,8 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             log_level: "info".to_string(),
+            log_format: LogFormat::default(),
+            log_file: None,
             data_dir: default_data_dir(),
             workspace: None,
         }
@@ -741,6 +786,10 @@ impl Default for MetricsConfig {
 pub struct ConfigOverrides {
     /// Override log level
     pub log_level: Option<String>,
+    /// Override log format (pretty or json)
+    pub log_format: Option<LogFormat>,
+    /// Override log file path
+    pub log_file: Option<String>,
     /// Override storage database path
     pub storage_db_path: Option<String>,
     /// Override metrics enabled flag
@@ -755,6 +804,12 @@ impl ConfigOverrides {
     fn apply(&self, config: &mut Config) {
         if let Some(ref log_level) = self.log_level {
             config.general.log_level.clone_from(log_level);
+        }
+        if let Some(log_format) = self.log_format {
+            config.general.log_format = log_format;
+        }
+        if let Some(ref log_file) = self.log_file {
+            config.general.log_file = Some(log_file.clone());
         }
         if let Some(ref db_path) = self.storage_db_path {
             config.storage.db_path.clone_from(db_path);
@@ -774,6 +829,8 @@ impl ConfigOverrides {
 #[derive(Debug, Default)]
 struct EnvOverrides {
     log_level: Option<String>,
+    log_format: Option<LogFormat>,
+    log_file: Option<String>,
     storage_db_path: Option<String>,
     metrics_enabled: Option<bool>,
     metrics_bind: Option<String>,
@@ -786,6 +843,12 @@ impl EnvOverrides {
 
         if let Ok(value) = std::env::var("WA_LOG_LEVEL") {
             overrides.log_level = Some(value);
+        }
+        if let Ok(value) = std::env::var("WA_LOG_FORMAT") {
+            overrides.log_format = Some(value.parse::<LogFormat>().map_err(crate::Error::Config)?);
+        }
+        if let Ok(value) = std::env::var("WA_LOG_FILE") {
+            overrides.log_file = Some(value);
         }
         if let Ok(value) = std::env::var("WA_STORAGE_DB_PATH") {
             overrides.storage_db_path = Some(value);
@@ -806,6 +869,12 @@ impl EnvOverrides {
     fn apply(self, config: &mut Config) {
         if let Some(log_level) = self.log_level {
             config.general.log_level = log_level;
+        }
+        if let Some(log_format) = self.log_format {
+            config.general.log_format = log_format;
+        }
+        if let Some(log_file) = self.log_file {
+            config.general.log_file = Some(log_file);
         }
         if let Some(db_path) = self.storage_db_path {
             config.storage.db_path = db_path;
@@ -855,6 +924,29 @@ impl EffectivePaths {
             diag_dir: path_to_string(&layout.diag_dir),
         }
     }
+}
+
+/// Resolve the config path that was loaded (if any).
+#[must_use]
+pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+
+    let cwd_config = std::path::Path::new("wa.toml");
+    if cwd_config.exists() {
+        return Some(cwd_config.to_path_buf());
+    }
+
+    let config_dir = dirs_config_path();
+    if let Some(dir) = config_dir {
+        let config_path = dir.join("wa.toml");
+        if config_path.exists() {
+            return Some(config_path);
+        }
+    }
+
+    None
 }
 
 impl Config {
@@ -954,6 +1046,11 @@ impl Config {
     pub fn normalize_paths(&mut self) {
         let data_dir = expand_tilde(&self.general.data_dir);
         self.general.data_dir = path_to_string(&data_dir);
+
+        if let Some(log_file) = self.general.log_file.take() {
+            let log_path = expand_tilde(&log_file);
+            self.general.log_file = Some(path_to_string(&log_path));
+        }
 
         let db_path = expand_tilde(&self.storage.db_path);
         self.storage.db_path = path_to_string(&db_path);
@@ -1105,6 +1202,91 @@ impl WorkspaceLayout {
     }
 }
 
+/// Warning for paths that are more permissive than expected.
+#[derive(Debug, Clone)]
+pub struct PermissionWarning {
+    pub label: &'static str,
+    pub path: PathBuf,
+    pub expected_mode: u32,
+    pub actual_mode: u32,
+}
+
+/// Collect permission warnings for known sensitive paths.
+#[must_use]
+pub fn collect_permission_warnings(
+    layout: &WorkspaceLayout,
+    config_path: Option<&Path>,
+    log_file_override: Option<&Path>,
+) -> Vec<PermissionWarning> {
+    let mut warnings = Vec::new();
+
+    if let Some(warning) = check_permission(&layout.wa_dir, 0o700, "workspace dir") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.logs_dir, 0o700, "logs dir") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.crash_dir, 0o700, "crash dir") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.diag_dir, 0o700, "diagnostics dir") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.db_path, 0o600, "database") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.log_path, 0o600, "watcher log") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.lock_path, 0o644, "lock file") {
+        warnings.push(warning);
+    }
+    if let Some(warning) = check_permission(&layout.ipc_socket_path, 0o600, "ipc socket") {
+        warnings.push(warning);
+    }
+    if let Some(path) = config_path {
+        if let Some(warning) = check_permission(path, 0o600, "config file") {
+            warnings.push(warning);
+        }
+    }
+    if let Some(path) = log_file_override {
+        if let Some(warning) = check_permission(path, 0o600, "log file") {
+            warnings.push(warning);
+        }
+    }
+
+    warnings
+}
+
+#[cfg(unix)]
+fn check_permission(
+    path: &Path,
+    expected_mode: u32,
+    label: &'static str,
+) -> Option<PermissionWarning> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let actual_mode = metadata.permissions().mode() & 0o777;
+    if actual_mode & !expected_mode != 0 {
+        Some(PermissionWarning {
+            label,
+            path: path.to_path_buf(),
+            expected_mode,
+            actual_mode,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn check_permission(
+    _path: &Path,
+    _expected_mode: u32,
+    _label: &'static str,
+) -> Option<PermissionWarning> {
+    None
+}
+
 /// Get the config directory path (XDG on Linux, Library on macOS)
 fn dirs_config_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
@@ -1165,13 +1347,26 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn ensure_dir(path: &Path) -> crate::Result<()> {
+    let existed = path.exists();
     std::fs::create_dir_all(path).map_err(|e| {
-        crate::error::ConfigError::ValidationError(format!(
+        crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
             "Workspace path not writable: {} ({e}). Hint: choose a writable workspace via --workspace or WA_WORKSPACE.",
             path.display()
-        ))
-        .into()
-    })
+        )))
+    })?;
+
+    #[cfg(unix)]
+    if !existed {
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(path, permissions).map_err(|e| {
+            crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
+                "Failed to set permissions on {} ({e})",
+                path.display()
+            )))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn resolve_workspace_root_with_env(
@@ -1208,6 +1403,8 @@ mod dirs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn default_config_is_valid() {
@@ -1412,6 +1609,8 @@ disabled_rules = ["codex.usage_warning"]
         let mut config = Config::default();
         let env_overrides = EnvOverrides {
             log_level: Some("debug".to_string()),
+            log_format: None,
+            log_file: None,
             storage_db_path: Some("env.db".to_string()),
             metrics_enabled: Some(false),
             metrics_bind: None,
@@ -1421,6 +1620,8 @@ disabled_rules = ["codex.usage_warning"]
 
         let cli_overrides = ConfigOverrides {
             log_level: Some("info".to_string()),
+            log_format: None,
+            log_file: None,
             storage_db_path: Some("cli.db".to_string()),
             metrics_enabled: Some(true),
             metrics_bind: None,
@@ -1715,5 +1916,58 @@ title = "vim"
         assert!(rule.matches("SSH:1", "any", "any"));
         assert!(!rule.matches("SSH:ab", "any", "any"));
         assert!(!rule.matches("SSH:", "any", "any"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_sets_secure_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "wa_perm_dir_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ensure_dir(&dir).expect("ensure_dir");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_permission_warnings_flags_open_modes() {
+        let root = std::env::temp_dir().join(format!(
+            "wa_perm_root_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let config = Config::default();
+        let layout = WorkspaceLayout::new(root.clone(), &config.storage);
+
+        std::fs::create_dir_all(&layout.wa_dir).expect("create wa_dir");
+        std::fs::set_permissions(&layout.wa_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set wa_dir perms");
+
+        std::fs::create_dir_all(layout.db_path.parent().expect("db parent"))
+            .expect("create db parent");
+        std::fs::File::create(&layout.db_path).expect("create db file");
+        std::fs::set_permissions(&layout.db_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set db perms");
+
+        let warnings = collect_permission_warnings(&layout, None, None);
+        assert!(warnings.iter().any(|w| w.label == "workspace dir"));
+        assert!(warnings.iter().any(|w| w.label == "database"));
+
+        let _ = std::fs::remove_file(&layout.db_path);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

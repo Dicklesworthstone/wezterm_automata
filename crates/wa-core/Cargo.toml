@@ -20,6 +20,7 @@ serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # Pattern matching
 aho-corasick.workspace = true
@@ -40,6 +41,7 @@ toml.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"
+tempfile = "3.10"
 
 [features]
 default = []

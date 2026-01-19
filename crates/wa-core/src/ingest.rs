@@ -18,7 +18,8 @@ use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::PaneFilterConfig;
-use crate::storage::PaneRecord;
+use crate::error::Result;
+use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
 use crate::wezterm::PaneInfo;
 
 // =============================================================================
@@ -318,6 +319,19 @@ impl PaneCursor {
             }
         }
     }
+
+    /// Resync cursor's sequence number to match storage after a discontinuity.
+    ///
+    /// Call this after `persist_captured_segment` returns a gap with reason
+    /// containing "seq_discontinuity". The `storage_seq` should be the `seq`
+    /// from the returned `PersistedCapture.segment`.
+    ///
+    /// After resyncing, subsequent captures will have sequence numbers that
+    /// align with storage.
+    pub fn resync_seq(&mut self, storage_seq: u64) {
+        self.next_seq = storage_seq.saturating_add(1);
+        self.in_gap = true;
+    }
 }
 
 /// Pane registry for tracking discovered panes with lifecycle management
@@ -610,6 +624,68 @@ pub enum CapturedSegmentKind {
     Gap { reason: String },
 }
 
+/// Result of persisting a captured segment.
+#[derive(Debug, Clone)]
+pub struct PersistedCapture {
+    /// Stored segment row
+    pub segment: Segment,
+    /// Gap row if the capture represented a discontinuity
+    pub gap: Option<Gap>,
+}
+
+/// Persist a captured segment and optional gap into storage.
+///
+/// The pane must already exist in storage (use `upsert_pane` elsewhere).
+///
+/// # Gap Recording
+///
+/// Gaps are recorded in two scenarios:
+/// 1. **Overlap failure**: When `captured.kind` is `Gap`, the original gap reason
+///    (e.g., "overlap_not_found") is recorded.
+/// 2. **Sequence discontinuity**: When the storage's sequence number doesn't match
+///    the cursor's expected sequence, an additional "seq_discontinuity" gap is recorded.
+///
+/// After a sequence discontinuity, callers should resync their cursor's `next_seq`
+/// to `stored.segment.seq + 1` to prevent further mismatches.
+pub async fn persist_captured_segment(
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+) -> Result<PersistedCapture> {
+    // Record gap if the captured segment itself represents a discontinuity (overlap failure)
+    let mut gap = match &captured.kind {
+        CapturedSegmentKind::Gap { reason } => {
+            Some(storage.record_gap(captured.pane_id, reason).await?)
+        }
+        CapturedSegmentKind::Delta => None,
+    };
+
+    let stored = storage
+        .append_segment(captured.pane_id, &captured.content, None)
+        .await?;
+
+    // Check for sequence discontinuity between cursor and storage
+    if stored.seq != captured.seq {
+        // Record gap for the discontinuity (this is in addition to any overlap-failure gap)
+        let discontinuity_reason = format!(
+            "seq_discontinuity:expected={},actual={}",
+            captured.seq, stored.seq
+        );
+        let discontinuity_gap = storage
+            .record_gap(captured.pane_id, &discontinuity_reason)
+            .await?;
+
+        // If we didn't already have a gap, use this one; otherwise the overlap gap takes precedence
+        if gap.is_none() {
+            gap = Some(discontinuity_gap);
+        }
+    }
+
+    Ok(PersistedCapture {
+        segment: stored,
+        gap,
+    })
+}
+
 fn hash_text(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -897,9 +973,129 @@ pub fn process_osc133_output(state: &mut Osc133State, text: &str) {
     }
 }
 
+// =============================================================================
+// Alt-Screen Detection
+// =============================================================================
+
+/// Alternate screen buffer state change detected in terminal output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltScreenChange {
+    /// Entered alternate screen buffer (e.g., vim, less, htop started)
+    Entered,
+    /// Left alternate screen buffer (program exited back to normal shell)
+    Exited,
+}
+
+/// Detect alternate screen buffer changes in terminal output.
+///
+/// Terminals use the following escape sequences for alternate screen:
+/// - `ESC [ ? 1049 h` - Enable alternate screen buffer (DECSET 1049)
+/// - `ESC [ ? 1049 l` - Disable alternate screen buffer (DECRST 1049)
+/// - `ESC [ ? 47 h` / `ESC [ ? 47 l` - Older alternate screen (less common)
+///
+/// When a program enters alternate screen (vim, less, htop, etc.), the entire
+/// visible buffer is replaced. When it exits, the original buffer is restored.
+/// This invalidates delta extraction because the content relationship is broken.
+///
+/// # Returns
+/// A vector of alt-screen changes in order of occurrence. Multiple changes
+/// can occur if a program rapidly enters and exits alternate screen.
+#[must_use]
+pub fn detect_alt_screen_changes(text: &str) -> Vec<AltScreenChange> {
+    use memchr::memmem;
+
+    let mut changes = Vec::new();
+    let bytes = text.as_bytes();
+
+    // DECSET 1049 - Enable alternate screen (most common)
+    // Pattern: ESC [ ? 1049 h
+    static ENABLE_1049: &[u8] = b"\x1b[?1049h";
+    static DISABLE_1049: &[u8] = b"\x1b[?1049l";
+
+    // DECSET 47 - Older alternate screen
+    static ENABLE_47: &[u8] = b"\x1b[?47h";
+    static DISABLE_47: &[u8] = b"\x1b[?47l";
+
+    // Find all matches and their positions
+    let mut positions: Vec<(usize, AltScreenChange)> = Vec::new();
+
+    for pos in memmem::find_iter(bytes, ENABLE_1049) {
+        positions.push((pos, AltScreenChange::Entered));
+    }
+    for pos in memmem::find_iter(bytes, DISABLE_1049) {
+        positions.push((pos, AltScreenChange::Exited));
+    }
+    for pos in memmem::find_iter(bytes, ENABLE_47) {
+        positions.push((pos, AltScreenChange::Entered));
+    }
+    for pos in memmem::find_iter(bytes, DISABLE_47) {
+        positions.push((pos, AltScreenChange::Exited));
+    }
+
+    // Sort by position and extract changes in order
+    positions.sort_by_key(|(pos, _)| *pos);
+    changes.extend(positions.into_iter().map(|(_, change)| change));
+
+    changes
+}
+
+/// Check if text contains any alternate screen transitions.
+///
+/// This is a fast check that can be used before full delta extraction
+/// to determine if the content might be from a different screen context.
+#[must_use]
+pub fn has_alt_screen_change(text: &str) -> bool {
+    use memchr::memmem;
+
+    let bytes = text.as_bytes();
+
+    memmem::find(bytes, b"\x1b[?1049h").is_some()
+        || memmem::find(bytes, b"\x1b[?1049l").is_some()
+        || memmem::find(bytes, b"\x1b[?47h").is_some()
+        || memmem::find(bytes, b"\x1b[?47l").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_path() -> String {
+        let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        dir.join(format!(
+            "wa_ingest_test_{counter}_{}.db",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .to_string()
+    }
+
+    fn cleanup_db(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    fn test_pane_record(pane_id: u64) -> PaneRecord {
+        let now = epoch_ms();
+        PaneRecord {
+            pane_id,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some("shell".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: Some(now),
+        }
+    }
 
     #[test]
     fn cursor_starts_at_zero() {
@@ -971,6 +1167,168 @@ mod tests {
         assert_eq!(seg2.seq, 2);
         assert!(matches!(seg2.kind, CapturedSegmentKind::Gap { .. }));
         assert_eq!(seg2.content, "a\nc\n");
+    }
+
+    #[tokio::test]
+    async fn persist_captured_segments_appends_rows() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+        let mut cursor = PaneCursor::new(1);
+        let seg0 = cursor
+            .capture_snapshot("hello\n", 1024)
+            .expect("first capture");
+        let seg1 = cursor
+            .capture_snapshot("hello\nworld\n", 1024)
+            .expect("second capture");
+
+        let stored0 = persist_captured_segment(&handle, &seg0).await.unwrap();
+        let stored1 = persist_captured_segment(&handle, &seg1).await.unwrap();
+
+        assert_eq!(stored0.segment.seq, seg0.seq);
+        assert_eq!(stored1.segment.seq, seg1.seq);
+
+        let segments = handle.get_segments(1, 10).await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().any(|seg| seg.content == "hello\n"));
+        assert!(segments.iter().any(|seg| seg.content == "world\n"));
+
+        handle.shutdown().await.unwrap();
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn persist_captured_gap_records_gap() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+        let mut cursor = PaneCursor::new(1);
+        let seg0 = cursor
+            .capture_snapshot("a\nb\n", 1024)
+            .expect("first capture");
+        persist_captured_segment(&handle, &seg0).await.unwrap();
+
+        let gap_segment = cursor
+            .capture_snapshot("a\nc\n", 1024)
+            .expect("gap capture");
+        let persisted = persist_captured_segment(&handle, &gap_segment)
+            .await
+            .unwrap();
+
+        let gap = persisted.gap.expect("gap recorded");
+        let expected_reason = match &gap_segment.kind {
+            CapturedSegmentKind::Gap { reason } => reason.as_str(),
+            CapturedSegmentKind::Delta => "unexpected_delta",
+        };
+
+        assert_eq!(gap.pane_id, 1);
+        assert_eq!(gap.reason, expected_reason);
+        assert_eq!(persisted.segment.seq, gap_segment.seq);
+        assert_eq!(persisted.segment.content, "a\nc\n");
+
+        handle.shutdown().await.unwrap();
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn persist_captured_segment_records_seq_discontinuity_gap() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+        // First, create a cursor and persist some segments normally
+        let mut cursor = PaneCursor::new(1);
+        let seg0 = cursor
+            .capture_snapshot("line1\n", 1024)
+            .expect("first capture");
+        persist_captured_segment(&handle, &seg0).await.unwrap();
+
+        let seg1 = cursor
+            .capture_snapshot("line1\nline2\n", 1024)
+            .expect("second capture");
+        persist_captured_segment(&handle, &seg1).await.unwrap();
+
+        // Now simulate a desync: manually advance the cursor's seq beyond what storage expects
+        cursor.next_seq = 100; // Storage expects seq=2, cursor will produce seq=100
+
+        let seg2 = cursor
+            .capture_snapshot("line1\nline2\nline3\n", 1024)
+            .expect("third capture");
+        assert_eq!(seg2.seq, 100); // Cursor produced seq=100
+
+        // Persist should NOT error, instead record a gap
+        let persisted = persist_captured_segment(&handle, &seg2).await.unwrap();
+
+        // Storage used its own seq (2), not the cursor's (100)
+        assert_eq!(persisted.segment.seq, 2);
+        assert_eq!(persisted.segment.content, "line3\n");
+
+        // A gap should have been recorded for the discontinuity
+        let gap = persisted.gap.expect("discontinuity gap recorded");
+        assert!(
+            gap.reason.starts_with("seq_discontinuity:"),
+            "reason should indicate seq discontinuity: {}",
+            gap.reason
+        );
+        assert!(
+            gap.reason.contains("expected=100"),
+            "reason should include expected seq: {}",
+            gap.reason
+        );
+        assert!(
+            gap.reason.contains("actual=2"),
+            "reason should include actual seq: {}",
+            gap.reason
+        );
+
+        handle.shutdown().await.unwrap();
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn resync_seq_aligns_cursor_with_storage() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+        // Create a cursor and persist some segments normally
+        let mut cursor = PaneCursor::new(1);
+        let seg0 = cursor
+            .capture_snapshot("a\n", 1024)
+            .expect("first capture");
+        persist_captured_segment(&handle, &seg0).await.unwrap();
+
+        // Simulate desync
+        cursor.next_seq = 999;
+
+        let seg1 = cursor
+            .capture_snapshot("a\nb\n", 1024)
+            .expect("second capture");
+        assert_eq!(seg1.seq, 999);
+
+        let persisted = persist_captured_segment(&handle, &seg1).await.unwrap();
+        assert_eq!(persisted.segment.seq, 1); // Storage used seq=1
+
+        // Resync cursor to storage
+        cursor.resync_seq(persisted.segment.seq);
+        assert_eq!(cursor.next_seq, 2); // Should be storage_seq + 1
+        assert!(cursor.in_gap); // Should be marked in gap state
+
+        // Next capture should be aligned
+        let seg2 = cursor
+            .capture_snapshot("a\nb\nc\n", 1024)
+            .expect("third capture");
+        assert_eq!(seg2.seq, 2);
+
+        let persisted2 = persist_captured_segment(&handle, &seg2).await.unwrap();
+        assert_eq!(persisted2.segment.seq, 2);
+        // No gap this time since we resynced
+        assert!(persisted2.gap.is_none());
+
+        handle.shutdown().await.unwrap();
+        cleanup_db(&db_path);
     }
 
     // Helper to create a test PaneInfo
