@@ -23,11 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::config::PaneFilterConfig;
+use crate::config::{HotReloadableConfig, PaneFilterConfig};
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
@@ -179,6 +179,10 @@ pub struct ObservationRuntime {
     shutdown_flag: Arc<AtomicBool>,
     /// Runtime metrics for health/shutdown
     metrics: Arc<RuntimeMetrics>,
+    /// Hot-reloadable config sender (for broadcasting updates to tasks)
+    config_tx: watch::Sender<HotReloadableConfig>,
+    /// Hot-reloadable config receiver (for tasks to receive updates)
+    config_rx: watch::Receiver<HotReloadableConfig>,
 }
 
 impl ObservationRuntime {
@@ -200,6 +204,20 @@ impl ObservationRuntime {
             .started_at
             .store(epoch_ms() as u64, Ordering::SeqCst);
 
+        // Initialize hot-reload config channel with current values
+        let hot_config = HotReloadableConfig {
+            log_level: "info".to_string(), // Default, will be overridden
+            poll_interval_ms: config.capture_interval.as_millis() as u64,
+            min_poll_interval_ms: config.min_capture_interval.as_millis() as u64,
+            retention_days: 30,
+            retention_max_mb: 0,
+            checkpoint_interval_secs: 60,
+            pattern_packs: vec![],
+            workflows_enabled: vec![],
+            auto_run_allowlist: vec![],
+        };
+        let (config_tx, config_rx) = watch::channel(hot_config);
+
         Self {
             config,
             storage: Arc::new(tokio::sync::Mutex::new(storage)),
@@ -209,6 +227,8 @@ impl ObservationRuntime {
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             metrics,
+            config_tx,
+            config_rx,
         }
     }
 
@@ -242,6 +262,7 @@ impl ObservationRuntime {
             registry: Arc::clone(&self.registry),
             cursors: Arc::clone(&self.cursors),
             start_time: Instant::now(),
+            config_tx: self.config_tx.clone(),
         })
     }
 
@@ -252,20 +273,36 @@ impl ObservationRuntime {
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let storage = Arc::clone(&self.storage);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        let interval = self.config.discovery_interval;
+        let initial_interval = self.config.discovery_interval;
+        let mut config_rx = self.config_rx.clone();
 
         tokio::spawn(async move {
             // Create a fresh WezTerm client for this task
             let wezterm = WeztermClient::new();
-            let mut ticker = tokio::time::interval(interval);
+            let mut current_interval = initial_interval;
 
             loop {
-                ticker.tick().await;
+                // Use sleep instead of interval to support dynamic interval changes
+                tokio::time::sleep(current_interval).await;
 
                 // Check shutdown flag
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Discovery task: shutdown signal received");
                     break;
+                }
+
+                // Check for config updates (non-blocking)
+                if config_rx.has_changed().unwrap_or(false) {
+                    let new_config = config_rx.borrow_and_update().clone();
+                    let new_interval = Duration::from_millis(new_config.poll_interval_ms);
+                    if new_interval != current_interval {
+                        info!(
+                            old_ms = current_interval.as_millis() as u64,
+                            new_ms = new_interval.as_millis() as u64,
+                            "Discovery interval updated via hot reload"
+                        );
+                        current_interval = new_interval;
+                    }
                 }
 
                 match wezterm.list_panes().await {
@@ -556,6 +593,8 @@ pub struct RuntimeHandle {
     pub cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
     /// Runtime start time
     pub start_time: Instant,
+    /// Hot-reload config sender for broadcasting updates
+    config_tx: watch::Sender<HotReloadableConfig>,
 }
 
 impl RuntimeHandle {
@@ -688,6 +727,28 @@ impl RuntimeHandle {
     #[must_use]
     pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {
         self.storage
+    }
+
+    /// Apply a hot-reloadable config update.
+    ///
+    /// Broadcasts the new config to all running tasks. Returns `Ok(())` if the
+    /// update was sent successfully, or an error if the channel is closed.
+    ///
+    /// # Arguments
+    /// * `new_config` - The new hot-reloadable configuration values
+    ///
+    /// # Errors
+    /// Returns an error if the config channel is closed (runtime shutting down).
+    pub fn apply_config_update(&self, new_config: HotReloadableConfig) -> Result<()> {
+        self.config_tx
+            .send(new_config)
+            .map_err(|e| crate::Error::Runtime(format!("Failed to send config update: {}", e)))
+    }
+
+    /// Get the current hot-reloadable config.
+    #[must_use]
+    pub fn current_config(&self) -> HotReloadableConfig {
+        self.config_tx.borrow().clone()
     }
 }
 
