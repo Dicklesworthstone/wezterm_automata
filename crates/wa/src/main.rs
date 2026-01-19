@@ -145,9 +145,13 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+#[command(disable_help_subcommand = true)]
 enum RobotCommands {
     /// Show robot help as JSON
     Help,
+
+    /// Show quick-start guide for agents (default when no subcommand)
+    QuickStart,
 
     /// Get all panes as JSON
     State,
@@ -156,6 +160,14 @@ enum RobotCommands {
     GetText {
         /// Pane ID
         pane_id: u64,
+
+        /// Number of lines to return from the end (tail)
+        #[arg(long, default_value = "50")]
+        tail: usize,
+
+        /// Include ANSI escape sequences
+        #[arg(long)]
+        escapes: bool,
     },
 
     /// Send text to a pane
@@ -171,30 +183,87 @@ enum RobotCommands {
         dry_run: bool,
     },
 
-    /// Wait for a pattern
+    /// Wait for a pattern in pane output
     WaitFor {
         /// Pane ID
         pane_id: u64,
 
-        /// Pattern rule ID to wait for
-        rule_id: String,
+        /// Pattern to wait for (substring by default, regex with --regex)
+        pattern: String,
 
-        /// Timeout in milliseconds
-        #[arg(long, default_value = "30000")]
-        timeout: u64,
+        /// Timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+
+        /// Number of tail lines to consider (0 = full buffer)
+        #[arg(long, default_value = "200")]
+        tail: usize,
+
+        /// Treat pattern as a regex instead of substring
+        #[arg(long)]
+        regex: bool,
     },
 
     /// Search captured output
     Search {
         /// FTS query
         query: String,
+
+        /// Limit number of results
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Only return results since this timestamp (epoch ms)
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Include snippets with highlighted terms
+        #[arg(long)]
+        snippets: bool,
     },
 
     /// Get recent events
     Events {
-        /// Limit
+        /// Maximum number of events to return
         #[arg(long, default_value = "20")]
         limit: usize,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Filter by rule ID (exact match)
+        #[arg(long)]
+        rule_id: Option<String>,
+
+        /// Filter by event type (e.g., "compaction_warning")
+        #[arg(long)]
+        event_type: Option<String>,
+
+        /// Only return unhandled events
+        #[arg(long)]
+        unhandled_only: bool,
+
+        /// Only return events since this timestamp (epoch ms)
+        #[arg(long)]
+        since: Option<i64>,
+    },
+
+    /// Run a workflow by name on a pane
+    Workflow {
+        /// Workflow name
+        name: String,
+
+        /// Target pane ID
+        pane_id: u64,
+
+        /// Bypass "already handled" checks (still policy-gated)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -243,6 +312,8 @@ const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
 const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
 const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
+const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
+const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 
 /// JSON envelope for robot mode responses
 #[derive(serde::Serialize)]
@@ -306,6 +377,52 @@ struct RobotCommandInfo {
     description: &'static str,
 }
 
+/// Quick-start data for agents
+#[derive(serde::Serialize)]
+struct RobotQuickStartData {
+    description: &'static str,
+    global_flags: Vec<QuickStartGlobalFlag>,
+    core_loop: Vec<QuickStartStep>,
+    commands: Vec<QuickStartCommand>,
+    tips: Vec<&'static str>,
+    error_handling: QuickStartErrorHandling,
+}
+
+#[derive(serde::Serialize)]
+struct QuickStartGlobalFlag {
+    flag: &'static str,
+    env_var: Option<&'static str>,
+    description: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct QuickStartStep {
+    step: u8,
+    action: &'static str,
+    command: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct QuickStartCommand {
+    name: &'static str,
+    args: &'static str,
+    summary: &'static str,
+    examples: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct QuickStartErrorHandling {
+    common_codes: Vec<QuickStartErrorCode>,
+    safety_notes: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct QuickStartErrorCode {
+    code: &'static str,
+    meaning: &'static str,
+    recovery: &'static str,
+}
+
 /// Pane state for CLI output (list and robot state commands)
 #[derive(serde::Serialize)]
 struct PaneState {
@@ -362,6 +479,122 @@ impl PaneState {
             self.pane_id, status, title, cwd, self.domain, reason
         )
     }
+}
+
+/// Robot get-text response data (matches wa-robot-get-text.json schema)
+#[derive(serde::Serialize)]
+struct RobotGetTextData {
+    pane_id: u64,
+    text: String,
+    tail_lines: usize,
+    escapes_included: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncation_info: Option<TruncationInfo>,
+}
+
+#[derive(serde::Serialize)]
+struct TruncationInfo {
+    original_bytes: usize,
+    returned_bytes: usize,
+    original_lines: usize,
+    returned_lines: usize,
+}
+
+/// Wait-for result data for robot mode
+#[derive(serde::Serialize)]
+struct RobotWaitForData {
+    pane_id: u64,
+    pattern: String,
+    matched: bool,
+    elapsed_ms: u64,
+    polls: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    is_regex: bool,
+}
+
+/// Search result data for robot mode
+#[derive(serde::Serialize)]
+struct RobotSearchData {
+    query: String,
+    results: Vec<RobotSearchHit>,
+    total_hits: usize,
+    limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_filter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_filter: Option<i64>,
+}
+
+/// Individual search hit for robot mode
+#[derive(serde::Serialize)]
+struct RobotSearchHit {
+    segment_id: i64,
+    pane_id: u64,
+    seq: u64,
+    captured_at: i64,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+/// Robot events response data
+#[derive(serde::Serialize)]
+struct RobotEventsData {
+    events: Vec<RobotEventItem>,
+    total_count: usize,
+    limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_filter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_type_filter: Option<String>,
+    unhandled_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_filter: Option<i64>,
+}
+
+/// Individual event for robot mode
+#[derive(serde::Serialize)]
+struct RobotEventItem {
+    id: i64,
+    pane_id: u64,
+    rule_id: String,
+    pack_id: String,
+    event_type: String,
+    severity: String,
+    confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<serde_json::Value>,
+    captured_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handled_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_id: Option<String>,
+}
+
+/// Workflow execution result for robot mode
+#[derive(Debug, serde::Serialize)]
+struct RobotWorkflowData {
+    workflow_name: String,
+    pane_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps_executed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -516,8 +749,173 @@ fn build_robot_help() -> RobotHelp {
                 name: "events",
                 description: "Fetch recent events",
             },
+            RobotCommandInfo {
+                name: "workflow",
+                description: "Run a workflow by name on a pane",
+            },
         ],
         global_flags: vec!["--workspace <path>", "--config <path>", "--verbose"],
+    }
+}
+
+fn build_robot_quick_start() -> RobotQuickStartData {
+    RobotQuickStartData {
+        description: "wa robot mode: JSON API for AI agents to observe and control WezTerm panes",
+        global_flags: vec![
+            QuickStartGlobalFlag {
+                flag: "--workspace <path>",
+                env_var: Some("WA_WORKSPACE"),
+                description: "Project root directory for config and database",
+            },
+            QuickStartGlobalFlag {
+                flag: "--config <path>",
+                env_var: None,
+                description: "Override config file location",
+            },
+        ],
+        core_loop: vec![
+            QuickStartStep {
+                step: 1,
+                action: "Discover panes",
+                command: "wa robot state",
+            },
+            QuickStartStep {
+                step: 2,
+                action: "Select target pane_id from state output",
+                command: "(parse JSON, pick pane_id)",
+            },
+            QuickStartStep {
+                step: 3,
+                action: "Read pane output",
+                command: "wa robot get-text <pane_id> --tail 100",
+            },
+            QuickStartStep {
+                step: 4,
+                action: "Preview send (safety-first)",
+                command: "wa robot send <pane_id> \"text\" --dry-run",
+            },
+            QuickStartStep {
+                step: 5,
+                action: "Execute send (if policy allows)",
+                command: "wa robot send <pane_id> \"text\"",
+            },
+        ],
+        commands: vec![
+            QuickStartCommand {
+                name: "state",
+                args: "",
+                summary: "List all panes with metadata (pane_id, title, cwd, observed)",
+                examples: vec!["wa robot state"],
+            },
+            QuickStartCommand {
+                name: "get-text",
+                args: "<pane_id> [--tail N] [--escapes]",
+                summary: "Fetch recent output from a pane",
+                examples: vec![
+                    "wa robot get-text 0",
+                    "wa robot get-text 0 --tail 200",
+                ],
+            },
+            QuickStartCommand {
+                name: "send",
+                args: "<pane_id> \"<text>\" [--dry-run]",
+                summary: "Send text input to a pane (policy-gated)",
+                examples: vec![
+                    "wa robot send 0 \"/help\" --dry-run",
+                    "wa robot send 0 \"/compact\"",
+                ],
+            },
+            QuickStartCommand {
+                name: "wait-for",
+                args: "<pane_id> <pattern> [--timeout-secs N] [--regex]",
+                summary: "Wait for a pattern to appear in pane output",
+                examples: vec![
+                    "wa robot wait-for 0 \"ready>\"",
+                    "wa robot wait-for 0 \"error|failed\" --regex --timeout-secs 60",
+                ],
+            },
+            QuickStartCommand {
+                name: "search",
+                args: "\"<query>\" [--limit N] [--pane ID]",
+                summary: "Full-text search across captured output",
+                examples: vec![
+                    "wa robot search \"compilation failed\"",
+                    "wa robot search \"error\" --pane 0 --limit 10",
+                ],
+            },
+            QuickStartCommand {
+                name: "events",
+                args: "[--limit N] [--pane ID] [--rule-id ID]",
+                summary: "Fetch recent pattern detection events",
+                examples: vec![
+                    "wa robot events",
+                    "wa robot events --rule-id codex.usage_reached",
+                ],
+            },
+            QuickStartCommand {
+                name: "workflow",
+                args: "<name> <pane_id> [--force]",
+                summary: "Run a workflow by name on a pane (policy-gated)",
+                examples: vec![
+                    "wa robot workflow handle_compaction 0",
+                    "wa robot workflow handle_usage_limit 1 --force",
+                ],
+            },
+            QuickStartCommand {
+                name: "help",
+                args: "",
+                summary: "Show command list as JSON",
+                examples: vec!["wa robot help"],
+            },
+            QuickStartCommand {
+                name: "quick-start",
+                args: "",
+                summary: "Show this quick-start guide",
+                examples: vec!["wa robot quick-start", "wa robot"],
+            },
+        ],
+        tips: vec![
+            "Always use --dry-run before send to preview policy decisions",
+            "The 'ok' field in responses indicates success (true) or failure (false)",
+            "Check 'error_code' field for programmatic error handling",
+            "Use 'now' timestamp in responses to track freshness",
+            "Pane IDs are stable within a WezTerm session but may change across restarts",
+        ],
+        error_handling: QuickStartErrorHandling {
+            common_codes: vec![
+                QuickStartErrorCode {
+                    code: "robot.pane_not_found",
+                    meaning: "The specified pane_id does not exist",
+                    recovery: "Use 'wa robot state' to list valid pane IDs",
+                },
+                QuickStartErrorCode {
+                    code: "robot.wezterm_not_running",
+                    meaning: "WezTerm is not running or not accessible",
+                    recovery: "Start WezTerm before running wa commands",
+                },
+                QuickStartErrorCode {
+                    code: "robot.policy_denied",
+                    meaning: "Action blocked by safety policy",
+                    recovery: "Use --dry-run to see policy details; adjust config if needed",
+                },
+                QuickStartErrorCode {
+                    code: "robot.require_approval",
+                    meaning: "Action requires human approval",
+                    recovery: "A human must approve via 'wa approve <token>' or interactive prompt",
+                },
+                QuickStartErrorCode {
+                    code: "robot.timeout",
+                    meaning: "Wait operation timed out",
+                    recovery: "Increase --timeout-secs or check if pattern is correct",
+                },
+            ],
+            safety_notes: vec![
+                "All send operations are policy-gated by default",
+                "--dry-run shows what would happen without executing",
+                "RequireApproval decisions surface a token for human approval",
+                "Approval can be granted via 'wa approve <token>' command",
+            ],
+        },
     }
 }
 
@@ -531,6 +929,81 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// Apply tail truncation to text, returning the truncated text and truncation info
+fn apply_tail_truncation(
+    text: &str,
+    tail_lines: usize,
+) -> (String, bool, Option<TruncationInfo>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let original_lines = lines.len();
+    let original_bytes = text.len();
+
+    if lines.len() <= tail_lines {
+        // No truncation needed
+        return (text.to_string(), false, None);
+    }
+
+    // Take the last N lines
+    let start_idx = lines.len().saturating_sub(tail_lines);
+    let truncated_lines: Vec<&str> = lines[start_idx..].to_vec();
+    let truncated_text = truncated_lines.join("\n");
+    let returned_bytes = truncated_text.len();
+    let returned_lines = truncated_lines.len();
+
+    (
+        truncated_text,
+        true,
+        Some(TruncationInfo {
+            original_bytes,
+            returned_bytes,
+            original_lines,
+            returned_lines,
+        }),
+    )
+}
+
+/// Map wa_core errors to stable robot error codes
+fn map_wezterm_error_to_robot(error: &wa_core::Error) -> (&'static str, Option<String>) {
+    use wa_core::error::WeztermError;
+
+    match error {
+        wa_core::Error::Wezterm(wezterm_err) => match wezterm_err {
+            WeztermError::CliNotFound => (
+                "robot.wezterm_not_found",
+                Some("Install WezTerm or ensure 'wezterm' is in PATH.".to_string()),
+            ),
+            WeztermError::NotRunning => (
+                "robot.wezterm_not_running",
+                Some("Start WezTerm before running wa commands.".to_string()),
+            ),
+            WeztermError::PaneNotFound(pane_id) => (
+                "robot.pane_not_found",
+                Some(format!("Pane {pane_id} does not exist. Use 'wa robot state' to list available panes.")),
+            ),
+            WeztermError::SocketNotFound(_) => (
+                "robot.wezterm_socket_not_found",
+                Some("WezTerm socket not found. Is WezTerm running?".to_string()),
+            ),
+            WeztermError::CommandFailed(_) => (
+                "robot.wezterm_command_failed",
+                Some("The WezTerm CLI command failed. Check WezTerm logs for details.".to_string()),
+            ),
+            WeztermError::ParseError(_) => (
+                "robot.wezterm_parse_error",
+                Some("Failed to parse WezTerm output. This may indicate a version mismatch.".to_string()),
+            ),
+            WeztermError::Timeout(_) => (
+                "robot.wezterm_timeout",
+                Some("WezTerm command timed out. The terminal may be unresponsive.".to_string()),
+            ),
+        },
+        _ => (
+            "robot.internal_error",
+            Some("An unexpected internal error occurred.".to_string()),
+        ),
+    }
 }
 
 fn init_logging_from_config(
@@ -589,6 +1062,7 @@ fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
 async fn run_watcher(
     layout: &wa_core::config::WorkspaceLayout,
     config: &wa_core::config::Config,
+    config_path: Option<&Path>,
     auto_handle: bool,
     _foreground: bool,
     poll_interval: u64,
@@ -596,6 +1070,7 @@ async fn run_watcher(
     disable_lock: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
+    use wa_core::config::{Config, ConfigOverrides, HotReloadableConfig};
     use wa_core::lock::WatcherLock;
     use wa_core::patterns::PatternEngine;
     use wa_core::runtime::{ObservationRuntime, RuntimeConfig};
@@ -669,9 +1144,11 @@ async fn run_watcher(
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(poll_interval),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
+        min_capture_interval: Duration::from_millis(50),
         overlap_size: 4096, // Default overlap window size
         pane_filter: config.ingest.panes.clone(),
         channel_buffer: 1024,
+        max_concurrent_captures: 10,
     };
 
     // Create and start the observation runtime
@@ -679,19 +1156,78 @@ async fn run_watcher(
     let handle = runtime.start().await?;
     tracing::info!("Observation runtime started");
 
-    // Wait for shutdown signal (SIGINT or SIGTERM)
+    // Track current config for hot reload
+    let mut current_config = config.clone();
+
+    // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config)
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sighup = signal(SignalKind::hangup())?;
 
-        tokio::select! {
-            _ = sigint.recv() => {
-                tracing::info!("Received SIGINT, initiating graceful shutdown");
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT, initiating graceful shutdown");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                    break;
+                }
+                _ = sighup.recv() => {
+                    tracing::info!("Received SIGHUP, attempting config reload");
+
+                    // Reload config from disk
+                    match Config::load_with_overrides(config_path, false, &ConfigOverrides::default()) {
+                        Ok(new_config) => {
+                            // Check what changed
+                            let diff = current_config.diff_for_hot_reload(&new_config);
+
+                            if !diff.allowed {
+                                tracing::warn!(
+                                    "Config reload blocked: forbidden changes detected"
+                                );
+                                for fc in &diff.forbidden {
+                                    tracing::warn!(
+                                        setting = %fc.name,
+                                        reason = %fc.reason,
+                                        "Forbidden config change"
+                                    );
+                                }
+                                tracing::warn!(
+                                    "Restart the watcher to apply these changes"
+                                );
+                            } else if diff.changes.is_empty() {
+                                tracing::info!("No configuration changes detected");
+                            } else {
+                                // Log and apply changes
+                                for change in &diff.changes {
+                                    tracing::info!(
+                                        setting = %change.name,
+                                        old = %change.old_value,
+                                        new = %change.new_value,
+                                        "Applying config change"
+                                    );
+                                }
+
+                                // Create hot-reloadable config and apply to runtime
+                                let hot_config = HotReloadableConfig::from_config(&new_config);
+                                if let Err(e) = handle.apply_config_update(hot_config) {
+                                    tracing::error!(error = %e, "Failed to apply config update");
+                                } else {
+                                    current_config = new_config;
+                                    tracing::info!("Config reload complete");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to reload config");
+                        }
+                    }
+                }
             }
         }
     }
@@ -815,6 +1351,7 @@ async fn main() -> anyhow::Result<()> {
             run_watcher(
                 &layout,
                 &config,
+                resolved_config_path.as_deref(),
                 auto_handle,
                 foreground,
                 poll_interval,
@@ -826,11 +1363,16 @@ async fn main() -> anyhow::Result<()> {
 
         Some(Commands::Robot { command }) => {
             let start = std::time::Instant::now();
-            let command = command.unwrap_or(RobotCommands::Help);
+            let command = command.unwrap_or(RobotCommands::QuickStart);
 
             match command {
                 RobotCommands::Help => {
                     let response = RobotResponse::success(build_robot_help(), elapsed_ms(start));
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                RobotCommands::QuickStart => {
+                    let response =
+                        RobotResponse::success(build_robot_quick_start(), elapsed_ms(start));
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
                 other => {
@@ -872,14 +1414,37 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        RobotCommands::GetText { pane_id } => {
-                            let response: RobotResponse<String> = RobotResponse::error_with_code(
-                                ROBOT_ERR_NOT_IMPLEMENTED,
-                                format!("get-text for pane {pane_id} not yet implemented"),
-                                None,
-                                elapsed_ms(start),
-                            );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        RobotCommands::GetText { pane_id, tail, escapes } => {
+                            let wezterm = wa_core::wezterm::WeztermClient::new();
+                            match wezterm.get_text(pane_id, escapes).await {
+                                Ok(full_text) => {
+                                    // Apply tail truncation
+                                    let (text, truncated, truncation_info) =
+                                        apply_tail_truncation(&full_text, tail);
+
+                                    let data = RobotGetTextData {
+                                        pane_id,
+                                        text,
+                                        tail_lines: tail,
+                                        escapes_included: escapes,
+                                        truncated,
+                                        truncation_info,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(e) => {
+                                    // Map errors to stable codes
+                                    let (code, hint) = map_wezterm_error_to_robot(&e);
+                                    let response = RobotResponse::<RobotGetTextData>::error_with_code(
+                                        code,
+                                        format!("{e}"),
+                                        hint,
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
                         RobotCommands::Send {
                             pane_id,
@@ -914,40 +1479,548 @@ async fn main() -> anyhow::Result<()> {
                         }
                         RobotCommands::WaitFor {
                             pane_id,
-                            rule_id,
-                            timeout,
+                            pattern,
+                            timeout_secs,
+                            tail,
+                            regex,
                         } => {
-                            let response: RobotResponse<()> = RobotResponse::error_with_code(
-                                ROBOT_ERR_NOT_IMPLEMENTED,
-                                format!(
-                                    "wait-for on pane {pane_id} for rule {rule_id} (timeout {timeout}ms) not yet implemented"
-                                ),
-                                None,
-                                elapsed_ms(start),
+                            use std::time::Duration;
+                            use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient};
+
+                            // Build the matcher
+                            let matcher = if regex {
+                                match fancy_regex::Regex::new(&pattern) {
+                                    Ok(compiled) => WaitMatcher::regex(compiled),
+                                    Err(e) => {
+                                        let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                            "WA-ROBOT-INVALID-REGEX",
+                                            format!("Invalid regex pattern: {e}"),
+                                            Some("Check the regex syntax".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                WaitMatcher::substring(&pattern)
+                            };
+
+                            // Create WezTerm client
+                            let wezterm = WeztermClient::new();
+
+                            // First verify the pane exists
+                            match wezterm.list_panes().await {
+                                Ok(panes) => {
+                                    if !panes.iter().any(|p| p.pane_id == pane_id) {
+                                        let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                            "WA-ROBOT-PANE-NOT-FOUND",
+                                            format!("Pane {pane_id} not found"),
+                                            Some("Use 'wa robot state' to list available panes".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                        "WA-ROBOT-WEZTERM-ERROR",
+                                        format!("Failed to list panes: {e}"),
+                                        None,
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            }
+
+                            // Configure wait options
+                            let options = WaitOptions {
+                                tail_lines: tail,
+                                escapes: false,
+                                ..WaitOptions::default()
+                            };
+
+                            // Create waiter and wait
+                            let waiter = PaneWaiter::new(&wezterm).with_options(options);
+                            let timeout = Duration::from_secs(timeout_secs);
+
+                            tracing::info!(
+                                pane_id,
+                                pattern = %pattern,
+                                timeout_secs,
+                                is_regex = regex,
+                                "Starting wait-for"
                             );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+
+                            match waiter.wait_for(pane_id, &matcher, timeout).await {
+                                Ok(WaitResult::Matched { elapsed_ms: elapsed, polls }) => {
+                                    let data = RobotWaitForData {
+                                        pane_id,
+                                        pattern,
+                                        matched: true,
+                                        elapsed_ms: elapsed,
+                                        polls,
+                                        is_regex: regex,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Ok(WaitResult::TimedOut { elapsed_ms: elapsed, polls, .. }) => {
+                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                        "WA-ROBOT-TIMEOUT",
+                                        format!(
+                                            "Timeout waiting for pattern '{}' after {}ms ({} polls)",
+                                            pattern, elapsed, polls
+                                        ),
+                                        Some("Increase --timeout-secs or check if the pattern is correct".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                        "WA-ROBOT-GET-TEXT-FAILED",
+                                        format!("Failed to get pane text: {e}"),
+                                        None,
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
-                        RobotCommands::Search { query } => {
-                            let response: RobotResponse<Vec<String>> =
-                                RobotResponse::error_with_code(
-                                    ROBOT_ERR_NOT_IMPLEMENTED,
-                                    format!("search for '{query}' not yet implemented"),
-                                    None,
-                                    elapsed_ms(start),
-                                );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        RobotCommands::Search {
+                            query,
+                            limit,
+                            pane,
+                            since,
+                            snippets,
+                        } => {
+                            // Get workspace layout for db path
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to get workspace layout: {e}"),
+                                        Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Open storage handle
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to open storage: {e}"),
+                                        Some("Is the database initialized? Run 'wa watch' first.".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Build search options
+                            let options = wa_core::storage::SearchOptions {
+                                limit: Some(limit),
+                                pane_id: pane,
+                                since,
+                                until: None,
+                                include_snippets: Some(snippets),
+                                snippet_max_tokens: Some(30), // Reasonable default for terminal output
+                                highlight_prefix: Some(">>".to_string()),
+                                highlight_suffix: Some("<<".to_string()),
+                            };
+
+                            // Perform search
+                            match storage.search_with_results(&query, options).await {
+                                Ok(results) => {
+                                    let total_hits = results.len();
+                                    let hits: Vec<RobotSearchHit> = results
+                                        .into_iter()
+                                        .map(|r| RobotSearchHit {
+                                            segment_id: r.segment.id,
+                                            pane_id: r.segment.pane_id,
+                                            seq: r.segment.seq,
+                                            captured_at: r.segment.captured_at,
+                                            score: r.score,
+                                            snippet: r.snippet,
+                                            content: if snippets {
+                                                None // Don't include full content when snippets are requested
+                                            } else {
+                                                Some(r.segment.content)
+                                            },
+                                        })
+                                        .collect();
+
+                                    let data = RobotSearchData {
+                                        query,
+                                        results: hits,
+                                        total_hits,
+                                        limit,
+                                        pane_filter: pane,
+                                        since_filter: since,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(e) => {
+                                    // Map storage errors to robot error codes
+                                    let (code, hint) = match &e {
+                                        wa_core::Error::Storage(
+                                            wa_core::StorageError::FtsQueryError(_),
+                                        ) => (
+                                            ROBOT_ERR_FTS_QUERY,
+                                            Some("Check FTS5 query syntax. Supported: words, \"phrases\", prefix*, AND/OR/NOT".to_string()),
+                                        ),
+                                        _ => (ROBOT_ERR_STORAGE, None),
+                                    };
+                                    let response = RobotResponse::<RobotSearchData>::error_with_code(
+                                        code,
+                                        format!("{e}"),
+                                        hint,
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
-                        RobotCommands::Events { limit } => {
-                            let response: RobotResponse<Vec<wa_core::events::Event>> =
-                                RobotResponse::error_with_code(
-                                    ROBOT_ERR_NOT_IMPLEMENTED,
-                                    format!("events (limit {limit}) not yet implemented"),
-                                    None,
-                                    elapsed_ms(start),
-                                );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        RobotCommands::Events {
+                            limit,
+                            pane,
+                            rule_id,
+                            event_type,
+                            unhandled_only,
+                            since,
+                        } => {
+                            // Get workspace layout for DB path
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to get workspace layout: {e}"),
+                                        Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Open storage handle
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to open storage: {e}"),
+                                        Some("Is the database initialized? Run 'wa watch' first.".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Build event query
+                            let query = wa_core::storage::EventQuery {
+                                limit: Some(limit),
+                                pane_id: pane,
+                                rule_id: rule_id.clone(),
+                                event_type: event_type.clone(),
+                                unhandled_only,
+                                since,
+                                until: None,
+                            };
+
+                            // Query events
+                            match storage.get_events(query).await {
+                                Ok(events) => {
+                                    let total_count = events.len();
+                                    let items: Vec<RobotEventItem> = events
+                                        .into_iter()
+                                        .map(|e| {
+                                            // Derive pack_id from rule_id (e.g., "codex.usage.reached" -> "builtin:codex")
+                                            let pack_id = e
+                                                .rule_id
+                                                .split('.')
+                                                .next()
+                                                .map(|agent| format!("builtin:{agent}"))
+                                                .unwrap_or_else(|| "builtin:unknown".to_string());
+                                            RobotEventItem {
+                                                id: e.id,
+                                                pane_id: e.pane_id,
+                                                rule_id: e.rule_id,
+                                                pack_id,
+                                                event_type: e.event_type,
+                                                severity: e.severity,
+                                                confidence: e.confidence,
+                                                extracted: e.extracted,
+                                                captured_at: e.detected_at,
+                                                handled_at: e.handled_at,
+                                                workflow_id: e.handled_by_workflow_id,
+                                            }
+                                        })
+                                        .collect();
+
+                                    let data = RobotEventsData {
+                                        events: items,
+                                        total_count,
+                                        limit,
+                                        pane_filter: pane,
+                                        rule_id_filter: rule_id,
+                                        event_type_filter: event_type,
+                                        unhandled_only,
+                                        since_filter: since,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(e) => {
+                                    let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to query events: {e}"),
+                                        None,
+                                        elapsed_ms(start),
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
-                        RobotCommands::Help => unreachable!("handled above"),
+                        RobotCommands::Workflow {
+                            name,
+                            pane_id,
+                            force,
+                        } => {
+                            use std::sync::Arc;
+                            use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
+                            use wa_core::storage::StorageHandle;
+                            use wa_core::workflows::{
+                                PaneWorkflowLockManager, WorkflowEngine, WorkflowExecutionResult,
+                                WorkflowRunner, WorkflowRunnerConfig,
+                            };
+
+                            // Verify pane exists
+                            let wezterm = wa_core::wezterm::WeztermClient::new();
+                            match wezterm.list_panes().await {
+                                Ok(panes) => {
+                                    if !panes.iter().any(|p| p.pane_id == pane_id) {
+                                        let response =
+                                            RobotResponse::<RobotWorkflowData>::error_with_code(
+                                                "robot.pane_not_found",
+                                                format!("Pane {pane_id} does not exist"),
+                                                Some(
+                                                    "Use 'wa robot state' to list available panes."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    let (code, hint) = map_wezterm_error_to_robot(&e);
+                                    let response =
+                                        RobotResponse::<RobotWorkflowData>::error_with_code(
+                                            code,
+                                            format!("{e}"),
+                                            hint,
+                                            elapsed_ms(start),
+                                        );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            }
+
+                            // Set up workflow infrastructure
+                            let db_path = &_ctx.effective.paths.db_path;
+                            let storage = match StorageHandle::new(db_path).await {
+                                Ok(s) => Arc::new(s),
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotWorkflowData>::error_with_code(
+                                            "robot.storage_error",
+                                            format!("Failed to open storage: {e}"),
+                                            Some("Check database path and permissions.".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            let engine = WorkflowEngine::new(10);
+                            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+
+                            // Create policy engine from safety config
+                            let policy_engine = PolicyEngine::new(
+                                config.safety.rate_limit_per_pane,
+                                config.safety.rate_limit_global,
+                                false, // Don't require prompt active for robot mode
+                            );
+
+                            // Create policy-gated injector with WezTerm client
+                            let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                            let injector = Arc::new(tokio::sync::Mutex::new(
+                                PolicyGatedInjector::new(policy_engine, wezterm_client),
+                            ));
+                            let runner_config = WorkflowRunnerConfig::default();
+                            let runner = WorkflowRunner::new(
+                                engine,
+                                lock_manager,
+                                Arc::clone(&storage),
+                                injector,
+                                runner_config,
+                            );
+
+                            // Look up workflow by name
+                            let workflow = runner.find_workflow_by_name(&name);
+                            let _ = force; // Will be used when implementing "already handled" bypass
+
+                            match workflow {
+                                Some(wf) => {
+                                    // Generate execution ID
+                                    let execution_id = format!(
+                                        "robot-{}-{}",
+                                        name,
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    );
+
+                                    // Run the workflow
+                                    let result = runner
+                                        .run_workflow(pane_id, wf, &execution_id, 0)
+                                        .await;
+
+                                    let (status, message, result_value, steps_executed, step_index) =
+                                        match result {
+                                            WorkflowExecutionResult::Completed {
+                                                result,
+                                                steps_executed,
+                                                ..
+                                            } => (
+                                                "completed",
+                                                None,
+                                                Some(result),
+                                                Some(steps_executed),
+                                                None,
+                                            ),
+                                            WorkflowExecutionResult::Aborted {
+                                                reason,
+                                                step_index,
+                                                ..
+                                            } => (
+                                                "aborted",
+                                                Some(reason),
+                                                None,
+                                                None,
+                                                Some(step_index),
+                                            ),
+                                            WorkflowExecutionResult::PolicyDenied {
+                                                reason,
+                                                step_index,
+                                                ..
+                                            } => (
+                                                "policy_denied",
+                                                Some(reason),
+                                                None,
+                                                None,
+                                                Some(step_index),
+                                            ),
+                                            WorkflowExecutionResult::Error { error, .. } => (
+                                                "error",
+                                                Some(error),
+                                                None,
+                                                None,
+                                                None, // Error variant doesn't track step_index
+                                            ),
+                                        };
+
+                                    let workflow_elapsed = elapsed_ms(start);
+                                    let data = RobotWorkflowData {
+                                        workflow_name: name.clone(),
+                                        pane_id,
+                                        execution_id: Some(execution_id),
+                                        status: status.to_string(),
+                                        message,
+                                        result: result_value,
+                                        steps_executed,
+                                        step_index,
+                                        elapsed_ms: Some(workflow_elapsed),
+                                    };
+
+                                    let response = if status == "completed" {
+                                        RobotResponse::success(data, workflow_elapsed)
+                                    } else if status == "policy_denied" {
+                                        RobotResponse::<RobotWorkflowData>::error_with_code(
+                                            "robot.policy_denied",
+                                            format!("Workflow '{}' denied by policy", name),
+                                            Some(
+                                                "Check safety configuration or use --dry-run."
+                                                    .to_string(),
+                                            ),
+                                            workflow_elapsed,
+                                        )
+                                    } else {
+                                        RobotResponse::<RobotWorkflowData>::error_with_code(
+                                            &format!("robot.workflow_{}", status),
+                                            format!(
+                                                "Workflow '{}' {}",
+                                                name,
+                                                data.message.as_deref().unwrap_or("failed")
+                                            ),
+                                            None,
+                                            workflow_elapsed,
+                                        )
+                                    };
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                None => {
+                                    // No workflow registered with this name
+                                    // Note: In standalone robot mode, no workflows are registered.
+                                    // The daemon (wa watch --auto-handle) would have workflows
+                                    // registered for event-driven execution.
+                                    let response =
+                                        RobotResponse::<RobotWorkflowData>::error_with_code(
+                                            "robot.workflow_not_found",
+                                            format!("Workflow '{}' not found", name),
+                                            Some(
+                                                "No workflows registered in standalone mode. \
+                                                 Use 'wa watch --auto-handle' for event-driven workflows."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    tracing::debug!(
+                                        workflow = %name,
+                                        pane_id,
+                                        "Workflow not found"
+                                    );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
+
+                            // Clean shutdown of storage
+                            if let Err(e) = storage.shutdown().await {
+                                tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                            }
+                        }
+                        RobotCommands::Help | RobotCommands::QuickStart => {
+                            unreachable!("handled above")
+                        }
                     }
                 }
             }
