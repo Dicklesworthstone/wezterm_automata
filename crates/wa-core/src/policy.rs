@@ -2689,4 +2689,78 @@ mod tests {
         assert_eq!(caps.alt_screen, Some(false));
         assert!(!caps.is_input_safe()); // No prompt active
     }
+
+    // ========================================================================
+    // InjectionResult Tests (wa-4vx.8.5)
+    // ========================================================================
+
+    #[test]
+    fn injection_result_allowed_is_allowed() {
+        let result = InjectionResult::Allowed {
+            decision: PolicyDecision::allow(),
+            summary: "ls -la".to_string(),
+            pane_id: 1,
+            action: ActionKind::SendText,
+        };
+        assert!(result.is_allowed());
+        assert!(!result.is_denied());
+        assert!(!result.requires_approval());
+        assert!(result.error_message().is_none());
+        assert!(result.rule_id().is_none());
+    }
+
+    #[test]
+    fn injection_result_denied_is_denied() {
+        let result = InjectionResult::Denied {
+            decision: PolicyDecision::deny_with_rule("unsafe command", "command.dangerous"),
+            summary: "rm -rf /".to_string(),
+            pane_id: 1,
+            action: ActionKind::SendText,
+        };
+        assert!(!result.is_allowed());
+        assert!(result.is_denied());
+        assert!(!result.requires_approval());
+        assert!(result.error_message().is_none());
+        assert_eq!(result.rule_id(), Some("command.dangerous"));
+    }
+
+    #[test]
+    fn injection_result_requires_approval_is_correct() {
+        let result = InjectionResult::RequiresApproval {
+            decision: PolicyDecision::require_approval_with_rule("needs approval", "policy.approval"),
+            summary: "git reset --hard".to_string(),
+            pane_id: 1,
+            action: ActionKind::SendText,
+        };
+        assert!(!result.is_allowed());
+        assert!(!result.is_denied());
+        assert!(result.requires_approval());
+        assert_eq!(result.rule_id(), Some("policy.approval"));
+    }
+
+    #[test]
+    fn injection_result_error_has_message() {
+        let result = InjectionResult::Error {
+            error: "pane not found".to_string(),
+            pane_id: 999,
+            action: ActionKind::SendText,
+        };
+        assert!(!result.is_allowed());
+        assert!(!result.is_denied());
+        assert!(!result.requires_approval());
+        assert_eq!(result.error_message(), Some("pane not found"));
+    }
+
+    #[test]
+    fn injection_result_serializes_correctly() {
+        let result = InjectionResult::Allowed {
+            decision: PolicyDecision::allow(),
+            summary: "echo test".to_string(),
+            pane_id: 42,
+            action: ActionKind::SendText,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"status\":\"allowed\""));
+        assert!(json.contains("\"pane_id\":42"));
+    }
 }
