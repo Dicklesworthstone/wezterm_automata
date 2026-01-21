@@ -400,7 +400,7 @@ impl PolicyCheck {
 impl From<&PolicyDecision> for PolicyCheck {
     fn from(decision: &PolicyDecision) -> Self {
         match decision {
-            PolicyDecision::Allow => Self::passed("policy", "Operation allowed"),
+            PolicyDecision::Allow { .. } => Self::passed("policy", "Operation allowed"),
             PolicyDecision::Deny { reason, .. } => Self::failed("policy", reason.as_str()),
             PolicyDecision::RequireApproval { reason, .. } => {
                 Self::failed("policy", format!("Approval required: {reason}"))

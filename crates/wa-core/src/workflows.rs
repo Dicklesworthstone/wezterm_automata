@@ -536,11 +536,8 @@ pub trait Workflow: Send + Sync {
     ///
     /// # Returns
     /// A `StepResult` indicating what should happen next.
-    fn execute_step(
-        &self,
-        ctx: &mut WorkflowContext,
-        step_idx: usize,
-    ) -> BoxFuture<'_, StepResult>;
+    fn execute_step(&self, ctx: &mut WorkflowContext, step_idx: usize)
+    -> BoxFuture<'_, StepResult>;
 
     /// Optional cleanup when workflow is aborted or completes with error.
     ///
@@ -1834,7 +1831,9 @@ impl WorkflowRunner {
 
         // Try to acquire pane lock
         let execution_id = generate_workflow_id(&workflow_name);
-        let lock_result = self.lock_manager.try_acquire(pane_id, &workflow_name, &execution_id);
+        let lock_result = self
+            .lock_manager
+            .try_acquire(pane_id, &workflow_name, &execution_id);
 
         match lock_result {
             LockAcquisitionResult::AlreadyLocked {
@@ -1864,7 +1863,13 @@ impl WorkflowRunner {
 
         match self
             .engine
-            .start(&self.storage, &workflow_name, pane_id, event_id, Some(context))
+            .start(
+                &self.storage,
+                &workflow_name,
+                pane_id,
+                event_id,
+                Some(context),
+            )
             .await
         {
             Ok(_execution) => WorkflowStartResult::Started {
@@ -2213,7 +2218,9 @@ impl WorkflowRunner {
 
                                     // Create a mini-runner for the spawned task
                                     let runner = WorkflowRunner {
-                                        workflows: std::sync::RwLock::new(vec![workflow_clone.clone()]),
+                                        workflows: std::sync::RwLock::new(vec![
+                                            workflow_clone.clone(),
+                                        ]),
                                         engine,
                                         lock_manager,
                                         storage,
@@ -2223,11 +2230,21 @@ impl WorkflowRunner {
 
                                     tokio::spawn(async move {
                                         let result = runner
-                                            .run_workflow(pane_id, workflow_clone, &execution_id_clone, 0)
+                                            .run_workflow(
+                                                pane_id,
+                                                workflow_clone,
+                                                &execution_id_clone,
+                                                0,
+                                            )
                                             .await;
 
                                         match &result {
-                                            WorkflowExecutionResult::Completed { execution_id, steps_executed, elapsed_ms, .. } => {
+                                            WorkflowExecutionResult::Completed {
+                                                execution_id,
+                                                steps_executed,
+                                                elapsed_ms,
+                                                ..
+                                            } => {
                                                 tracing::info!(
                                                     execution_id,
                                                     steps = steps_executed,
@@ -2235,7 +2252,12 @@ impl WorkflowRunner {
                                                     "Workflow completed"
                                                 );
                                             }
-                                            WorkflowExecutionResult::Aborted { execution_id, reason, step_index, .. } => {
+                                            WorkflowExecutionResult::Aborted {
+                                                execution_id,
+                                                reason,
+                                                step_index,
+                                                ..
+                                            } => {
                                                 tracing::warn!(
                                                     execution_id,
                                                     step = step_index,
@@ -2243,7 +2265,11 @@ impl WorkflowRunner {
                                                     "Workflow aborted"
                                                 );
                                             }
-                                            WorkflowExecutionResult::PolicyDenied { execution_id, step_index, reason } => {
+                                            WorkflowExecutionResult::PolicyDenied {
+                                                execution_id,
+                                                step_index,
+                                                reason,
+                                            } => {
                                                 tracing::warn!(
                                                     execution_id,
                                                     step = step_index,
@@ -2251,7 +2277,10 @@ impl WorkflowRunner {
                                                     "Workflow denied by policy"
                                                 );
                                             }
-                                            WorkflowExecutionResult::Error { execution_id, error } => {
+                                            WorkflowExecutionResult::Error {
+                                                execution_id,
+                                                error,
+                                            } => {
                                                 tracing::error!(
                                                     execution_id = execution_id.as_deref(),
                                                     error,
@@ -2283,7 +2312,10 @@ impl WorkflowRunner {
                     }
                 }
                 Err(crate::events::RecvError::Lagged { missed_count }) => {
-                    tracing::warn!(skipped = missed_count, "Workflow runner lagged, skipped events");
+                    tracing::warn!(
+                        skipped = missed_count,
+                        "Workflow runner lagged, skipped events"
+                    );
                 }
                 Err(crate::events::RecvError::Closed) => {
                     tracing::info!("Event bus closed, workflow runner stopping");
@@ -3986,7 +4018,11 @@ mod tests {
         // Create a minimal storage handle using temp file
         let rt = tokio::runtime::Runtime::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
         let storage = rt.block_on(async {
             Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
         });
@@ -4068,7 +4104,11 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
         let storage = rt.block_on(async {
             Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
         });
@@ -4147,7 +4187,11 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
         let storage = rt.block_on(async {
             Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap())
         });
@@ -4245,7 +4289,9 @@ mod tests {
     /// Test that policy denial is properly returned when sending to a running command.
     #[test]
     fn policy_denies_send_when_command_running() {
-        use crate::policy::{ActorKind, PolicyEngine, PaneCapabilities, PolicyInput, ActionKind, PolicyDecision};
+        use crate::policy::{
+            ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine, PolicyInput,
+        };
 
         // Create a strict policy engine (requires prompt active)
         let mut engine = PolicyEngine::strict();
@@ -4264,7 +4310,9 @@ mod tests {
 
         // Verify it's denied with the expected reason
         match decision {
-            PolicyDecision::Deny { reason, rule_id } => {
+            PolicyDecision::Deny {
+                reason, rule_id, ..
+            } => {
                 assert!(
                     reason.contains("running command") || reason.contains("wait for prompt"),
                     "Expected denial reason about running command, got: {reason}"
@@ -4278,7 +4326,9 @@ mod tests {
     /// Test that InjectionResult::Denied is returned when policy denies.
     #[tokio::test]
     async fn policy_gated_injector_returns_denied_for_running_command() {
-        use crate::policy::{ActorKind, PolicyEngine, PolicyGatedInjector, PaneCapabilities, InjectionResult};
+        use crate::policy::{
+            ActorKind, InjectionResult, PaneCapabilities, PolicyEngine, PolicyGatedInjector,
+        };
 
         // Create a strict policy engine (requires prompt active)
         let engine = PolicyEngine::strict();
@@ -4290,11 +4340,20 @@ mod tests {
 
         // Try to send text - should be denied by policy
         let result = injector
-            .send_text(42, "echo test", ActorKind::Workflow, &caps, Some("wf-test-002"))
+            .send_text(
+                42,
+                "echo test",
+                ActorKind::Workflow,
+                &caps,
+                Some("wf-test-002"),
+            )
             .await;
 
         // Verify it's denied
-        assert!(result.is_denied(), "Expected denied result, got: {result:?}");
+        assert!(
+            result.is_denied(),
+            "Expected denied result, got: {result:?}"
+        );
 
         // Verify the rule ID
         if let InjectionResult::Denied { decision, .. } = result {
@@ -4312,18 +4371,18 @@ mod tests {
     fn workflow_context_injector_access() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
 
         rt.block_on(async {
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
             // Create context without injector
-            let ctx = WorkflowContext::new(
-                storage.clone(),
-                42,
-                PaneCapabilities::default(),
-                "exec-001",
-            );
+            let ctx =
+                WorkflowContext::new(storage.clone(), 42, PaneCapabilities::default(), "exec-001");
             assert!(!ctx.has_injector());
 
             // Create context with injector
@@ -4333,13 +4392,9 @@ mod tests {
                 crate::policy::PolicyGatedInjector::new(engine, client),
             ));
 
-            let ctx_with_injector = WorkflowContext::new(
-                storage.clone(),
-                42,
-                PaneCapabilities::default(),
-                "exec-002",
-            )
-            .with_injector(injector);
+            let ctx_with_injector =
+                WorkflowContext::new(storage.clone(), 42, PaneCapabilities::default(), "exec-002")
+                    .with_injector(injector);
 
             assert!(ctx_with_injector.has_injector());
 

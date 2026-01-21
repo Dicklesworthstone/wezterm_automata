@@ -25,7 +25,7 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{CommandGateConfig, DcgDenyPolicy, DcgMode};
 // ============================================================================
@@ -203,7 +203,7 @@ impl ActorKind {
 /// When `alt_screen` is `None` (unknown), policy should default to deny or
 /// require approval for `SendText` actions, since we cannot safely determine
 /// if input is appropriate.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PaneCapabilities {
     /// Whether a shell prompt is currently active (from OSC 133)
@@ -322,6 +322,122 @@ impl PaneCapabilities {
 // Policy Decision
 // ============================================================================
 
+/// Full decision context captured during policy evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionContext {
+    /// Timestamp of decision (epoch ms)
+    pub timestamp_ms: i64,
+    /// Action being evaluated
+    pub action: ActionKind,
+    /// Actor requesting the action
+    pub actor: ActorKind,
+    /// Target pane ID (if applicable)
+    pub pane_id: Option<u64>,
+    /// Target domain (if applicable)
+    pub domain: Option<String>,
+    /// Capabilities snapshot used for the decision
+    pub capabilities: PaneCapabilities,
+    /// Optional redacted text summary
+    pub text_summary: Option<String>,
+    /// Optional workflow ID (if action is from a workflow)
+    pub workflow_id: Option<String>,
+    /// Rules evaluated in order
+    pub rules_evaluated: Vec<RuleEvaluation>,
+    /// Rule that determined the outcome (if any)
+    pub determining_rule: Option<String>,
+    /// Evidence collected during evaluation
+    pub evidence: Vec<DecisionEvidence>,
+    /// Rate limit snapshot, if applicable
+    pub rate_limit: Option<RateLimitSnapshot>,
+}
+
+impl DecisionContext {
+    /// Create an empty context (used only for manual/test decisions).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            timestamp_ms: 0,
+            action: ActionKind::ReadOutput,
+            actor: ActorKind::Human,
+            pane_id: None,
+            domain: None,
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            rules_evaluated: Vec::new(),
+            determining_rule: None,
+            evidence: Vec::new(),
+            rate_limit: None,
+        }
+    }
+
+    /// Record a rule evaluation in order.
+    pub fn record_rule(
+        &mut self,
+        rule_id: impl Into<String>,
+        matched: bool,
+        decision: Option<&str>,
+        reason: Option<String>,
+    ) {
+        self.rules_evaluated.push(RuleEvaluation {
+            rule_id: rule_id.into(),
+            matched,
+            decision: decision.map(str::to_string),
+            reason,
+        });
+    }
+
+    /// Mark the rule that determined the outcome.
+    pub fn set_determining_rule(&mut self, rule_id: impl Into<String>) {
+        self.determining_rule = Some(rule_id.into());
+    }
+
+    /// Add evidence to the context.
+    pub fn add_evidence(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.evidence.push(DecisionEvidence {
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+}
+
+/// Per-rule evaluation details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleEvaluation {
+    /// Rule identifier
+    pub rule_id: String,
+    /// Whether the rule matched
+    pub matched: bool,
+    /// Decision produced by the rule (allow/deny/require_approval), if any
+    pub decision: Option<String>,
+    /// Optional reason or explanation
+    pub reason: Option<String>,
+}
+
+/// Evidence captured for debugging/explainability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionEvidence {
+    /// Evidence key
+    pub key: String,
+    /// Evidence value (stringified)
+    pub value: String,
+}
+
+/// Snapshot of rate limit state when a decision is made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitSnapshot {
+    /// Scope string (per_pane:<id> or global)
+    pub scope: String,
+    /// Action kind
+    pub action: String,
+    /// Limit per minute
+    pub limit: u32,
+    /// Current count in the window
+    pub current: usize,
+    /// Suggested retry-after in seconds
+    pub retry_after_secs: u64,
+}
+
 /// Allow-once approval payload for RequireApproval decisions
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
@@ -342,7 +458,11 @@ pub struct ApprovalRequest {
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum PolicyDecision {
     /// Action is allowed
-    Allow,
+    Allow {
+        /// Decision context
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<DecisionContext>,
+    },
     /// Action is denied
     Deny {
         /// Human-readable reason for denial
@@ -350,6 +470,9 @@ pub enum PolicyDecision {
         /// Optional stable rule ID that triggered denial
         #[serde(skip_serializing_if = "Option::is_none")]
         rule_id: Option<String>,
+        /// Decision context
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<DecisionContext>,
     },
     /// Action requires explicit user approval
     RequireApproval {
@@ -361,6 +484,9 @@ pub enum PolicyDecision {
         /// Optional allow-once approval payload
         #[serde(skip_serializing_if = "Option::is_none")]
         approval: Option<ApprovalRequest>,
+        /// Decision context
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<DecisionContext>,
     },
 }
 
@@ -368,7 +494,7 @@ impl PolicyDecision {
     /// Create an Allow decision
     #[must_use]
     pub const fn allow() -> Self {
-        Self::Allow
+        Self::Allow { context: None }
     }
 
     /// Create a Deny decision with a reason
@@ -377,6 +503,7 @@ impl PolicyDecision {
         Self::Deny {
             reason: reason.into(),
             rule_id: None,
+            context: None,
         }
     }
 
@@ -386,6 +513,7 @@ impl PolicyDecision {
         Self::Deny {
             reason: reason.into(),
             rule_id: Some(rule_id.into()),
+            context: None,
         }
     }
 
@@ -396,6 +524,7 @@ impl PolicyDecision {
             reason: reason.into(),
             rule_id: None,
             approval: None,
+            context: None,
         }
     }
 
@@ -409,13 +538,14 @@ impl PolicyDecision {
             reason: reason.into(),
             rule_id: Some(rule_id.into()),
             approval: None,
+            context: None,
         }
     }
 
     /// Returns true if the action is allowed
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allow)
+        matches!(self, Self::Allow { .. })
     }
 
     /// Returns true if the action is denied
@@ -446,7 +576,7 @@ impl PolicyDecision {
             Self::Deny { rule_id, .. } | Self::RequireApproval { rule_id, .. } => {
                 rule_id.as_deref()
             }
-            Self::Allow => None,
+            Self::Allow { .. } => None,
         }
     }
 
@@ -455,13 +585,55 @@ impl PolicyDecision {
     pub fn with_approval(self, approval: ApprovalRequest) -> Self {
         match self {
             Self::RequireApproval {
-                reason, rule_id, ..
+                reason,
+                rule_id,
+                context,
+                ..
             } => Self::RequireApproval {
                 reason,
                 rule_id,
                 approval: Some(approval),
+                context,
             },
             other => other,
+        }
+    }
+
+    /// Attach decision context to this decision.
+    #[must_use]
+    pub fn with_context(self, context: DecisionContext) -> Self {
+        match self {
+            Self::Allow { .. } => Self::Allow {
+                context: Some(context),
+            },
+            Self::Deny {
+                reason, rule_id, ..
+            } => Self::Deny {
+                reason,
+                rule_id,
+                context: Some(context),
+            },
+            Self::RequireApproval {
+                reason,
+                rule_id,
+                approval,
+                ..
+            } => Self::RequireApproval {
+                reason,
+                rule_id,
+                approval,
+                context: Some(context),
+            },
+        }
+    }
+
+    /// Get decision context, if present.
+    #[must_use]
+    pub fn context(&self) -> Option<&DecisionContext> {
+        match self {
+            Self::Allow { context }
+            | Self::Deny { context, .. }
+            | Self::RequireApproval { context, .. } => context.as_ref(),
         }
     }
 
@@ -469,7 +641,7 @@ impl PolicyDecision {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Allow => "allow",
+            Self::Allow { .. } => "allow",
             Self::Deny { .. } => "deny",
             Self::RequireApproval { .. } => "require_approval",
         }
@@ -480,7 +652,7 @@ impl PolicyDecision {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Deny { reason, .. } | Self::RequireApproval { reason, .. } => Some(reason),
-            Self::Allow => None,
+            Self::Allow { .. } => None,
         }
     }
 
@@ -581,6 +753,67 @@ impl PolicyInput {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl DecisionContext {
+    /// Build a decision context from a policy input.
+    #[must_use]
+    pub fn from_input(input: &PolicyInput) -> Self {
+        let mut ctx = Self {
+            timestamp_ms: now_ms(),
+            action: input.action,
+            actor: input.actor,
+            pane_id: input.pane_id,
+            domain: input.domain.clone(),
+            capabilities: input.capabilities.clone(),
+            text_summary: input.text_summary.clone(),
+            workflow_id: input.workflow_id.clone(),
+            rules_evaluated: Vec::new(),
+            determining_rule: None,
+            evidence: Vec::new(),
+            rate_limit: None,
+        };
+
+        ctx.add_evidence(
+            "prompt_active",
+            input.capabilities.prompt_active.to_string(),
+        );
+        ctx.add_evidence(
+            "command_running",
+            input.capabilities.command_running.to_string(),
+        );
+        ctx.add_evidence(
+            "alt_screen",
+            input
+                .capabilities
+                .alt_screen
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+        );
+        ctx.add_evidence(
+            "has_recent_gap",
+            input.capabilities.has_recent_gap.to_string(),
+        );
+        ctx.add_evidence("is_reserved", input.capabilities.is_reserved.to_string());
+        if let Some(reserved_by) = &input.capabilities.reserved_by {
+            ctx.add_evidence("reserved_by", reserved_by.clone());
+        }
+        if let Some(text) = input.command_text.as_ref() {
+            ctx.add_evidence("command_text_present", "true");
+            ctx.add_evidence("command_text_len", text.len().to_string());
+            ctx.add_evidence("command_candidate", is_command_candidate(text).to_string());
+        } else {
+            ctx.add_evidence("command_text_present", "false");
+        }
+
+        ctx
+    }
+}
+
 /// Rolling window for rate limiting
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
@@ -639,6 +872,21 @@ impl RateLimitHit {
         reason.push_str(". Remediation: wait before retrying or reduce concurrency.");
 
         reason
+    }
+}
+
+fn rate_limit_snapshot_from_hit(hit: &RateLimitHit) -> RateLimitSnapshot {
+    let scope = match hit.scope {
+        RateLimitScope::PerPane { pane_id } => format!("per_pane:{pane_id}"),
+        RateLimitScope::Global => "global".to_string(),
+    };
+
+    RateLimitSnapshot {
+        scope,
+        action: hit.action.as_str().to_string(),
+        limit: hit.limit,
+        current: hit.current,
+        retry_after_secs: hit.retry_after.as_millis().div_ceil(1000) as u64,
     }
 }
 
@@ -1396,17 +1644,37 @@ impl PolicyEngine {
     /// assert!(decision.is_allowed());
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
+        let mut context = DecisionContext::from_input(input);
+
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
             match self.rate_limiter.check(input.action, input.pane_id) {
-                RateLimitOutcome::Allowed => {}
+                RateLimitOutcome::Allowed => {
+                    context.record_rule("policy.rate_limit", false, None, None);
+                }
                 RateLimitOutcome::Limited(hit) => {
+                    context.rate_limit = Some(rate_limit_snapshot_from_hit(&hit));
+                    context.record_rule(
+                        "policy.rate_limit",
+                        true,
+                        Some("require_approval"),
+                        Some(hit.reason()),
+                    );
+                    context.set_determining_rule("policy.rate_limit");
                     return PolicyDecision::require_approval_with_rule(
                         hit.reason(),
                         "policy.rate_limit",
-                    );
+                    )
+                    .with_context(context);
                 }
             }
+        } else {
+            context.record_rule(
+                "policy.rate_limit",
+                false,
+                None,
+                Some("action not rate limited".to_string()),
+            );
         }
 
         // Check prompt state for send actions
@@ -1416,18 +1684,41 @@ impl PolicyEngine {
         {
             // If command is running, deny
             if input.capabilities.command_running {
+                context.record_rule(
+                    "policy.prompt_required",
+                    true,
+                    Some("deny"),
+                    Some("command running".to_string()),
+                );
+                context.set_determining_rule("policy.prompt_required");
                 return PolicyDecision::deny_with_rule(
                     "Refusing to send to running command - wait for prompt",
                     "policy.prompt_required",
-                );
+                )
+                .with_context(context);
             }
             // If state is unknown, require approval for non-trusted actors
             if !input.actor.is_trusted() {
+                context.record_rule(
+                    "policy.prompt_unknown",
+                    true,
+                    Some("require_approval"),
+                    Some("prompt inactive and actor untrusted".to_string()),
+                );
+                context.set_determining_rule("policy.prompt_unknown");
                 return PolicyDecision::require_approval_with_rule(
                     "Pane state unknown - approval required before sending",
                     "policy.prompt_unknown",
-                );
+                )
+                .with_context(context);
             }
+        } else {
+            context.record_rule(
+                "policy.prompt_required",
+                false,
+                None,
+                Some("prompt gate not applicable".to_string()),
+            );
         }
 
         // Check reservation conflicts
@@ -1437,50 +1728,117 @@ impl PolicyEngine {
                 (&input.capabilities.reserved_by, &input.workflow_id)
             {
                 if reserved_by == workflow_id {
-                    return PolicyDecision::allow();
+                    context.record_rule(
+                        "policy.pane_reserved",
+                        false,
+                        None,
+                        Some("reserved by same workflow".to_string()),
+                    );
+                    return PolicyDecision::allow().with_context(context);
                 }
             }
             // Otherwise deny
-            return PolicyDecision::deny_with_rule(
-                format!(
-                    "Pane is reserved by workflow {}",
-                    input
-                        .capabilities
-                        .reserved_by
-                        .as_deref()
-                        .unwrap_or("unknown")
-                ),
-                "policy.pane_reserved",
+            let reason = format!(
+                "Pane is reserved by workflow {}",
+                input
+                    .capabilities
+                    .reserved_by
+                    .as_deref()
+                    .unwrap_or("unknown")
             );
+            context.record_rule(
+                "policy.pane_reserved",
+                true,
+                Some("deny"),
+                Some(reason.clone()),
+            );
+            context.set_determining_rule("policy.pane_reserved");
+            return PolicyDecision::deny_with_rule(reason, "policy.pane_reserved")
+                .with_context(context);
         }
+        context.record_rule(
+            "policy.pane_reserved",
+            false,
+            None,
+            Some("no reservation conflict".to_string()),
+        );
 
         // Command safety gate for SendText
         if matches!(input.action, ActionKind::SendText) {
             if let Some(text) = input.command_text.as_deref() {
                 match evaluate_command_gate(text, &self.command_gate) {
-                    CommandGateOutcome::Allow => {}
+                    CommandGateOutcome::Allow => {
+                        context.record_rule(
+                            "policy.command_gate",
+                            false,
+                            None,
+                            Some("command gate allow".to_string()),
+                        );
+                    }
                     CommandGateOutcome::Deny { reason, rule_id } => {
-                        return PolicyDecision::deny_with_rule(reason, rule_id);
+                        context.record_rule(
+                            rule_id.clone(),
+                            true,
+                            Some("deny"),
+                            Some(reason.clone()),
+                        );
+                        context.set_determining_rule(rule_id.clone());
+                        return PolicyDecision::deny_with_rule(reason, rule_id)
+                            .with_context(context);
                     }
                     CommandGateOutcome::RequireApproval { reason, rule_id } => {
-                        return PolicyDecision::require_approval_with_rule(reason, rule_id);
+                        context.record_rule(
+                            rule_id.clone(),
+                            true,
+                            Some("require_approval"),
+                            Some(reason.clone()),
+                        );
+                        context.set_determining_rule(rule_id.clone());
+                        return PolicyDecision::require_approval_with_rule(reason, rule_id)
+                            .with_context(context);
                     }
                 }
+            } else {
+                context.record_rule(
+                    "policy.command_gate",
+                    false,
+                    None,
+                    Some("no command text".to_string()),
+                );
             }
+        } else {
+            context.record_rule(
+                "policy.command_gate",
+                false,
+                None,
+                Some("non-send action".to_string()),
+            );
         }
 
         // Destructive actions require approval for non-trusted actors
         if input.action.is_destructive() && !input.actor.is_trusted() {
-            return PolicyDecision::require_approval_with_rule(
-                format!(
-                    "Destructive action '{}' requires approval",
-                    input.action.as_str()
-                ),
-                "policy.destructive_action",
+            let reason = format!(
+                "Destructive action '{}' requires approval",
+                input.action.as_str()
             );
+            context.record_rule(
+                "policy.destructive_action",
+                true,
+                Some("require_approval"),
+                Some(reason.clone()),
+            );
+            context.set_determining_rule("policy.destructive_action");
+            return PolicyDecision::require_approval_with_rule(reason, "policy.destructive_action")
+                .with_context(context);
         }
+        context.record_rule(
+            "policy.destructive_action",
+            false,
+            None,
+            Some("non-destructive or trusted actor".to_string()),
+        );
 
-        PolicyDecision::allow()
+        PolicyDecision::allow().with_context(context)
     }
 
     /// Legacy: Check if send operation is allowed
@@ -1653,6 +2011,9 @@ impl InjectionResult {
                 rule_id: None,
                 input_summary: Some(summary.clone()),
                 verification_summary: None,
+                decision_context: decision
+                    .context()
+                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
                 result: "success".to_string(),
             },
             Self::Denied {
@@ -1673,6 +2034,9 @@ impl InjectionResult {
                 rule_id: decision.rule_id().map(String::from),
                 input_summary: Some(summary.clone()),
                 verification_summary: None,
+                decision_context: decision
+                    .context()
+                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
                 result: "denied".to_string(),
             },
             Self::RequiresApproval {
@@ -1693,6 +2057,9 @@ impl InjectionResult {
                 rule_id: decision.rule_id().map(String::from),
                 input_summary: Some(summary.clone()),
                 verification_summary: None,
+                decision_context: decision
+                    .context()
+                    .and_then(|ctx| serde_json::to_string(ctx).ok()),
                 result: "require_approval".to_string(),
             },
             Self::Error {
@@ -1712,6 +2079,7 @@ impl InjectionResult {
                 rule_id: None,
                 input_summary: None,
                 verification_summary: Some(error.clone()),
+                decision_context: None,
                 result: "error".to_string(),
             },
         }
@@ -1959,7 +2327,7 @@ impl PolicyGatedInjector {
 
         // Build the injection result
         let result = match &decision {
-            PolicyDecision::Allow => {
+            PolicyDecision::Allow { .. } => {
                 // SAFETY: This is the only place where actual injection happens
                 // after policy approval. The text reference lifetime is handled
                 // by copying to a String for the actual send.

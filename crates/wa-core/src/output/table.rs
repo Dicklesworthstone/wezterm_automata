@@ -215,10 +215,7 @@ impl Table {
             .map(|row| {
                 let mut obj = serde_json::Map::new();
                 for (i, cell) in row.iter().enumerate() {
-                    let key = self.columns[i]
-                        .header
-                        .to_lowercase()
-                        .replace(' ', "_");
+                    let key = self.columns[i].header.to_lowercase().replace(' ', "_");
                     obj.insert(key, serde_json::Value::String(strip_ansi(cell)));
                 }
                 serde_json::Value::Object(obj)

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, trace};
 
 use crate::ingest::{CapturedSegment, PaneCursor};
@@ -182,10 +182,8 @@ impl TailerSupervisor {
         // Add tailers for new panes
         for &pane_id in observed_panes.keys() {
             if !self.tailers.contains_key(&pane_id) {
-                self.tailers.insert(
-                    pane_id,
-                    PaneTailer::new(pane_id, self.config.min_interval),
-                );
+                self.tailers
+                    .insert(pane_id, PaneTailer::new(pane_id, self.config.min_interval));
                 self.supervisor_metrics.tailers_started += 1;
                 debug!(pane_id, "Added tailer for new pane");
             }
@@ -213,7 +211,7 @@ impl TailerSupervisor {
 
         // Capture from each ready pane
         let mut cursors = self.cursors.write().await;
-        
+
         for pane_id in ready_panes {
             let Some(_cursor) = cursors.get_mut(&pane_id) else {
                 continue;
@@ -274,7 +272,7 @@ mod tests {
         };
 
         let mut tailer = PaneTailer::new(1, config.min_interval);
-        
+
         // No changes - interval should increase
         tailer.record_poll(false, &config);
         assert_eq!(tailer.current_interval, Duration::from_millis(200));
@@ -298,7 +296,7 @@ mod tests {
         };
 
         let mut tailer = PaneTailer::new(1, config.min_interval);
-        
+
         // Should cap at max_interval
         tailer.record_poll(false, &config);
         assert_eq!(tailer.current_interval, config.max_interval);
@@ -317,50 +315,56 @@ mod tests {
 
         // Add some panes
         let mut panes = HashMap::new();
-        panes.insert(1, PaneInfo {
-            pane_id: 1,
-            tab_id: 0,
-            window_id: 0,
-            domain_id: None,
-            domain_name: None,
-            workspace: None,
-            size: None,
-            rows: Some(24),
-            cols: Some(80),
-            cwd: None,
-            title: None,
-            tty_name: None,
-            cursor_x: Some(0),
-            cursor_y: Some(0),
-            cursor_visibility: None,
-            left_col: None,
-            top_row: None,
-            is_active: true,
-            is_zoomed: false,
-            extra: std::collections::HashMap::new(),
-        });
-        panes.insert(2, PaneInfo {
-            pane_id: 2,
-            tab_id: 0,
-            window_id: 0,
-            domain_id: None,
-            domain_name: None,
-            workspace: None,
-            size: None,
-            rows: Some(24),
-            cols: Some(80),
-            cwd: None,
-            title: None,
-            tty_name: None,
-            cursor_x: Some(0),
-            cursor_y: Some(0),
-            cursor_visibility: None,
-            left_col: None,
-            top_row: None,
-            is_active: false,
-            is_zoomed: false,
-            extra: std::collections::HashMap::new(),
-        });
+        panes.insert(
+            1,
+            PaneInfo {
+                pane_id: 1,
+                tab_id: 0,
+                window_id: 0,
+                domain_id: None,
+                domain_name: None,
+                workspace: None,
+                size: None,
+                rows: Some(24),
+                cols: Some(80),
+                cwd: None,
+                title: None,
+                tty_name: None,
+                cursor_x: Some(0),
+                cursor_y: Some(0),
+                cursor_visibility: None,
+                left_col: None,
+                top_row: None,
+                is_active: true,
+                is_zoomed: false,
+                extra: std::collections::HashMap::new(),
+            },
+        );
+        panes.insert(
+            2,
+            PaneInfo {
+                pane_id: 2,
+                tab_id: 0,
+                window_id: 0,
+                domain_id: None,
+                domain_name: None,
+                workspace: None,
+                size: None,
+                rows: Some(24),
+                cols: Some(80),
+                cwd: None,
+                title: None,
+                tty_name: None,
+                cursor_x: Some(0),
+                cursor_y: Some(0),
+                cursor_visibility: None,
+                left_col: None,
+                top_row: None,
+                is_active: false,
+                is_zoomed: false,
+                extra: std::collections::HashMap::new(),
+            },
+        );
 
         supervisor.sync_tailers(&panes);
         assert_eq!(supervisor.active_count(), 2);
@@ -375,7 +379,8 @@ mod tests {
     fn capture_event_wraps_captured_segment() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        #[allow(clippy::cast_possible_truncation)] // Epoch millis won't overflow i64 until year 292 million
+        #[allow(clippy::cast_possible_truncation)]
+        // Epoch millis won't overflow i64 until year 292 million
         let captured_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)

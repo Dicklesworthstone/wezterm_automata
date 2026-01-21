@@ -87,7 +87,9 @@ impl UserVarPayload {
                                 payload.event_data = Some(data);
                             }
                             Err(e) if !lenient => {
-                                return Err(UserVarError::ParseFailed(format!("invalid JSON: {e}")));
+                                return Err(UserVarError::ParseFailed(format!(
+                                    "invalid JSON: {e}"
+                                )));
                             }
                             Err(_) => {} // lenient mode - continue with partial data
                         }

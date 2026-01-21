@@ -62,8 +62,7 @@ fn generate_segment_content(i: usize) -> String {
         ),
         3 => format!(
             "error[E0308]: mismatched types\n --> src/main.rs:{}:5\n  |\n{} |     return value;\n  |            ^^^^^ expected `i32`, found `String`\n",
-            i,
-            i
+            i, i
         ),
         4 => format!(
             "test test_{} ... ok\ntest test_{} ... ok\ntest result: ok. 2 passed; 0 failed\n",
@@ -79,11 +78,7 @@ fn generate_segment_content(i: usize) -> String {
             100000 + i * 1000,
             50000 + i * 100
         ),
-        7 => format!(
-            "$ npm install\nadded {} packages in {}s\n",
-            i * 10,
-            i % 60
-        ),
+        7 => format!("$ npm install\nadded {} packages in {}s\n", i * 10, i % 60),
         8 => format!(
             "Python 3.11.{}\n>>> print('Hello from segment {}')\nHello from segment {}\n",
             i % 10,
@@ -117,7 +112,10 @@ fn opts(limit: usize) -> SearchOptions {
 
 /// Populate a database with N segments.
 async fn populate_db(storage: &StorageHandle, num_segments: usize) {
-    storage.upsert_pane(test_pane(1)).await.expect("upsert pane");
+    storage
+        .upsert_pane(test_pane(1))
+        .await
+        .expect("upsert pane");
 
     for i in 0..num_segments {
         let content = generate_segment_content(i);
@@ -144,32 +142,36 @@ fn bench_fts_small_db(c: &mut Criterion) {
 
     // Budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("cargo", opts(10)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
     });
 
     group.bench_function("phrase_search", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("\"mismatched types\"", opts(10)).await
+            storage
+                .search_with_options("\"mismatched types\"", opts(10))
+                .await
         })
     });
 
     group.bench_function("prefix_search", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("compil*", opts(10)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("compil*", opts(10)).await })
     });
 
     group.bench_function("boolean_search", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("error AND types", opts(10)).await
+            storage
+                .search_with_options("error AND types", opts(10))
+                .await
         })
     });
 
     group.bench_function("no_match", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("nonexistent_term_xyz", opts(10)).await
+            storage
+                .search_with_options("nonexistent_term_xyz", opts(10))
+                .await
         })
     });
 
@@ -192,21 +194,21 @@ fn bench_fts_medium_db(c: &mut Criterion) {
     });
 
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("cargo", opts(10)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
     });
 
     group.bench_function("phrase_search", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("\"test result\"", opts(10)).await
+            storage
+                .search_with_options("\"test result\"", opts(10))
+                .await
         })
     });
 
     group.bench_function("common_term_high_results", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("Processing", opts(100)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("Processing", opts(100)).await })
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -229,26 +231,28 @@ fn bench_fts_large_db(c: &mut Criterion) {
 
     // These should still meet budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("cargo", opts(10)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
     });
 
     group.bench_function("phrase_search", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("\"expected i32\"", opts(10)).await
+            storage
+                .search_with_options("\"expected i32\"", opts(10))
+                .await
         })
     });
 
     group.bench_function("common_term_limited", |b| {
-        b.to_async(&rt).iter(|| async {
-            storage.search_with_options("test", opts(10)).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { storage.search_with_options("test", opts(10)).await })
     });
 
     group.bench_function("rare_term", |b| {
         b.to_async(&rt).iter(|| async {
-            storage.search_with_options("\"Auto-compact\"", opts(10)).await
+            storage
+                .search_with_options("\"Auto-compact\"", opts(10))
+                .await
         })
     });
 
@@ -271,15 +275,10 @@ fn bench_fts_result_limits(c: &mut Criterion) {
 
     // Test how result limit affects performance
     for limit in [1, 10, 50, 100, 500] {
-        group.bench_with_input(
-            BenchmarkId::new("limit", limit),
-            &limit,
-            |b, &limit| {
-                b.to_async(&rt).iter(|| async {
-                    storage.search_with_options("status", opts(limit)).await
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &limit| {
+            b.to_async(&rt)
+                .iter(|| async { storage.search_with_options("status", opts(limit)).await })
+        });
     }
 
     rt.block_on(storage.shutdown()).expect("shutdown");

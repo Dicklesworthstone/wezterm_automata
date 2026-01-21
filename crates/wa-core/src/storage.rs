@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Schema initialization SQL
 ///
@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS audit_actions (
     rule_id TEXT,                      -- policy rule id if any
     input_summary TEXT,                -- redacted summary of input
     verification_summary TEXT,         -- redacted summary of verification
+    decision_context TEXT,             -- JSON: decision context
     result TEXT NOT NULL               -- success, denied, failed, timeout
 );
 
@@ -330,12 +331,11 @@ static MIGRATIONS: &[Migration] = &[
         description: "Initial schema",
         up_sql: "", // Empty - baseline schema is created via SCHEMA_SQL
     },
-    // Future migrations go here:
-    // Migration {
-    //     version: 2,
-    //     description: "Add foo column to bar table",
-    //     up_sql: "ALTER TABLE bar ADD COLUMN foo TEXT;",
-    // },
+    Migration {
+        version: 2,
+        description: "Add decision_context to audit_actions",
+        up_sql: "ALTER TABLE audit_actions ADD COLUMN decision_context TEXT;",
+    },
 ];
 
 // =============================================================================
@@ -593,6 +593,8 @@ pub struct AuditActionRecord {
     pub input_summary: Option<String>,
     /// Redacted verification summary
     pub verification_summary: Option<String>,
+    /// Decision context (JSON), if available
+    pub decision_context: Option<String>,
     /// Result (success, denied, failed, timeout)
     pub result: String,
 }
@@ -610,6 +612,10 @@ impl AuditActionRecord {
             .map(|value| redactor.redact(value));
         self.verification_summary = self
             .verification_summary
+            .as_ref()
+            .map(|value| redactor.redact(value));
+        self.decision_context = self
+            .decision_context
             .as_ref()
             .map(|value| redactor.redact(value));
     }
@@ -718,6 +724,7 @@ fn record_migration(conn: &Connection, version: i32, description: &str) -> Resul
 /// - Any migration fails to apply
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
     let current = get_user_version(conn)?;
+    let needs_init = needs_initialization(conn)?;
 
     if current > SCHEMA_VERSION {
         return Err(StorageError::MigrationFailed(format!(
@@ -732,13 +739,22 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    // Fresh database: create base schema first
+    // Fresh database: create base schema and mark as current.
+    if current == 0 && needs_init {
+        conn.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+        set_user_version(conn, SCHEMA_VERSION)?;
+        record_migration(conn, SCHEMA_VERSION, "Initial schema")?;
+        return Ok(());
+    }
+
+    // Existing database at version 0: ensure base schema exists, then migrate.
     if current == 0 {
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
     }
 
-    // Apply pending migrations
+    // Apply pending migrations for existing databases
     run_migrations(conn, current)?;
 
     Ok(())
@@ -1479,7 +1495,9 @@ impl StorageHandle {
     /// Count unhandled events grouped by pane ID
     ///
     /// Returns a map from pane_id to the count of unhandled events for that pane.
-    pub async fn count_unhandled_events_by_pane(&self) -> Result<std::collections::HashMap<u64, u32>> {
+    pub async fn count_unhandled_events_by_pane(
+        &self,
+    ) -> Result<std::collections::HashMap<u64, u32>> {
         let db_path = Arc::clone(&self.db_path);
 
         tokio::task::spawn_blocking(move || {
@@ -2265,8 +2283,9 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
 
     conn.execute(
         "INSERT INTO audit_actions (ts, actor_kind, actor_id, pane_id, domain, action_kind,
-         policy_decision, decision_reason, rule_id, input_summary, verification_summary, result)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             ts,
             action.actor_kind.as_str(),
@@ -2279,6 +2298,7 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
             action.rule_id.as_deref(),
             action.input_summary.as_deref(),
             action.verification_summary.as_deref(),
+            action.decision_context.as_deref(),
             action.result.as_str(),
         ],
     )
@@ -2934,7 +2954,7 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
 fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<AuditActionRecord>> {
     let mut sql = String::from(
         "SELECT id, ts, actor_kind, actor_id, pane_id, domain, action_kind, policy_decision,
-         decision_reason, rule_id, input_summary, verification_summary, result
+         decision_reason, rule_id, input_summary, verification_summary, decision_context, result
          FROM audit_actions WHERE 1=1",
     );
     let mut params: Vec<SqlValue> = Vec::new();
@@ -3008,7 +3028,8 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
                 rule_id: row.get(9)?,
                 input_summary: row.get(10)?,
                 verification_summary: row.get(11)?,
-                result: row.get(12)?,
+                decision_context: row.get(12)?,
+                result: row.get(13)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Audit query failed: {e}")))?;
@@ -3571,8 +3592,42 @@ mod tests {
         // This test simulates what happens when we add a new migration
         let conn = Connection::open_in_memory().unwrap();
 
-        // Create base schema manually (simulating an older database)
-        conn.execute_batch(SCHEMA_SQL).unwrap();
+        // Create a minimal v1 schema without the new audit_actions column.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                domain TEXT NOT NULL DEFAULT 'local',
+                window_id INTEGER,
+                tab_id INTEGER,
+                title TEXT,
+                cwd TEXT,
+                tty_name TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                observed INTEGER NOT NULL DEFAULT 1,
+                ignore_reason TEXT,
+                last_decision_at INTEGER
+            );
+
+            CREATE TABLE audit_actions (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                actor_kind TEXT NOT NULL,
+                actor_id TEXT,
+                pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
+                domain TEXT,
+                action_kind TEXT NOT NULL,
+                policy_decision TEXT NOT NULL,
+                decision_reason TEXT,
+                rule_id TEXT,
+                input_summary TEXT,
+                verification_summary TEXT,
+                result TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
         set_user_version(&conn, 0).unwrap();
 
         // Tables should exist but version should be 0
@@ -3998,12 +4053,14 @@ mod tests {
             rule_id: Some("policy.allow".to_string()),
             input_summary: Some("echo hi".to_string()),
             verification_summary: Some("prompt_active".to_string()),
+            decision_context: Some("{\"rule\":\"policy.allow\"}".to_string()),
             result: "success".to_string(),
         };
 
         let json = serde_json::to_string(&action).unwrap();
         assert!(json.contains("send_text"));
         assert!(json.contains("policy_decision"));
+        assert!(json.contains("decision_context"));
     }
 
     #[test]
@@ -4025,6 +4082,10 @@ mod tests {
                 "API key sk-abc123456789012345678901234567890123456789012345678901".to_string(),
             ),
             verification_summary: Some("checked prompt".to_string()),
+            decision_context: Some(
+                "{\"token\":\"sk-abc123456789012345678901234567890123456789012345678901\"}"
+                    .to_string(),
+            ),
             result: "success".to_string(),
         };
 
@@ -4033,11 +4094,14 @@ mod tests {
 
         let reason = action.decision_reason.unwrap();
         let input = action.input_summary.unwrap();
+        let context = action.decision_context.unwrap();
 
         assert!(reason.contains("[REDACTED]"));
         assert!(input.contains("[REDACTED]"));
+        assert!(context.contains("[REDACTED]"));
         assert!(!reason.contains("sk-abc"));
         assert!(!input.contains("sk-abc"));
+        assert!(!context.contains("sk-abc"));
     }
 
     #[test]
@@ -4066,6 +4130,7 @@ mod tests {
             rule_id: None,
             input_summary: Some("echo hi".to_string()),
             verification_summary: Some("prompt".to_string()),
+            decision_context: None,
             result: "success".to_string(),
         };
 
@@ -4110,6 +4175,7 @@ mod tests {
             rule_id: None,
             input_summary: Some("old".to_string()),
             verification_summary: None,
+            decision_context: None,
             result: "success".to_string(),
         };
         let newer = AuditActionRecord {
@@ -4153,6 +4219,7 @@ mod tests {
             rule_id: None,
             input_summary: Some("echo hi".to_string()),
             verification_summary: None,
+            decision_context: None,
             result: "success".to_string(),
         };
         let deny = AuditActionRecord {
@@ -5214,6 +5281,7 @@ async fn storage_handle_records_audit_action_redacted() {
             "API key sk-abc123456789012345678901234567890123456789012345678901".to_string(),
         ),
         verification_summary: None,
+        decision_context: None,
         result: "success".to_string(),
     };
 
@@ -5754,13 +5822,10 @@ mod proptest_tests {
     fn temp_db_path() -> String {
         let counter = PROPTEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir();
-        dir.join(format!(
-            "wa_proptest_{counter}_{}.db",
-            std::process::id()
-        ))
-        .to_str()
-        .unwrap()
-        .to_string()
+        dir.join(format!("wa_proptest_{counter}_{}.db", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Helper to create a test pane record
@@ -5793,10 +5858,7 @@ mod proptest_tests {
         // Generate 1-50 write operations across 1-5 panes
         let pane_count = 1u64..=5;
         pane_count.prop_flat_map(|max_panes| {
-            proptest::collection::vec(
-                (1..=max_panes, segment_content_strategy()),
-                1..50,
-            )
+            proptest::collection::vec((1..=max_panes, segment_content_strategy()), 1..50)
         })
     }
 

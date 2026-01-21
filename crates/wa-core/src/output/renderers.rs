@@ -279,10 +279,7 @@ impl EventListRenderer {
         ));
 
         if let Some(handled_at) = event.handled_at {
-            output.push_str(&format!(
-                "  Handled:    {}\n",
-                format_timestamp(handled_at)
-            ));
+            output.push_str(&format!("  Handled:    {}\n", format_timestamp(handled_at)));
             if let Some(workflow) = &event.handled_by_workflow_id {
                 output.push_str(&format!("  By workflow: {workflow}\n"));
             }
@@ -302,8 +299,7 @@ impl EventListRenderer {
 
         if let Some(extracted) = &event.extracted {
             output.push_str("\n  Extracted data:\n");
-            let json =
-                serde_json::to_string_pretty(extracted).unwrap_or_else(|_| "{}".to_string());
+            let json = serde_json::to_string_pretty(extracted).unwrap_or_else(|_| "{}".to_string());
             for line in json.lines() {
                 output.push_str(&format!("    {line}\n"));
             }
@@ -323,11 +319,7 @@ pub struct SearchResultRenderer;
 impl SearchResultRenderer {
     /// Render search results
     #[must_use]
-    pub fn render(
-        results: &[SearchResult],
-        query: &str,
-        ctx: &RenderContext,
-    ) -> String {
+    pub fn render(results: &[SearchResult], query: &str, ctx: &RenderContext) -> String {
         if ctx.format.is_json() {
             return serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string());
         }
@@ -540,7 +532,10 @@ impl SummaryRenderer {
             "  Events:    {} total ({} unhandled)\n",
             summary.total_events, summary.unhandled_events
         ));
-        output.push_str(&format!("  Workflows: {} active\n", summary.active_workflows));
+        output.push_str(&format!(
+            "  Workflows: {} active\n",
+            summary.active_workflows
+        ));
 
         output
     }
@@ -591,9 +586,7 @@ pub fn format_timestamp(epoch_ms: i64) -> String {
 
     let day = remaining_days + 1;
 
-    format!(
-        "{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}"
-    )
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn days_in_year(year: u64) -> u64 {

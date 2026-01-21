@@ -461,11 +461,7 @@ impl PaneState {
     }
 
     fn format_human(&self) -> String {
-        let status = if self.observed {
-            "observed"
-        } else {
-            "ignored"
-        };
+        let status = if self.observed { "observed" } else { "ignored" };
         let reason = self
             .ignore_reason
             .as_ref()
@@ -811,10 +807,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 name: "get-text",
                 args: "<pane_id> [--tail N] [--escapes]",
                 summary: "Fetch recent output from a pane",
-                examples: vec![
-                    "wa robot get-text 0",
-                    "wa robot get-text 0 --tail 200",
-                ],
+                examples: vec!["wa robot get-text 0", "wa robot get-text 0 --tail 200"],
             },
             QuickStartCommand {
                 name: "send",
@@ -932,10 +925,7 @@ fn now_ms() -> u64 {
 }
 
 /// Apply tail truncation to text, returning the truncated text and truncation info
-fn apply_tail_truncation(
-    text: &str,
-    tail_lines: usize,
-) -> (String, bool, Option<TruncationInfo>) {
+fn apply_tail_truncation(text: &str, tail_lines: usize) -> (String, bool, Option<TruncationInfo>) {
     let lines: Vec<&str> = text.lines().collect();
     let original_lines = lines.len();
     let original_bytes = text.len();
@@ -980,7 +970,9 @@ fn map_wezterm_error_to_robot(error: &wa_core::Error) -> (&'static str, Option<S
             ),
             WeztermError::PaneNotFound(pane_id) => (
                 "robot.pane_not_found",
-                Some(format!("Pane {pane_id} does not exist. Use 'wa robot state' to list available panes.")),
+                Some(format!(
+                    "Pane {pane_id} does not exist. Use 'wa robot state' to list available panes."
+                )),
             ),
             WeztermError::SocketNotFound(_) => (
                 "robot.wezterm_socket_not_found",
@@ -992,7 +984,10 @@ fn map_wezterm_error_to_robot(error: &wa_core::Error) -> (&'static str, Option<S
             ),
             WeztermError::ParseError(_) => (
                 "robot.wezterm_parse_error",
-                Some("Failed to parse WezTerm output. This may indicate a version mismatch.".to_string()),
+                Some(
+                    "Failed to parse WezTerm output. This may indicate a version mismatch."
+                        .to_string(),
+                ),
             ),
             WeztermError::Timeout(_) => (
                 "robot.wezterm_timeout",
@@ -1057,7 +1052,6 @@ fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
     }
 }
 
-
 /// Run the observation watcher daemon.
 async fn run_watcher(
     layout: &wa_core::config::WorkspaceLayout,
@@ -1092,7 +1086,9 @@ async fn run_watcher(
 
     // Acquire single-instance lock (unless disabled)
     let _lock_guard = if disable_lock {
-        tracing::warn!("Single-instance lock DISABLED - data corruption may occur if multiple watchers run");
+        tracing::warn!(
+            "Single-instance lock DISABLED - data corruption may occur if multiple watchers run"
+        );
         None
     } else {
         match WatcherLock::acquire(&layout.lock_path) {
@@ -1162,7 +1158,7 @@ async fn run_watcher(
     // Wait for signals (SIGINT/SIGTERM to shutdown, SIGHUP to reload config)
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sighup = signal(SignalKind::hangup())?;
@@ -1400,7 +1396,8 @@ async fn main() -> anyhow::Result<()> {
                                         .iter()
                                         .map(|p| PaneState::from_pane_info(p, filter))
                                         .collect();
-                                    let response = RobotResponse::success(states, elapsed_ms(start));
+                                    let response =
+                                        RobotResponse::success(states, elapsed_ms(start));
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                                 Err(e) => {
@@ -1414,7 +1411,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        RobotCommands::GetText { pane_id, tail, escapes } => {
+                        RobotCommands::GetText {
+                            pane_id,
+                            tail,
+                            escapes,
+                        } => {
                             let wezterm = wa_core::wezterm::WeztermClient::new();
                             match wezterm.get_text(pane_id, escapes).await {
                                 Ok(full_text) => {
@@ -1436,12 +1437,13 @@ async fn main() -> anyhow::Result<()> {
                                 Err(e) => {
                                     // Map errors to stable codes
                                     let (code, hint) = map_wezterm_error_to_robot(&e);
-                                    let response = RobotResponse::<RobotGetTextData>::error_with_code(
-                                        code,
-                                        format!("{e}"),
-                                        hint,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotGetTextData>::error_with_code(
+                                            code,
+                                            format!("{e}"),
+                                            hint,
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                             }
@@ -1485,19 +1487,22 @@ async fn main() -> anyhow::Result<()> {
                             regex,
                         } => {
                             use std::time::Duration;
-                            use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient};
+                            use wa_core::wezterm::{
+                                PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient,
+                            };
 
                             // Build the matcher
                             let matcher = if regex {
                                 match fancy_regex::Regex::new(&pattern) {
                                     Ok(compiled) => WaitMatcher::regex(compiled),
                                     Err(e) => {
-                                        let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                            "WA-ROBOT-INVALID-REGEX",
-                                            format!("Invalid regex pattern: {e}"),
-                                            Some("Check the regex syntax".to_string()),
-                                            elapsed_ms(start),
-                                        );
+                                        let response =
+                                            RobotResponse::<RobotWaitForData>::error_with_code(
+                                                "WA-ROBOT-INVALID-REGEX",
+                                                format!("Invalid regex pattern: {e}"),
+                                                Some("Check the regex syntax".to_string()),
+                                                elapsed_ms(start),
+                                            );
                                         println!("{}", serde_json::to_string_pretty(&response)?);
                                         return Ok(());
                                     }
@@ -1513,23 +1518,28 @@ async fn main() -> anyhow::Result<()> {
                             match wezterm.list_panes().await {
                                 Ok(panes) => {
                                     if !panes.iter().any(|p| p.pane_id == pane_id) {
-                                        let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                            "WA-ROBOT-PANE-NOT-FOUND",
-                                            format!("Pane {pane_id} not found"),
-                                            Some("Use 'wa robot state' to list available panes".to_string()),
-                                            elapsed_ms(start),
-                                        );
+                                        let response =
+                                            RobotResponse::<RobotWaitForData>::error_with_code(
+                                                "WA-ROBOT-PANE-NOT-FOUND",
+                                                format!("Pane {pane_id} not found"),
+                                                Some(
+                                                    "Use 'wa robot state' to list available panes"
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
                                         println!("{}", serde_json::to_string_pretty(&response)?);
                                         return Ok(());
                                     }
                                 }
                                 Err(e) => {
-                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                        "WA-ROBOT-WEZTERM-ERROR",
-                                        format!("Failed to list panes: {e}"),
-                                        None,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotWaitForData>::error_with_code(
+                                            "WA-ROBOT-WEZTERM-ERROR",
+                                            format!("Failed to list panes: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                     return Ok(());
                                 }
@@ -1555,7 +1565,10 @@ async fn main() -> anyhow::Result<()> {
                             );
 
                             match waiter.wait_for(pane_id, &matcher, timeout).await {
-                                Ok(WaitResult::Matched { elapsed_ms: elapsed, polls }) => {
+                                Ok(WaitResult::Matched {
+                                    elapsed_ms: elapsed,
+                                    polls,
+                                }) => {
                                     let data = RobotWaitForData {
                                         pane_id,
                                         pattern,
@@ -1567,7 +1580,11 @@ async fn main() -> anyhow::Result<()> {
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
-                                Ok(WaitResult::TimedOut { elapsed_ms: elapsed, polls, .. }) => {
+                                Ok(WaitResult::TimedOut {
+                                    elapsed_ms: elapsed,
+                                    polls,
+                                    ..
+                                }) => {
                                     let response = RobotResponse::<RobotWaitForData>::error_with_code(
                                         "WA-ROBOT-TIMEOUT",
                                         format!(
@@ -1580,12 +1597,13 @@ async fn main() -> anyhow::Result<()> {
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                                 Err(e) => {
-                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                        "WA-ROBOT-GET-TEXT-FAILED",
-                                        format!("Failed to get pane text: {e}"),
-                                        None,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotWaitForData>::error_with_code(
+                                            "WA-ROBOT-GET-TEXT-FAILED",
+                                            format!("Failed to get pane text: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                             }
@@ -1601,12 +1619,13 @@ async fn main() -> anyhow::Result<()> {
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
-                                    let response = RobotResponse::<RobotSearchData>::error_with_code(
-                                        ROBOT_ERR_CONFIG,
-                                        format!("Failed to get workspace layout: {e}"),
-                                        Some("Check --workspace or WA_WORKSPACE".to_string()),
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotSearchData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                     return Ok(());
                                 }
@@ -1614,7 +1633,8 @@ async fn main() -> anyhow::Result<()> {
 
                             // Open storage handle
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await
+                            {
                                 Ok(s) => s,
                                 Err(e) => {
                                     let response = RobotResponse::<RobotSearchData>::error_with_code(
@@ -1683,12 +1703,13 @@ async fn main() -> anyhow::Result<()> {
                                         ),
                                         _ => (ROBOT_ERR_STORAGE, None),
                                     };
-                                    let response = RobotResponse::<RobotSearchData>::error_with_code(
-                                        code,
-                                        format!("{e}"),
-                                        hint,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotSearchData>::error_with_code(
+                                            code,
+                                            format!("{e}"),
+                                            hint,
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                             }
@@ -1705,12 +1726,13 @@ async fn main() -> anyhow::Result<()> {
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
                                 Ok(l) => l,
                                 Err(e) => {
-                                    let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                        ROBOT_ERR_CONFIG,
-                                        format!("Failed to get workspace layout: {e}"),
-                                        Some("Check --workspace or WA_WORKSPACE".to_string()),
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotEventsData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                     return Ok(());
                                 }
@@ -1718,7 +1740,8 @@ async fn main() -> anyhow::Result<()> {
 
                             // Open storage handle
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await
+                            {
                                 Ok(s) => s,
                                 Err(e) => {
                                     let response = RobotResponse::<RobotEventsData>::error_with_code(
@@ -1787,12 +1810,13 @@ async fn main() -> anyhow::Result<()> {
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                                 Err(e) => {
-                                    let response = RobotResponse::<RobotEventsData>::error_with_code(
-                                        ROBOT_ERR_STORAGE,
-                                        format!("Failed to query events: {e}"),
-                                        None,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotEventsData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query events: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
                             }
@@ -1852,7 +1876,9 @@ async fn main() -> anyhow::Result<()> {
                                         RobotResponse::<RobotWorkflowData>::error_with_code(
                                             "robot.storage_error",
                                             format!("Failed to open storage: {e}"),
-                                            Some("Check database path and permissions.".to_string()),
+                                            Some(
+                                                "Check database path and permissions.".to_string(),
+                                            ),
                                             elapsed_ms(start),
                                         );
                                     println!("{}", serde_json::to_string_pretty(&response)?);
@@ -1901,9 +1927,8 @@ async fn main() -> anyhow::Result<()> {
                                     );
 
                                     // Run the workflow
-                                    let result = runner
-                                        .run_workflow(pane_id, wf, &execution_id, 0)
-                                        .await;
+                                    let result =
+                                        runner.run_workflow(pane_id, wf, &execution_id, 0).await;
 
                                     let (status, message, result_value, steps_executed, step_index) =
                                         match result {
@@ -2061,8 +2086,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let observed_count = states.iter().filter(|s| s.observed).count();
                 let ignored_count = states.len() - observed_count;
-                println!("Panes ({} observed, {} ignored):", observed_count, ignored_count);
-                println!("  {:>4}  {:>10}  {:<20}  {:<40}  {}", "ID", "STATUS", "TITLE", "CWD", "DOMAIN");
+                println!(
+                    "Panes ({} observed, {} ignored):",
+                    observed_count, ignored_count
+                );
+                println!(
+                    "  {:>4}  {:>10}  {:<20}  {:<40}  {}",
+                    "ID", "STATUS", "TITLE", "CWD", "DOMAIN"
+                );
                 println!("  {}", "-".repeat(100));
                 for state in &states {
                     println!("{}", state.format_human());

@@ -172,6 +172,7 @@ impl<'a> ApprovalStore<'a> {
             rule_id: None,
             input_summary: Some(format!("allow_once approval for {}", input.action.as_str())),
             verification_summary: Some(verification),
+            decision_context: None,
             result: "success".to_string(),
         };
 

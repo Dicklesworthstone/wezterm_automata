@@ -109,9 +109,7 @@ fn bench_pattern_detection(c: &mut Criterion) {
         b.iter(|| engine.detect(CLAUDE_COMPACTION))
     });
 
-    group.bench_function("multi_match", |b| {
-        b.iter(|| engine.detect(MULTI_MATCH))
-    });
+    group.bench_function("multi_match", |b| b.iter(|| engine.detect(MULTI_MATCH)));
 
     group.finish();
 }

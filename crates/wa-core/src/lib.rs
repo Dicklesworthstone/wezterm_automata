@@ -20,6 +20,7 @@
 //! - `ingest`: Pane output capture and delta extraction
 //! - `patterns`: Pattern detection engine
 //! - `events`: Event bus for detections and signals
+//! - `explanations`: Reusable explanation templates for wa why and errors
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
 //! - `approval`: Allow-once approvals for RequireApproval decisions
@@ -39,6 +40,7 @@ pub mod crash;
 pub mod dry_run;
 pub mod error;
 pub mod events;
+pub mod explanations;
 pub mod ingest;
 pub mod ipc;
 pub mod lock;

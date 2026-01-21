@@ -55,11 +55,9 @@ fn bench_no_change(c: &mut Criterion) {
         let content = generate_content(lines);
 
         group.throughput(Throughput::Bytes(content.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("lines", lines),
-            &content,
-            |b, content| b.iter(|| extract_delta(content, content, DEFAULT_OVERLAP_SIZE)),
-        );
+        group.bench_with_input(BenchmarkId::new("lines", lines), &content, |b, content| {
+            b.iter(|| extract_delta(content, content, DEFAULT_OVERLAP_SIZE))
+        });
     }
 
     group.finish();

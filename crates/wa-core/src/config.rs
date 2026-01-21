@@ -2281,9 +2281,11 @@ title = "vim"
         assert!(!result.allowed);
         assert_eq!(result.forbidden.len(), 1);
         assert_eq!(result.forbidden[0].name, "storage.db_path");
-        assert!(result.forbidden[0]
-            .reason
-            .contains("cannot be changed at runtime"));
+        assert!(
+            result.forbidden[0]
+                .reason
+                .contains("cannot be changed at runtime")
+        );
     }
 
     #[test]
@@ -2295,7 +2297,12 @@ title = "vim"
         let result = config1.diff_for_hot_reload(&config2);
 
         assert!(!result.allowed);
-        assert!(result.forbidden.iter().any(|f| f.name == "general.data_dir"));
+        assert!(
+            result
+                .forbidden
+                .iter()
+                .any(|f| f.name == "general.data_dir")
+        );
     }
 
     #[test]
@@ -2307,10 +2314,12 @@ title = "vim"
         let result = config1.diff_for_hot_reload(&config2);
 
         assert!(!result.allowed);
-        assert!(result
-            .forbidden
-            .iter()
-            .any(|f| f.name == "storage.writer_queue_size"));
+        assert!(
+            result
+                .forbidden
+                .iter()
+                .any(|f| f.name == "storage.writer_queue_size")
+        );
     }
 
     #[test]
@@ -2337,18 +2346,19 @@ title = "vim"
 
         assert!(result.allowed);
         assert_eq!(result.changes.len(), 3);
-        assert!(result
-            .changes
-            .iter()
-            .any(|c| c.name == "general.log_level"));
-        assert!(result
-            .changes
-            .iter()
-            .any(|c| c.name == "ingest.poll_interval_ms"));
-        assert!(result
-            .changes
-            .iter()
-            .any(|c| c.name == "storage.retention_days"));
+        assert!(result.changes.iter().any(|c| c.name == "general.log_level"));
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "ingest.poll_interval_ms")
+        );
+        assert!(
+            result
+                .changes
+                .iter()
+                .any(|c| c.name == "storage.retention_days")
+        );
     }
 
     #[test]
@@ -2363,10 +2373,7 @@ title = "vim"
         // Should be forbidden overall
         assert!(!result.allowed);
         // But should still report what would have been allowed
-        assert!(result
-            .changes
-            .iter()
-            .any(|c| c.name == "general.log_level"));
+        assert!(result.changes.iter().any(|c| c.name == "general.log_level"));
         assert!(result.forbidden.iter().any(|f| f.name == "storage.db_path"));
     }
 

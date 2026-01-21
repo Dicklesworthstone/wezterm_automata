@@ -950,7 +950,8 @@ impl OutputCache {
         let now = epoch_ms();
         let cutoff = now - max_age_ms as i64;
 
-        self.pane_states.retain(|_, state| state.last_updated > cutoff);
+        self.pane_states
+            .retain(|_, state| state.last_updated > cutoff);
 
         let hashes_to_remove: Vec<u64> = self
             .global_hashes
@@ -1593,9 +1594,7 @@ mod tests {
 
         // Create a cursor and persist some segments normally
         let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor
-            .capture_snapshot("a\n", 1024)
-            .expect("first capture");
+        let seg0 = cursor.capture_snapshot("a\n", 1024).expect("first capture");
         persist_captured_segment(&handle, &seg0).await.unwrap();
 
         // Simulate desync
@@ -2228,7 +2227,9 @@ mod tests {
             .expect("alt screen capture");
 
         // Should be detected as a gap
-        assert!(matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_entered"));
+        assert!(
+            matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_entered")
+        );
         assert!(cursor.in_alt_screen);
         assert!(cursor.in_gap);
     }
@@ -2249,7 +2250,9 @@ mod tests {
             .capture_snapshot("vim content\x1b[?1049l$ ", 1024)
             .expect("alt screen exit capture");
 
-        assert!(matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_exited"));
+        assert!(
+            matches!(seg1.kind, CapturedSegmentKind::Gap { ref reason } if reason == "alt_screen_exited")
+        );
         assert!(!cursor.in_alt_screen);
     }
 
@@ -2337,7 +2340,7 @@ mod tests {
 
         let stats = cache.stats();
         assert_eq!(stats.misses, 1); // Only first was a miss
-        assert_eq!(stats.hits, 3);   // Three hits from global LRU
+        assert_eq!(stats.hits, 3); // Three hits from global LRU
     }
 
     #[test]

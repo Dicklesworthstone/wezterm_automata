@@ -33,8 +33,7 @@ mod table;
 
 pub use format::{OutputFormat, detect_format};
 pub use renderers::{
-    Render, RenderContext,
-    PaneTableRenderer, EventListRenderer, SearchResultRenderer,
+    EventListRenderer, PaneTableRenderer, Render, RenderContext, SearchResultRenderer,
     WorkflowResultRenderer,
 };
-pub use table::{Table, Column, Alignment};
+pub use table::{Alignment, Column, Table};
