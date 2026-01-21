@@ -1697,19 +1697,13 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
     }
 
     // Check action kind
-    if !match_on.actions.is_empty()
-        && !match_on
-            .actions
-            .iter()
-            .any(|a| a == input.action.as_str())
+    if !match_on.actions.is_empty() && !match_on.actions.iter().any(|a| a == input.action.as_str())
     {
         return false;
     }
 
     // Check actor kind
-    if !match_on.actors.is_empty()
-        && !match_on.actors.iter().any(|a| a == input.actor.as_str())
-    {
+    if !match_on.actors.is_empty() && !match_on.actors.iter().any(|a| a == input.actor.as_str()) {
         return false;
     }
 
@@ -1733,9 +1727,10 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
     if !match_on.pane_titles.is_empty() {
         match &input.pane_title {
             Some(title) => {
-                let matches_any = match_on.pane_titles.iter().any(|pattern| {
-                    glob_match(pattern, title)
-                });
+                let matches_any = match_on
+                    .pane_titles
+                    .iter()
+                    .any(|pattern| glob_match(pattern, title));
                 if !matches_any {
                     return false;
                 }
@@ -1748,9 +1743,10 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
     if !match_on.pane_cwds.is_empty() {
         match &input.pane_cwd {
             Some(cwd) => {
-                let matches_any = match_on.pane_cwds.iter().any(|pattern| {
-                    glob_match(pattern, cwd)
-                });
+                let matches_any = match_on
+                    .pane_cwds
+                    .iter()
+                    .any(|pattern| glob_match(pattern, cwd));
                 if !matches_any {
                     return false;
                 }
@@ -1764,7 +1760,9 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         match &input.command_text {
             Some(text) => {
                 let matches_any = match_on.command_patterns.iter().any(|pattern| {
-                    Regex::new(pattern).map(|re| re.is_match(text)).unwrap_or(false)
+                    Regex::new(pattern)
+                        .map(|re| re.is_match(text))
+                        .unwrap_or(false)
                 });
                 if !matches_any {
                     return false;
@@ -2072,9 +2070,10 @@ impl PolicyEngine {
 
         if let (Some(rule), Some(decision)) = (rule_result.matching_rule, rule_result.decision) {
             let rule_id = format!("config.rule.{}", rule.id);
-            let reason = rule.message.clone().unwrap_or_else(|| {
-                format!("Rule '{}' matched", rule.id)
-            });
+            let reason = rule
+                .message
+                .clone()
+                .unwrap_or_else(|| format!("Rule '{}' matched", rule.id));
 
             match decision {
                 PolicyRuleDecision::Deny => {

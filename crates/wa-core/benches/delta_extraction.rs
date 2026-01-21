@@ -14,7 +14,7 @@ mod bench_common;
 
 const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
     name: "delta_extraction",
-    budget: "microseconds per extract (target: not milliseconds)",
+    budget: "p50 < 200µs, p99 < 1ms (typical overlap sizes)",
 }];
 
 /// Default overlap window size from RuntimeConfig.
@@ -171,7 +171,7 @@ fn bench_large_content(c: &mut Criterion) {
 }
 
 fn bench_config() -> Criterion {
-    bench_common::emit_bench_metadata("delta_extraction", BUDGETS);
+    bench_common::emit_bench_artifacts("delta_extraction", BUDGETS);
     Criterion::default().configure_from_args()
 }
 

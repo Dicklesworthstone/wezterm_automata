@@ -297,7 +297,7 @@ fn bench_fts_result_limits(c: &mut Criterion) {
 }
 
 fn bench_config() -> Criterion {
-    bench_common::emit_bench_metadata("fts_query", BUDGETS);
+    bench_common::emit_bench_artifacts("fts_query", BUDGETS);
     Criterion::default().configure_from_args()
 }
 
