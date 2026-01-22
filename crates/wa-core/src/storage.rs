@@ -3980,6 +3980,7 @@ mod tests {
     fn pane_record_serializes() {
         let pane = PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: Some(0),
             tab_id: Some(0),
@@ -5158,6 +5159,7 @@ async fn storage_handle_graceful_shutdown() {
     // Upsert a pane to verify it works
     let pane = PaneRecord {
         pane_id: 1,
+        pane_uuid: None,
         domain: "local".to_string(),
         window_id: None,
         tab_id: None,
@@ -5192,6 +5194,7 @@ async fn storage_handle_insert_step_log_and_query() {
     // Create pane
     let pane = PaneRecord {
         pane_id: 1,
+        pane_uuid: None,
         domain: "local".to_string(),
         window_id: None,
         tab_id: None,
@@ -5263,6 +5266,7 @@ async fn storage_handle_records_audit_action_redacted() {
 
     let pane = PaneRecord {
         pane_id: 1,
+        pane_uuid: None,
         domain: "local".to_string(),
         window_id: None,
         tab_id: None,
@@ -5346,6 +5350,7 @@ async fn storage_handle_writer_queue_processes_all() {
     // Create pane first
     let pane = PaneRecord {
         pane_id: 1,
+        pane_uuid: None,
         domain: "local".to_string(),
         window_id: None,
         tab_id: None,

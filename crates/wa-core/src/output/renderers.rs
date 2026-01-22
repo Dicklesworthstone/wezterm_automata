@@ -634,6 +634,7 @@ mod tests {
     fn sample_pane() -> PaneRecord {
         PaneRecord {
             pane_id: 1,
+            pane_uuid: None,
             domain: "local".to_string(),
             window_id: Some(0),
             tab_id: Some(0),
