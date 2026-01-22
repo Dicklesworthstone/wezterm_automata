@@ -586,6 +586,9 @@ struct QuickStartErrorCode {
 #[derive(serde::Serialize)]
 struct PaneState {
     pane_id: u64,
+    /// Stable pane UUID (assigned at discovery, persists across renames/moves)
+    /// Will be null until the pane has been observed by the daemon.
+    pane_uuid: Option<String>,
     tab_id: u64,
     window_id: u64,
     domain: String,
@@ -609,6 +612,7 @@ impl PaneState {
 
         Self {
             pane_id: info.pane_id,
+            pane_uuid: None, // Not assigned until pane is observed by daemon
             tab_id: info.tab_id,
             window_id: info.window_id,
             domain,
