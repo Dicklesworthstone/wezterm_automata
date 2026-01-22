@@ -65,6 +65,10 @@ harness = false
 name = "watcher_loop"
 harness = false
 
+[[bench]]
+name = "sizing_benchmark"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)
