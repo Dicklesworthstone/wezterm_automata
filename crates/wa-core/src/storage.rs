@@ -371,7 +371,7 @@ static MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         description: "Add action_undo + action_history view + audit_action_id on step logs",
-        up_sql: r#"
+        up_sql: r"
             ALTER TABLE workflow_step_logs ADD COLUMN audit_action_id INTEGER REFERENCES audit_actions(id);
             CREATE INDEX IF NOT EXISTS idx_step_logs_audit_action ON workflow_step_logs(audit_action_id);
 
@@ -394,7 +394,7 @@ static MIGRATIONS: &[Migration] = &[
             FROM audit_actions a
             LEFT JOIN action_undo u ON u.audit_action_id = a.id
             LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
-        "#,
+        ",
     },
 ];
 
@@ -2630,7 +2630,7 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
 
 /// Upsert undo metadata for an audit action (synchronous)
 fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Result<()> {
-    let undoable_i64 = if record.undoable { 1i64 } else { 0i64 };
+    let undoable_i64 = i64::from(record.undoable);
 
     conn.execute(
         "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by)

@@ -88,6 +88,7 @@ impl StateChange {
     }
 
     /// Get human-readable time ago.
+    #[must_use]
     pub fn time_ago(&self) -> String {
         let Ok(elapsed) = self.timestamp.elapsed() else {
             return "just now".to_string();
@@ -126,38 +127,40 @@ pub enum Platform {
 
 impl Platform {
     /// Detect current platform.
+    #[must_use]
     pub fn detect() -> Self {
         // Check for container first
         if std::path::Path::new("/.dockerenv").exists()
             || std::env::var("container").is_ok()
             || std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
         {
-            return Platform::Container;
+            return Self::Container;
         }
 
         #[cfg(target_os = "macos")]
         {
-            Platform::MacOS
+            Self::MacOS
         }
         #[cfg(target_os = "linux")]
         {
-            Platform::Linux
+            Self::Linux
         }
         #[cfg(target_os = "windows")]
         {
-            Platform::Windows
+            Self::Windows
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
-            Platform::Unknown
+            Self::Unknown
         }
     }
 
     /// Get package manager command for this platform.
+    #[must_use]
     pub fn package_manager(&self) -> Option<&'static str> {
         match self {
-            Platform::MacOS => Some("brew"),
-            Platform::Linux => {
+            Self::MacOS => Some("brew"),
+            Self::Linux => {
                 // Try to detect specific distro
                 if std::path::Path::new("/usr/bin/apt").exists() {
                     Some("apt")
@@ -171,9 +174,9 @@ impl Platform {
                     None
                 }
             }
-            Platform::Windows => Some("winget"),
-            Platform::Container => Some("apt"), // Most containers are Debian-based
-            Platform::Unknown => None,
+            Self::Windows => Some("winget"),
+            Self::Container => Some("apt"), // Most containers are Debian-based
+            Self::Unknown => None,
         }
     }
 
@@ -196,11 +199,11 @@ impl Platform {
 impl fmt::Display for Platform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Platform::MacOS => "macOS",
-            Platform::Linux => "Linux",
-            Platform::Windows => "Windows",
-            Platform::Container => "Container",
-            Platform::Unknown => "Unknown",
+            Self::MacOS => "macOS",
+            Self::Linux => "Linux",
+            Self::Windows => "Windows",
+            Self::Container => "Container",
+            Self::Unknown => "Unknown",
         };
         write!(f, "{name}")
     }
@@ -223,7 +226,7 @@ pub struct SuggestionContext {
 
 impl Default for Platform {
     fn default() -> Self {
-        Platform::detect()
+        Self::detect()
     }
 }
 

@@ -47,8 +47,8 @@ impl From<&PaneInfo> for PaneView {
     fn from(info: &PaneInfo) -> Self {
         Self {
             pane_id: info.pane_id,
-            title: info.title.clone(),
-            domain: info.domain.clone(),
+            title: info.title.clone().unwrap_or_default(),
+            domain: info.effective_domain().to_string(),
             cwd: info.cwd.clone(),
             is_excluded: false,
             agent_type: None,
@@ -125,6 +125,7 @@ pub trait QueryClient: Send + Sync {
 pub struct ProductionQueryClient {
     workspace_layout: WorkspaceLayout,
     wezterm: WeztermClient,
+    #[allow(dead_code)]
     storage: Option<StorageHandle>,
 }
 
@@ -149,7 +150,7 @@ impl ProductionQueryClient {
 
     /// Get the database path
     fn db_path(&self) -> PathBuf {
-        self.workspace_layout.database_file()
+        self.workspace_layout.db_path.clone()
     }
 
     /// Check if the database exists
@@ -217,8 +218,7 @@ impl QueryClient for ProductionQueryClient {
     }
 
     fn is_watcher_running(&self) -> bool {
-        let lock_path = self.workspace_layout.watcher_lock();
-        lock_path.exists()
+        self.workspace_layout.lock_path.exists()
     }
 }
 

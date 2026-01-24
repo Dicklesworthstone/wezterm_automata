@@ -30,7 +30,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::config::{HotReloadableConfig, PaneFilterConfig};
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
-use crate::events::{Event, EventBus};
+use crate::events::EventBus;
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::storage::{StorageHandle, StoredEvent};
@@ -501,7 +501,7 @@ impl ObservationRuntime {
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
-        let event_bus = self.event_bus.clone();
+        let _event_bus = self.event_bus.clone();
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown

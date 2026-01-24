@@ -42,17 +42,18 @@ impl View {
     }
 
     /// Get all views in tab order
-    pub const fn all() -> &'static [View] {
+    pub const fn all() -> &'static [Self] {
         &[
-            View::Home,
-            View::Panes,
-            View::Events,
-            View::Search,
-            View::Help,
+            Self::Home,
+            Self::Panes,
+            Self::Events,
+            Self::Search,
+            Self::Help,
         ]
     }
 
     /// Get the index of this view in the tab order
+    #[must_use]
     pub fn index(&self) -> usize {
         match self {
             Self::Home => 0,
@@ -64,6 +65,7 @@ impl View {
     }
 
     /// Get the next view (wraps around)
+    #[must_use]
     pub fn next(&self) -> Self {
         match self {
             Self::Home => Self::Panes,
@@ -75,6 +77,7 @@ impl View {
     }
 
     /// Get the previous view (wraps around)
+    #[must_use]
     pub fn prev(&self) -> Self {
         match self {
             Self::Home => Self::Help,
@@ -162,35 +165,38 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     title.render(chunks[0], buf);
 
     // Health status
-    let health_text = if let Some(ref health) = state.health {
-        let watcher_status = if health.watcher_running {
-            Span::styled("RUNNING", Style::default().fg(Color::Green))
-        } else {
-            Span::styled("STOPPED", Style::default().fg(Color::Red))
-        };
-        let db_status = if health.db_accessible {
-            Span::styled("OK", Style::default().fg(Color::Green))
-        } else {
-            Span::styled("NOT FOUND", Style::default().fg(Color::Red))
-        };
-        let wezterm_status = if health.wezterm_accessible {
-            Span::styled("OK", Style::default().fg(Color::Green))
-        } else {
-            Span::styled("ERROR", Style::default().fg(Color::Red))
-        };
+    let health_text = state.health.as_ref().map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "Loading...",
+                Style::default().fg(Color::Yellow),
+            ))]
+        },
+        |health| {
+            let watcher_status = if health.watcher_running {
+                Span::styled("RUNNING", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("STOPPED", Style::default().fg(Color::Red))
+            };
+            let db_status = if health.db_accessible {
+                Span::styled("OK", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("NOT FOUND", Style::default().fg(Color::Red))
+            };
+            let wezterm_status = if health.wezterm_accessible {
+                Span::styled("OK", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("ERROR", Style::default().fg(Color::Red))
+            };
 
-        vec![
-            Line::from(vec![Span::raw("Watcher: "), watcher_status]),
-            Line::from(vec![Span::raw("Database: "), db_status]),
-            Line::from(vec![Span::raw("WezTerm: "), wezterm_status]),
-            Line::from(Span::raw(format!("Panes: {}", health.pane_count))),
-        ]
-    } else {
-        vec![Line::from(Span::styled(
-            "Loading...",
-            Style::default().fg(Color::Yellow),
-        ))]
-    };
+            vec![
+                Line::from(vec![Span::raw("Watcher: "), watcher_status]),
+                Line::from(vec![Span::raw("Database: "), db_status]),
+                Line::from(vec![Span::raw("WezTerm: "), wezterm_status]),
+                Line::from(Span::raw(format!("Panes: {}", health.pane_count))),
+            ]
+        },
+    );
 
     let health_block = Paragraph::new(health_text).block(
         Block::default()
