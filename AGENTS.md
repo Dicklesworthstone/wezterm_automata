@@ -271,7 +271,7 @@ wa watch --foreground
 wa robot state
 
 # Wait for any rate limit
-wa robot wait-for 0 "usage_reached" --timeout 3600
+wa robot wait-for 0 "usage_reached" --timeout-secs 3600
 ```
 
 ### 2. Orchestrate Agent Swarm
@@ -294,7 +294,7 @@ wa robot send 0 "/retry"
 wa robot search "test failed"
 
 # Get context around match
-wa robot get-text 0 --lines 100
+wa robot get-text 0 --tail 100
 ```
 
 ---
