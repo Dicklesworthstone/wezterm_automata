@@ -647,18 +647,13 @@ pub fn enhance_with_platform_commands(
 // ============================================================================
 
 /// Priority levels for suggestions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Priority {
     Low = 0,
+    #[default]
     Medium = 1,
     High = 2,
     Critical = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 /// Types of suggestions the engine can generate.
