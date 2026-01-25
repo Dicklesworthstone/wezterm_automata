@@ -435,40 +435,49 @@ impl PaneCursor {
     /// 1. **Overlap failure**: Delta extraction couldn't find matching content
     /// 2. **Alt-screen toggle**: Detected `ESC[?1049h/l` or `ESC[?47h/l` sequences
     ///    indicating the terminal switched between normal and alternate screen buffers
+    /// 3. **External state change**: `external_alt_screen` (from Lua IPC) differs from current state
     pub fn capture_snapshot(
         &mut self,
         current_snapshot: &str,
         overlap_size: usize,
+        external_alt_screen: Option<bool>,
     ) -> Option<CapturedSegment> {
-        if current_snapshot == self.last_snapshot {
+        if current_snapshot == self.last_snapshot && external_alt_screen.is_none() {
             return None;
         }
 
         let current_hash = hash_text(current_snapshot);
 
-        // Check for alt-screen changes before delta extraction
+        // Check for alt-screen changes via text detection
         let alt_screen_changes = detect_alt_screen_changes(current_snapshot);
 
-        // Determine if an actual state transition occurred relative to current state
-        let mut simulated_state = self.in_alt_screen;
-        let mut actual_transition_occurred = false;
+        // Determine the next state based on text detection first
+        let mut next_state = self.in_alt_screen;
+        let mut text_transition_occurred = false;
 
         for change in &alt_screen_changes {
-            let new_state = match change {
+            let s = match change {
                 AltScreenChange::Entered => true,
                 AltScreenChange::Exited => false,
             };
 
-            if new_state != simulated_state {
-                simulated_state = new_state;
-                actual_transition_occurred = true;
+            if s != next_state {
+                next_state = s;
+                text_transition_occurred = true;
             }
         }
 
-        // Update final state
-        self.in_alt_screen = simulated_state;
+        // If external authoritative state is provided, it overrides text detection
+        let final_state = external_alt_screen.unwrap_or(next_state);
+        let actual_transition_occurred = final_state != self.in_alt_screen;
 
-        let delta = extract_delta(&self.last_snapshot, current_snapshot, overlap_size);
+        // Update final state
+        self.in_alt_screen = final_state;
+
+        // Save old snapshot for comparison before updating
+        let previous_snapshot = std::mem::take(&mut self.last_snapshot);
+
+        let delta = extract_delta(&previous_snapshot, current_snapshot, overlap_size);
 
         // Update snapshot state regardless; capture is derived from these snapshots.
         self.last_snapshot = current_snapshot.to_string();
@@ -481,14 +490,15 @@ impl PaneCursor {
             let seq = self.next_seq;
             self.next_seq = self.next_seq.saturating_add(1);
 
-            let reason = if alt_screen_changes
-                .last()
-                .is_some_and(|c| *c == AltScreenChange::Entered)
-            {
+            // Determine reason
+            let reason = if self.in_alt_screen {
                 "alt_screen_entered".to_string()
             } else {
                 "alt_screen_exited".to_string()
             };
+
+            // If we have text transitions, prefer their specificity, but if overridden by external,
+            // use the external state to decide the reason.
 
             let content = match delta {
                 DeltaResult::Content(c) => c,
@@ -503,6 +513,13 @@ impl PaneCursor {
                 kind: CapturedSegmentKind::Gap { reason },
                 captured_at: epoch_ms(),
             });
+        }
+
+        if current_snapshot == previous_snapshot {
+            // If we reached here, it means no transition occurred, and content didn't change.
+            // We early-returned at the top if external_alt_screen was None.
+            // If external_alt_screen was Some but matched current state, we effectively have no change.
+            return None;
         }
 
         match delta {
@@ -549,7 +566,7 @@ impl PaneCursor {
 
     /// Alias for `capture_snapshot` for backward compatibility.
     pub fn capture(&mut self, content: &str, overlap_size: usize) -> Option<CapturedSegment> {
-        self.capture_snapshot(content, overlap_size)
+        self.capture_snapshot(content, overlap_size, None)
     }
 }
 
@@ -1661,26 +1678,28 @@ mod tests {
     fn capture_snapshot_assigns_monotonic_seq() {
         let mut cursor = PaneCursor::new(7);
 
-        let seg0 = cursor.capture_snapshot("a\n", 1024).expect("first capture");
+        let seg0 = cursor
+            .capture_snapshot("a\n", 1024, None)
+            .expect("first capture");
         assert_eq!(seg0.seq, 0);
         assert_eq!(seg0.pane_id, 7);
         assert_eq!(seg0.kind, CapturedSegmentKind::Delta);
         assert_eq!(seg0.content, "a\n");
 
         let seg1 = cursor
-            .capture_snapshot("a\nb\n", 1024)
+            .capture_snapshot("a\nb\n", 1024, None)
             .expect("second capture");
         assert_eq!(seg1.seq, 1);
         assert_eq!(seg1.kind, CapturedSegmentKind::Delta);
         assert_eq!(seg1.content, "b\n");
 
         // No change shouldn't emit a segment or advance seq
-        assert!(cursor.capture_snapshot("a\nb\n", 1024).is_none());
+        assert!(cursor.capture_snapshot("a\nb\n", 1024, None).is_none());
         assert_eq!(cursor.next_seq, 2);
 
         // In-place edit triggers a gap segment with full snapshot content
         let seg2 = cursor
-            .capture_snapshot("a\nc\n", 1024)
+            .capture_snapshot("a\nc\n", 1024, None)
             .expect("gap capture");
         assert_eq!(seg2.seq, 2);
         assert!(matches!(seg2.kind, CapturedSegmentKind::Gap { .. }));
@@ -1695,10 +1714,10 @@ mod tests {
 
         let mut cursor = PaneCursor::new(1);
         let seg0 = cursor
-            .capture_snapshot("hello\n", 1024)
+            .capture_snapshot("hello\n", 1024, None)
             .expect("first capture");
         let seg1 = cursor
-            .capture_snapshot("hello\nworld\n", 1024)
+            .capture_snapshot("hello\nworld\n", 1024, None)
             .expect("second capture");
 
         let stored0 = persist_captured_segment(&handle, &seg0).await.unwrap();
@@ -1724,12 +1743,12 @@ mod tests {
 
         let mut cursor = PaneCursor::new(1);
         let seg0 = cursor
-            .capture_snapshot("a\nb\n", 1024)
+            .capture_snapshot("a\nb\n", 1024, None)
             .expect("first capture");
         persist_captured_segment(&handle, &seg0).await.unwrap();
 
         let gap_segment = cursor
-            .capture_snapshot("a\nc\n", 1024)
+            .capture_snapshot("a\nc\n", 1024, None)
             .expect("gap capture");
         let persisted = persist_captured_segment(&handle, &gap_segment)
             .await
@@ -1759,12 +1778,12 @@ mod tests {
         // First, create a cursor and persist some segments normally
         let mut cursor = PaneCursor::new(1);
         let seg0 = cursor
-            .capture_snapshot("line1\n", 1024)
+            .capture_snapshot("line1\n", 1024, None)
             .expect("first capture");
         persist_captured_segment(&handle, &seg0).await.unwrap();
 
         let seg1 = cursor
-            .capture_snapshot("line1\nline2\n", 1024)
+            .capture_snapshot("line1\nline2\n", 1024, None)
             .expect("second capture");
         persist_captured_segment(&handle, &seg1).await.unwrap();
 
@@ -1772,7 +1791,7 @@ mod tests {
         cursor.next_seq = 100; // Storage expects seq=2, cursor will produce seq=100
 
         let seg2 = cursor
-            .capture_snapshot("line1\nline2\nline3\n", 1024)
+            .capture_snapshot("line1\nline2\nline3\n", 1024, None)
             .expect("third capture");
         assert_eq!(seg2.seq, 100); // Cursor produced seq=100
 
@@ -1813,14 +1832,16 @@ mod tests {
 
         // Create a cursor and persist some segments normally
         let mut cursor = PaneCursor::new(1);
-        let seg0 = cursor.capture_snapshot("a\n", 1024).expect("first capture");
+        let seg0 = cursor
+            .capture_snapshot("a\n", 1024, None)
+            .expect("first capture");
         persist_captured_segment(&handle, &seg0).await.unwrap();
 
         // Simulate desync
         cursor.next_seq = 999;
 
         let seg1 = cursor
-            .capture_snapshot("a\nb\n", 1024)
+            .capture_snapshot("a\nb\n", 1024, None)
             .expect("second capture");
         assert_eq!(seg1.seq, 999);
 
@@ -1834,7 +1855,7 @@ mod tests {
 
         // Next capture should be aligned
         let seg2 = cursor
-            .capture_snapshot("a\nb\nc\n", 1024)
+            .capture_snapshot("a\nb\nc\n", 1024, None)
             .expect("third capture");
         assert_eq!(seg2.seq, 2);
 
@@ -2436,13 +2457,13 @@ mod tests {
 
         // Initial content
         let seg0 = cursor
-            .capture_snapshot("$ ls\nfile1\nfile2\n", 1024)
+            .capture_snapshot("$ ls\nfile1\nfile2\n", 1024, None)
             .expect("first capture");
         assert_eq!(seg0.kind, CapturedSegmentKind::Delta);
 
         // Simulate entering vim (alt screen)
         let seg1 = cursor
-            .capture_snapshot("$ ls\nfile1\nfile2\n\x1b[?1049hvim window", 1024)
+            .capture_snapshot("$ ls\nfile1\nfile2\n\x1b[?1049hvim window", 1024, None)
             .expect("alt screen capture");
 
         // Should be detected as a gap
@@ -2461,12 +2482,12 @@ mod tests {
         cursor.in_alt_screen = true;
 
         let _seg0 = cursor
-            .capture_snapshot("vim content", 1024)
+            .capture_snapshot("vim content", 1024, None)
             .expect("first capture in alt screen");
 
         // Exit vim (alt screen exit)
         let seg1 = cursor
-            .capture_snapshot("vim content\x1b[?1049l$ ", 1024)
+            .capture_snapshot("vim content\x1b[?1049l$ ", 1024, None)
             .expect("alt screen exit capture");
 
         assert!(
@@ -2481,15 +2502,15 @@ mod tests {
         assert!(!cursor.in_alt_screen);
 
         // Enter alt screen
-        cursor.capture_snapshot("\x1b[?1049hcontent", 1024);
+        cursor.capture_snapshot("\x1b[?1049hcontent", 1024, None);
         assert!(cursor.in_alt_screen);
 
         // Still in alt screen
-        cursor.capture_snapshot("\x1b[?1049hcontent update", 1024);
+        cursor.capture_snapshot("\x1b[?1049hcontent update", 1024, None);
         assert!(cursor.in_alt_screen);
 
         // Exit alt screen
-        cursor.capture_snapshot("\x1b[?1049hcontent update\x1b[?1049l$ prompt", 1024);
+        cursor.capture_snapshot("\x1b[?1049hcontent update\x1b[?1049l$ prompt", 1024, None);
         assert!(!cursor.in_alt_screen);
     }
 
