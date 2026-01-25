@@ -1012,11 +1012,6 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
     let deadline = start + timeout;
     let mut polls = 0usize;
     let mut interval = options.poll_initial;
-    let mut last_tail_hash = None;
-    let mut last_markers = CodexSummaryMarkers {
-        token_usage: false,
-        resume_hint: false,
-    };
 
     tracing::info!(
         pane_id,
@@ -1028,15 +1023,14 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
         polls += 1;
         let text = source.get_text(pane_id, options.escapes).await?;
         let tail = tail_text(&text, options.tail_lines);
-        last_tail_hash = Some(stable_hash(tail.as_bytes()));
+        let last_tail_hash = Some(stable_hash(tail.as_bytes()));
 
-        let markers = CodexSummaryMarkers {
+        let last_markers = CodexSummaryMarkers {
             token_usage: tail.contains("Token usage:"),
             resume_hint: tail.contains("codex resume"),
         };
-        last_markers = markers;
 
-        if markers.complete() {
+        if last_markers.complete() {
             let elapsed_ms = elapsed_ms(start);
             tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait matched");
             return Ok(CodexSummaryWaitResult {

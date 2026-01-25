@@ -453,7 +453,6 @@ impl PaneCursor {
 
         // Determine the next state based on text detection first
         let mut next_state = self.in_alt_screen;
-        let mut text_transition_occurred = false;
 
         for change in &alt_screen_changes {
             let s = match change {
@@ -463,7 +462,6 @@ impl PaneCursor {
 
             if s != next_state {
                 next_state = s;
-                text_transition_occurred = true;
             }
         }
 

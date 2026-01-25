@@ -30,6 +30,7 @@ tracing-subscriber.workspace = true
 fancy-regex.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+toon_rust.workspace = true
 dirs = "5.0"
 
 [features]

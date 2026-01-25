@@ -4825,16 +4825,30 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 }
 
 fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
+    use wa_core::output::{ErrorRenderer, OutputFormat, detect_format};
+
     if robot_mode {
-        eprintln!("Error: {err}");
+        // In robot mode, output structured JSON error
+        if let Some(core_err) = err.downcast_ref::<wa_core::Error>() {
+            let renderer = ErrorRenderer::new(OutputFormat::Json);
+            eprintln!("{}", renderer.render(core_err));
+        } else {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "error": err.to_string(),
+                })
+            );
+        }
         return;
     }
 
+    // In human mode, use rich formatting with error codes
     if let Some(core_err) = err.downcast_ref::<wa_core::Error>() {
-        eprintln!(
-            "{}",
-            wa_core::error::format_error_with_remediation(core_err)
-        );
+        let format = detect_format();
+        let renderer = ErrorRenderer::new(format);
+        eprintln!("{}", renderer.render(core_err));
     } else {
         eprintln!("Error: {err}");
     }
@@ -5551,6 +5565,68 @@ mod tests {
             action_fingerprint: fingerprint.to_string(),
         };
         storage.insert_approval_token(token).await.unwrap();
+    }
+
+    #[test]
+    fn workflow_dry_run_report_includes_steps() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let report = build_workflow_dry_run_report(&command_ctx, "handle_compaction", 42, None);
+
+        assert!(!report.expected_actions.is_empty());
+        assert!(
+            report
+                .expected_actions
+                .iter()
+                .any(|action| action.action_type == wa_core::dry_run::ActionType::AcquireLock)
+        );
+
+        let send_actions: Vec<_> = report
+            .expected_actions
+            .iter()
+            .filter(|action| action.action_type == wa_core::dry_run::ActionType::SendText)
+            .collect();
+        assert!(!send_actions.is_empty());
+        assert!(
+            send_actions
+                .iter()
+                .all(|action| action.description.contains("policy-gated"))
+        );
+        assert!(send_actions.iter().all(|action| {
+            action
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("policy_gated"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }));
+
+        let workflow_check = report
+            .policy_evaluation
+            .as_ref()
+            .and_then(|policy| policy.checks.iter().find(|check| check.name == "workflow"));
+        assert!(workflow_check.is_some());
+        assert!(workflow_check.unwrap().passed);
+    }
+
+    #[test]
+    fn workflow_dry_run_report_unknown_workflow() {
+        let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
+        let report = build_workflow_dry_run_report(&command_ctx, "unknown_workflow", 7, None);
+
+        assert!(report.expected_actions.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No workflow steps available"))
+        );
+
+        let workflow_check = report
+            .policy_evaluation
+            .as_ref()
+            .and_then(|policy| policy.checks.iter().find(|check| check.name == "workflow"));
+        assert!(workflow_check.is_some());
+        assert!(!workflow_check.unwrap().passed);
     }
 
     #[test]

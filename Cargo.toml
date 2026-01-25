@@ -95,6 +95,9 @@ sha2 = "0.10"
 toml = "0.8"
 toml_edit = "0.22"
 
+# Serialization
+toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust" }
+
 # File locking
 fs2 = "0.4"
 

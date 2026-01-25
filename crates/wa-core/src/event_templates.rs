@@ -261,12 +261,10 @@ fn event_context(event: &StoredEvent) -> HashMap<String, String> {
     ctx.insert("severity".to_string(), event.severity.clone());
     ctx.insert("confidence".to_string(), format!("{:.2}", event.confidence));
 
-    if let Some(extracted) = &event.extracted {
-        if let Value::Object(map) = extracted {
-            for (key, value) in map {
-                ctx.entry(key.clone())
-                    .or_insert_with(|| value_to_string(value));
-            }
+    if let Some(Value::Object(map)) = &event.extracted {
+        for (key, value) in map {
+            ctx.entry(key.clone())
+                .or_insert_with(|| value_to_string(value));
         }
     }
 
@@ -282,9 +280,6 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
-static CONDITIONAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)\{\?([A-Za-z0-9_.-]+)\}(.*?)\{/\?\1\}").expect("conditional regex")
-});
 static PLURAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{([A-Za-z0-9_.-]+)\|([^|}]*)\|([^}]*)\}").expect("plural regex")
 });
@@ -310,23 +305,40 @@ fn render_template(template: &str, context: &HashMap<String, String>) -> String 
 }
 
 fn render_conditionals(template: &str, context: &HashMap<String, String>) -> String {
-    let mut current = template.to_string();
+    let mut output = String::new();
+    let mut rest = template;
+
     loop {
-        let updated = CONDITIONAL_RE.replace_all(&current, |caps: &Captures| {
-            let key = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let body = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-            if is_truthy(context.get(key)) {
-                body.to_string()
-            } else {
-                String::new()
-            }
-        });
-        let updated = updated.into_owned();
-        if updated == current {
-            break current;
+        let Some(start) = rest.find("{?") else {
+            output.push_str(rest);
+            break;
+        };
+
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end_key) = after.find('}') else {
+            output.push_str(&rest[start..]);
+            break;
+        };
+
+        let key = &after[..end_key];
+        let after_key = &after[end_key + 1..];
+        let close_tag = format!("{{/?{key}}}");
+
+        let Some(close_pos) = after_key.find(&close_tag) else {
+            output.push_str(&rest[start..]);
+            break;
+        };
+
+        let body = &after_key[..close_pos];
+        if is_truthy(context.get(key)) {
+            output.push_str(body);
         }
-        current = updated;
+
+        rest = &after_key[close_pos + close_tag.len()..];
     }
+
+    output
 }
 
 fn render_plurals(template: &str, context: &HashMap<String, String>) -> String {
@@ -335,7 +347,7 @@ fn render_plurals(template: &str, context: &HashMap<String, String>) -> String {
             let key = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
             let singular = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
             let plural = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
-            let count = context.get(key).and_then(parse_count);
+            let count = context.get(key).and_then(|value| parse_count(value));
             if count == Some(1) {
                 singular.to_string()
             } else {
@@ -363,7 +375,7 @@ fn is_truthy(value: Option<&String>) -> bool {
     }
 }
 
-fn parse_count(value: &String) -> Option<i64> {
+fn parse_count(value: &str) -> Option<i64> {
     let cleaned = value.replace(',', "");
     cleaned.trim().parse::<i64>().ok()
 }
@@ -400,6 +412,38 @@ mod tests {
         ctx.insert("count".to_string(), "2".to_string());
         let rendered_plural = render_template("{count} {count|item|items}", &ctx);
         assert_eq!(rendered_plural, "2 items");
+    }
+
+    #[test]
+    fn render_template_missing_variable_preserves_placeholder() {
+        let ctx = HashMap::new();
+        let rendered = render_template("Value: {missing}", &ctx);
+        assert_eq!(rendered, "Value: {missing}");
+    }
+
+    #[test]
+    fn render_template_conditionals_falsey_values() {
+        let template = "Start {?flag}Enabled{/?flag} End";
+
+        for value in ["0", "false", "  ", ""] {
+            let mut ctx = HashMap::new();
+            ctx.insert("flag".to_string(), value.to_string());
+            let rendered = render_template(template, &ctx);
+            assert_eq!(rendered, "Start  End");
+        }
+    }
+
+    #[test]
+    fn render_template_plurals_handle_missing_or_comma_counts() {
+        let template = "Found {count|item|items}";
+
+        let rendered_missing = render_template(template, &HashMap::new());
+        assert_eq!(rendered_missing, "Found items");
+
+        let mut ctx = HashMap::new();
+        ctx.insert("count".to_string(), "1,234".to_string());
+        let rendered_plural = render_template("{count} {count|item|items}", &ctx);
+        assert_eq!(rendered_plural, "1,234 items");
     }
 
     #[test]
@@ -450,5 +494,78 @@ mod tests {
         let rendered = registry.render(&event);
         assert_eq!(rendered.summary, "Usage 75%");
         assert_eq!(rendered.description, "Remaining 1h");
+    }
+
+    #[test]
+    fn registry_fallback_used_for_unknown_event() {
+        let registry = TemplateRegistry::new(
+            HashMap::new(),
+            EventTemplate::new(
+                "fallback",
+                "Unknown event {event_type}",
+                "Fallback for {event_type}",
+                Severity::Info,
+            ),
+        );
+
+        let event = StoredEvent {
+            id: 7,
+            pane_id: 3,
+            rule_id: "unknown.rule".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "unknown.event".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.5,
+            extracted: None,
+            matched_text: None,
+            segment_id: None,
+            detected_at: 0,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+
+        let rendered = registry.render(&event);
+        assert!(rendered.summary.contains("unknown.event"));
+        assert!(rendered.description.contains("unknown.event"));
+    }
+
+    #[test]
+    fn render_event_summary_matches_rule_description() {
+        let engine = PatternEngine::new();
+        let mut by_event: HashMap<String, Vec<&RuleDef>> = HashMap::new();
+        for rule in engine.rules() {
+            by_event
+                .entry(rule.event_type.clone())
+                .or_default()
+                .push(rule);
+        }
+
+        let rule = by_event
+            .values()
+            .find(|rules| rules.len() == 1)
+            .and_then(|rules| rules.first().copied())
+            .expect("expected at least one unique event type");
+
+        let event = StoredEvent {
+            id: 99,
+            pane_id: 12,
+            rule_id: rule.id.clone(),
+            agent_type: rule.agent_type.to_string(),
+            event_type: rule.event_type.clone(),
+            severity: "warning".to_string(),
+            confidence: 0.9,
+            extracted: Some(serde_json::json!({"remaining": "10"})),
+            matched_text: None,
+            segment_id: None,
+            detected_at: 0,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+
+        let rendered = render_event(&event);
+        assert_eq!(rendered.summary, rule.description);
+        assert!(!rendered.summary.contains(&rule.event_type));
     }
 }

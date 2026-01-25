@@ -66,6 +66,7 @@ pub struct CodexExitOutcome {
 }
 
 /// Convert an injection result into a success/error for Ctrl-C handling.
+#[allow(dead_code)]
 fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
     match result {
         InjectionResult::Allowed { .. } => Ok(()),
@@ -92,6 +93,7 @@ fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
 /// 2) If not seen, sends Ctrl-C again and waits up to `summary_timeout_ms`.
 ///
 /// Returns the number of Ctrl-C injections performed and the summary wait result.
+#[allow(dead_code)]
 pub(crate) async fn codex_exit_and_wait_for_summary<S, F, Fut>(
     pane_id: u64,
     source: &S,
@@ -148,8 +150,7 @@ where
 
     let last_hash = second_wait
         .last_tail_hash
-        .map(|value| format!("{value:016x}"))
-        .unwrap_or_else(|| "none".to_string());
+        .map_or_else(|| "none".to_string(), |value| format!("{value:016x}"));
     Err(format!(
         "Session summary not found after Ctrl-C x2 (token_usage={}, resume_hint={}, elapsed_ms={}, last_tail_hash={})",
         second_wait.last_markers.token_usage,
@@ -164,6 +165,7 @@ where
 // ============================================================================
 
 /// Parsed token usage summary from Codex session output.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTokenUsage {
     pub total: Option<i64>,
@@ -173,6 +175,7 @@ pub struct CodexTokenUsage {
     pub reasoning: Option<i64>,
 }
 
+#[allow(dead_code)]
 impl CodexTokenUsage {
     fn has_any(&self) -> bool {
         self.total.is_some()
@@ -184,6 +187,7 @@ impl CodexTokenUsage {
 }
 
 /// Parsed Codex session summary details needed for resume + accounting.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexSessionSummary {
     pub session_id: String,
@@ -192,6 +196,7 @@ pub struct CodexSessionSummary {
 }
 
 /// Structured error for Codex session summary parsing.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexSessionParseError {
     pub missing: Vec<&'static str>,
@@ -211,23 +216,31 @@ impl std::fmt::Display for CodexSessionParseError {
 
 impl std::error::Error for CodexSessionParseError {}
 
+#[allow(dead_code)]
 static CODEX_RESUME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)codex resume\s+(?P<session_id>[0-9a-fA-F-]{8,})").expect("codex resume regex")
 });
+#[allow(dead_code)]
 static CODEX_RESET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)try again at\s+(?P<reset_time>[^.\n]+)").expect("codex reset time regex")
 });
+#[allow(dead_code)]
 static CODEX_TOTAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)total\s*=\s*([\d,]+)").expect("total regex"));
+#[allow(dead_code)]
 static CODEX_INPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)input\s*=\s*([\d,]+)").expect("input regex"));
+#[allow(dead_code)]
 static CODEX_OUTPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)output\s*=\s*([\d,]+)").expect("output regex"));
+#[allow(dead_code)]
 static CODEX_CACHED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(\+\s*([\d,]+)\s+cached\)").expect("cached regex"));
+#[allow(dead_code)]
 static CODEX_REASONING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex"));
 
+#[allow(dead_code)]
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
     for byte in bytes {
@@ -237,11 +250,13 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[allow(dead_code)]
 fn parse_number(raw: &str) -> Option<i64> {
     let cleaned = raw.replace(',', "");
     cleaned.parse::<i64>().ok()
 }
 
+#[allow(dead_code)]
 fn capture_number(regex: &Regex, text: &str) -> Option<i64> {
     regex
         .captures(text)
@@ -249,6 +264,7 @@ fn capture_number(regex: &Regex, text: &str) -> Option<i64> {
         .and_then(parse_number)
 }
 
+#[allow(dead_code)]
 fn extract_token_usage(line: &str) -> CodexTokenUsage {
     CodexTokenUsage {
         total: capture_number(&CODEX_TOTAL_RE, line),
@@ -259,12 +275,12 @@ fn extract_token_usage(line: &str) -> CodexTokenUsage {
     }
 }
 
+#[allow(dead_code)]
 fn find_token_usage_line(tail: &str) -> Option<&str> {
-    tail.lines()
-        .filter(|line| line.contains("Token usage:"))
-        .last()
+    tail.lines().rfind(|line| line.contains("Token usage:"))
 }
 
+#[allow(dead_code)]
 fn find_session_id(tail: &str) -> Option<String> {
     CODEX_RESUME_RE
         .captures_iter(tail)
@@ -272,6 +288,7 @@ fn find_session_id(tail: &str) -> Option<String> {
         .last()
 }
 
+#[allow(dead_code)]
 fn find_reset_time(tail: &str) -> Option<String> {
     CODEX_RESET_RE
         .captures_iter(tail)
@@ -290,6 +307,7 @@ fn find_reset_time(tail: &str) -> Option<String> {
 ///
 /// Optional fields:
 /// - reset_time ("try again at ...")
+#[allow(dead_code)]
 pub(crate) fn parse_codex_session_summary(
     tail: &str,
 ) -> Result<CodexSessionSummary, CodexSessionParseError> {
@@ -305,13 +323,7 @@ pub(crate) fn parse_codex_session_summary(
     if session_id.is_none() {
         missing.push("session_id");
     }
-    if token_usage_line.is_none()
-        || token_usage
-            .as_ref()
-            .map(|usage| usage.has_any())
-            .unwrap_or(false)
-            == false
-    {
+    if token_usage_line.is_none() || !token_usage.as_ref().is_some_and(CodexTokenUsage::has_any) {
         missing.push("token_usage");
     }
 
@@ -331,6 +343,7 @@ pub(crate) fn parse_codex_session_summary(
 }
 
 /// Build an agent session record from a parsed Codex summary.
+#[allow(dead_code)]
 pub(crate) fn codex_session_record_from_summary(
     pane_id: u64,
     summary: &CodexSessionSummary,
@@ -346,6 +359,7 @@ pub(crate) fn codex_session_record_from_summary(
 }
 
 /// Persist parsed Codex summary data into agent_sessions.
+#[allow(dead_code)]
 pub(crate) async fn persist_codex_session_summary(
     storage: &StorageHandle,
     pane_id: u64,

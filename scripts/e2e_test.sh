@@ -330,6 +330,7 @@ run_self_check() {
 # Format: scenario_name:description
 SCENARIO_REGISTRY=(
     "capture_search:Validate ingest pipeline and FTS search"
+    "natural_language:Validate event summaries and wa why output"
     "compaction_workflow:Validate pattern detection and workflow execution"
     "policy_denial:Validate safety gates block sends to protected panes"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
@@ -633,6 +634,138 @@ run_scenario_capture_search() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_capture_search
+
+    return $result
+}
+
+run_scenario_natural_language() {
+    local scenario_dir="$1"
+    local marker="You've hit your usage limit, try again at 12:00."
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
+    local wa_pid=""
+    local pane_id=""
+    local result=0
+
+    log_info "Using marker: $marker"
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    cleanup_natural_language() {
+        log_verbose "Cleaning up natural_language scenario"
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$pane_id" ]]; then
+            log_verbose "Closing dummy pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_natural_language EXIT
+
+    # Step 1: Spawn dummy pane with usage-limit marker
+    log_info "Step 1: Spawning dummy pane..."
+    local dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_print.sh"
+    if [[ ! -x "$dummy_script" ]]; then
+        log_fail "Dummy print script not found or not executable: $dummy_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$dummy_script" "$marker" 5 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn dummy pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned pane: $pane_id"
+    echo "Spawned pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 2: Start wa watch in background
+    log_info "Step 2: Starting wa watch..."
+    "$WA_BINARY" watch --foreground \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 1
+
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 3: Wait for pane to be observed
+    log_info "Step 3: Waiting for pane capture..."
+    local wait_timeout=${TIMEOUT:-30}
+    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+
+    # Step 4: Wait for usage limit event to be detected
+    log_info "Step 4: Waiting for usage limit event..."
+    local event_cmd="\"$WA_BINARY\" events --format json --rule-id codex.usage.reached --limit 5 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "usage limit event detected" "$event_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for usage limit event"
+        "$WA_BINARY" events --format json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Usage limit event detected"
+    fi
+
+    # Step 5: Capture CLI outputs
+    log_info "Step 5: Capturing CLI outputs..."
+    local events_output
+    events_output=$("$WA_BINARY" events --rule-id codex.usage.reached --limit 5 2>&1)
+    echo "$events_output" > "$scenario_dir/events_output.txt"
+
+    local why_output
+    why_output=$("$WA_BINARY" why workflow.usage_limit 2>&1)
+    echo "$why_output" > "$scenario_dir/why_output.txt"
+
+    # Step 6: Assert outputs are human-readable
+    log_info "Step 6: Asserting outputs..."
+    if echo "$events_output" | grep -q "Codex usage limit reached"; then
+        log_pass "Events output uses human summary"
+    else
+        log_fail "Events output missing human summary"
+        result=1
+    fi
+
+    if echo "$why_output" | grep -q "handle_usage_limits"; then
+        log_pass "wa why output rendered explanation"
+    else
+        log_fail "wa why output missing workflow explanation"
+        result=1
+    fi
+
+    # Step 7: Stop wa watch gracefully
+    log_info "Step 7: Stopping wa watch..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+    log_verbose "wa watch stopped"
+
+    trap - EXIT
+    cleanup_natural_language
 
     return $result
 }
@@ -2162,13 +2295,16 @@ run_scenario() {
 
     local result=0
 
-    case "$name" in
-        capture_search)
-            run_scenario_capture_search "$scenario_dir" || result=$?
-            ;;
-        compaction_workflow)
-            run_scenario_compaction_workflow "$scenario_dir" || result=$?
-            ;;
+        case "$name" in
+            capture_search)
+                run_scenario_capture_search "$scenario_dir" || result=$?
+                ;;
+            natural_language)
+                run_scenario_natural_language "$scenario_dir" || result=$?
+                ;;
+            compaction_workflow)
+                run_scenario_compaction_workflow "$scenario_dir" || result=$?
+                ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
             ;;

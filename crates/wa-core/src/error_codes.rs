@@ -726,6 +726,44 @@ pub static WA_9001: ErrorCodeDef = ErrorCodeDef {
     doc_link: Some("https://github.com/Dicklesworthstone/wezterm_automata/issues"),
 };
 
+/// WA-9002: I/O error
+pub static WA_9002: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-9002",
+    category: ErrorCategory::Internal,
+    title: "I/O error",
+    description: "A filesystem or OS I/O error occurred while wa was running.",
+    causes: &[
+        "Missing files or directories",
+        "Permission denied when reading or writing",
+        "Disk full or unavailable filesystem",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Run diagnostics", "wa doctor"),
+        RecoveryStep::text("Check filesystem permissions and available space"),
+        RecoveryStep::text("Retry after resolving the underlying I/O issue"),
+    ],
+    doc_link: None,
+};
+
+/// WA-9003: JSON serialization error
+pub static WA_9003: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-9003",
+    category: ErrorCategory::Internal,
+    title: "JSON serialization error",
+    description: "JSON input or output could not be parsed or serialized.",
+    causes: &[
+        "Malformed JSON input",
+        "Unexpected data types in JSON payloads",
+        "Invalid UTF-8 in JSON streams",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Validate JSON", "python -m json.tool < input.json"),
+        RecoveryStep::text("Check for trailing commas or invalid characters"),
+        RecoveryStep::text("Retry with a well-formed JSON payload"),
+    ],
+    doc_link: None,
+};
+
 // ============================================================================
 // Error Code Registry
 // ============================================================================
@@ -769,6 +807,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("WA-7010", &WA_7010);
         // Internal errors
         m.insert("WA-9001", &WA_9001);
+        m.insert("WA-9002", &WA_9002);
+        m.insert("WA-9003", &WA_9003);
         m
     });
 
@@ -782,7 +822,7 @@ pub fn get_error_code(code: &str) -> Option<&'static ErrorCodeDef> {
 #[must_use]
 pub fn list_error_codes() -> Vec<&'static str> {
     let mut codes: Vec<&str> = ERROR_CATALOG.keys().copied().collect();
-    codes.sort();
+    codes.sort_unstable();
     codes
 }
 
@@ -843,6 +883,28 @@ mod tests {
                 !def.recovery_steps.is_empty(),
                 "Error code {code} has no recovery steps"
             );
+        }
+    }
+
+    #[test]
+    fn all_codes_have_titles_and_descriptions() {
+        for (code, def) in ERROR_CATALOG.iter() {
+            assert!(
+                !def.title.trim().is_empty(),
+                "Error code {code} has empty title"
+            );
+            assert!(
+                !def.description.trim().is_empty(),
+                "Error code {code} has empty description"
+            );
+        }
+    }
+
+    #[test]
+    fn list_error_codes_is_sorted() {
+        let codes = list_error_codes();
+        for window in codes.windows(2) {
+            assert!(window[0] <= window[1], "Codes not sorted: {:?}", codes);
         }
     }
 

@@ -4,11 +4,11 @@
 //! producing rich error messages with error codes, descriptions,
 //! and actionable suggestions.
 
+use super::format::{OutputFormat, Style};
 use crate::error::{
     ConfigError, Error, PatternError, Remediation, StorageError, WeztermError, WorkflowError,
 };
-use crate::error_codes::{get_error_code, ErrorCodeDef};
-use super::format::{OutputFormat, Style};
+use crate::error_codes::{ErrorCodeDef, get_error_code};
 
 /// Renderer for CLI error output
 pub struct ErrorRenderer {
@@ -77,13 +77,13 @@ impl ErrorRenderer {
     #[must_use]
     pub fn render(&self, error: &Error) -> String {
         if self.format.is_json() {
-            return self.render_json(error);
+            return Self::render_json(error);
         }
         self.render_plain(error)
     }
 
     /// Render error as JSON
-    fn render_json(&self, error: &Error) -> String {
+    fn render_json(error: &Error) -> String {
         let code = Self::error_code(error);
         let code_def = get_error_code(code);
 
@@ -126,10 +126,7 @@ impl ErrorRenderer {
         let mut output = String::new();
 
         // Error header with title
-        let title = code_def.map_or_else(
-            || error.to_string(),
-            |def| def.title.to_string(),
-        );
+        let title = code_def.map_or_else(|| error.to_string(), |def| def.title.to_string());
         output.push_str(&format!("{} {}\n", style.red("Error:"), style.bold(&title)));
 
         // Error message (if different from title)
@@ -145,7 +142,7 @@ impl ErrorRenderer {
 
         // Suggestions from remediation
         if let Some(remediation) = error.remediation() {
-            output.push_str(&self.render_remediation(&remediation, &style));
+            output.push_str(&Self::render_remediation(&remediation, &style));
         }
 
         // Error code footer
@@ -163,7 +160,7 @@ impl ErrorRenderer {
     }
 
     /// Render remediation section
-    fn render_remediation(&self, remediation: &Remediation, style: &Style) -> String {
+    fn render_remediation(remediation: &Remediation, style: &Style) -> String {
         let mut output = String::new();
 
         output.push_str(&format!("\n{}\n", style.bold("Suggestions:")));
@@ -202,13 +199,13 @@ impl ErrorRenderer {
     #[must_use]
     pub fn render_error_code(&self, def: &ErrorCodeDef) -> String {
         if self.format.is_json() {
-            return self.render_error_code_json(def);
+            return Self::render_error_code_json(def);
         }
         self.render_error_code_plain(def)
     }
 
     /// Render error code as JSON
-    fn render_error_code_json(&self, def: &ErrorCodeDef) -> String {
+    fn render_error_code_json(def: &ErrorCodeDef) -> String {
         let obj = serde_json::json!({
             "code": def.code,
             "title": def.title,
@@ -255,16 +252,9 @@ impl ErrorRenderer {
         if !def.recovery_steps.is_empty() {
             output.push_str(&format!("\n{}\n", style.bold("Recovery steps:")));
             for (i, step) in def.recovery_steps.iter().enumerate() {
-                output.push_str(&format!(
-                    "  {}. {}\n",
-                    i + 1,
-                    step.description
-                ));
-                if let Some(cmd) = step.command {
-                    output.push_str(&format!(
-                        "     {}\n",
-                        style.cyan(&format!("`{cmd}`"))
-                    ));
+                output.push_str(&format!("  {}. {}\n", i + 1, step.description));
+                if let Some(cmd) = &step.command {
+                    output.push_str(&format!("     {}\n", style.cyan(&format!("`{cmd}`"))));
                 }
             }
         }
@@ -300,10 +290,16 @@ mod tests {
             (Error::Wezterm(WeztermError::CliNotFound), "WA-1001"),
             (Error::Wezterm(WeztermError::NotRunning), "WA-1002"),
             (Error::Wezterm(WeztermError::PaneNotFound(1)), "WA-1010"),
-            (Error::Storage(StorageError::Database("test".into())), "WA-2001"),
+            (
+                Error::Storage(StorageError::Database("test".into())),
+                "WA-2001",
+            ),
             (Error::Pattern(PatternError::MatchTimeout), "WA-3020"),
             (Error::Workflow(WorkflowError::PaneLocked), "WA-5030"),
-            (Error::Config(ConfigError::FileNotFound("wa.toml".into())), "WA-7001"),
+            (
+                Error::Config(ConfigError::FileNotFound("wa.toml".into())),
+                "WA-7001",
+            ),
             (Error::Policy("denied".into()), "WA-4001"),
         ];
 
@@ -324,7 +320,10 @@ mod tests {
         let output = renderer.render(&error);
 
         assert!(output.contains("WA-1010"), "Should include error code");
-        assert!(output.contains("wa why WA-1010"), "Should include wa why hint");
+        assert!(
+            output.contains("wa why WA-1010"),
+            "Should include wa why hint"
+        );
     }
 
     #[test]
@@ -337,5 +336,60 @@ mod tests {
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["code"], "WA-1002");
         assert!(parsed["error"].is_string());
+    }
+
+    #[test]
+    fn render_plain_includes_code_and_title() {
+        let error = Error::Wezterm(WeztermError::CliNotFound);
+        let renderer = ErrorRenderer::new(OutputFormat::Plain);
+        let output = renderer.render(&error);
+
+        assert!(output.contains("WA-1001"));
+        assert!(output.contains("WezTerm CLI not found"));
+        assert!(output.contains("wa why WA-1001"));
+    }
+
+    #[test]
+    fn render_json_includes_code_and_category() {
+        let error = Error::Config(ConfigError::FileNotFound("wa.toml".to_string()));
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let output = renderer.render(&error);
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid json output");
+        assert_eq!(json["code"], "WA-7001");
+        assert!(
+            json["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Config")
+        );
+        assert_eq!(json["category"], "Config");
+    }
+
+    #[test]
+    fn renderer_codes_exist_in_catalog() {
+        let io_error = Error::Io(std::io::Error::other("io failure"));
+        let json_error =
+            Error::Json(serde_json::from_str::<serde_json::Value>("not json").unwrap_err());
+
+        let samples = vec![
+            Error::Wezterm(WeztermError::CliNotFound),
+            Error::Storage(StorageError::Database("db".to_string())),
+            Error::Pattern(PatternError::InvalidRule("rule".to_string())),
+            Error::Workflow(WorkflowError::NotFound("missing".to_string())),
+            Error::Config(ConfigError::ValidationError("bad".to_string())),
+            Error::Policy("denied".to_string()),
+            Error::Runtime("boom".to_string()),
+            io_error,
+            json_error,
+        ];
+
+        for error in samples {
+            let code = ErrorRenderer::error_code(&error);
+            assert!(
+                get_error_code(code).is_some(),
+                "Missing catalog entry for {code}"
+            );
+        }
     }
 }

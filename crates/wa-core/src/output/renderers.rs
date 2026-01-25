@@ -717,6 +717,15 @@ mod tests {
     }
 
     #[test]
+    fn event_list_plain_has_no_ansi() {
+        let events = vec![sample_event()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render(&events, &ctx);
+
+        assert!(!output.contains("\x1b["));
+    }
+
+    #[test]
     fn test_json_output() {
         let panes = vec![sample_pane()];
         let ctx = RenderContext::new(OutputFormat::Json);
