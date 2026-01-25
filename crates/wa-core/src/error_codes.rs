@@ -715,11 +715,7 @@ pub static WA_9001: ErrorCodeDef = ErrorCodeDef {
     category: ErrorCategory::Internal,
     title: "Internal error",
     description: "An unexpected internal error occurred. This is likely a bug in wa.",
-    causes: &[
-        "Bug in wa code",
-        "Unexpected state",
-        "Unhandled edge case",
-    ],
+    causes: &["Bug in wa code", "Unexpected state", "Unhandled edge case"],
     recovery_steps: &[
         RecoveryStep::with_command("Run diagnostics", "wa doctor"),
         RecoveryStep::text("Try restarting the watcher"),

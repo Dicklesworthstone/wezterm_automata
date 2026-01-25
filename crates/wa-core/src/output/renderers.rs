@@ -7,6 +7,7 @@
 
 use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
+use crate::event_templates;
 use crate::storage::{PaneRecord, SearchResult, StoredEvent};
 
 /// Rendering context with shared settings
@@ -212,6 +213,7 @@ impl EventListRenderer {
             Column::new("ID").align(Alignment::Right).min_width(5),
             Column::new("PANE").align(Alignment::Right).min_width(4),
             Column::new("RULE").min_width(16),
+            Column::new("SUMMARY").min_width(24),
             Column::new("SEV").min_width(8),
             Column::new("TIME").min_width(20),
             Column::new("STATUS").min_width(10),
@@ -226,6 +228,7 @@ impl EventListRenderer {
 
         for event in display_events {
             let severity = style.severity(&event.severity, &event.severity);
+            let summary = event_templates::render_event(event).summary;
             let status = if event.handled_at.is_some() {
                 style.green("handled")
             } else {
@@ -236,6 +239,7 @@ impl EventListRenderer {
                 event.id.to_string(),
                 event.pane_id.to_string(),
                 event.rule_id.clone(),
+                truncate(&summary, 60),
                 severity,
                 format_timestamp(event.detected_at),
                 status,
@@ -264,6 +268,7 @@ impl EventListRenderer {
         let style = Style::from_format(ctx.format);
         let mut output = String::new();
 
+        let rendered = event_templates::render_event(event);
         output.push_str(&style.bold(&format!("Event #{}\n", event.id)));
         output.push_str(&format!("  Rule:       {}\n", event.rule_id));
         output.push_str(&format!("  Pane:       {}\n", event.pane_id));
@@ -274,6 +279,7 @@ impl EventListRenderer {
             style.severity(&event.severity, &event.severity)
         ));
         output.push_str(&format!("  Confidence: {:.2}\n", event.confidence));
+        output.push_str(&format!("  Summary:    {}\n", rendered.summary));
         output.push_str(&format!(
             "  Detected:   {}\n",
             format_timestamp(event.detected_at)
@@ -303,6 +309,26 @@ impl EventListRenderer {
             let json = serde_json::to_string_pretty(extracted).unwrap_or_else(|_| "{}".to_string());
             for line in json.lines() {
                 output.push_str(&format!("    {line}\n"));
+            }
+        }
+
+        if !rendered.description.trim().is_empty() {
+            output.push_str("\n  Description:\n");
+            for line in rendered.description.lines() {
+                output.push_str(&format!("    {line}\n"));
+            }
+        }
+
+        if !rendered.suggestions.is_empty() {
+            output.push_str("\n  Suggestions:\n");
+            for suggestion in rendered.suggestions {
+                output.push_str(&format!("    - {}\n", suggestion.text));
+                if let Some(command) = suggestion.command {
+                    output.push_str(&format!("      Command: {command}\n"));
+                }
+                if let Some(doc) = suggestion.doc_link {
+                    output.push_str(&format!("      Docs: {doc}\n"));
+                }
             }
         }
 

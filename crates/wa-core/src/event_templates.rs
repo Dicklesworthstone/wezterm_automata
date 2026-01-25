@@ -283,10 +283,10 @@ fn value_to_string(value: &Value) -> String {
 }
 
 static CONDITIONAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)\\{\\?([A-Za-z0-9_.-]+)\\}(.*?)\\{/\\?\\1\\}").expect("conditional regex")
+    Regex::new(r"(?s)\{\?([A-Za-z0-9_.-]+)\}(.*?)\{/\?\1\}").expect("conditional regex")
 });
 static PLURAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\\{([A-Za-z0-9_.-]+)\\|([^|}]*)\\|([^}]*)\\}").expect("plural regex")
+    Regex::new(r"\{([A-Za-z0-9_.-]+)\|([^|}]*)\|([^}]*)\}").expect("plural regex")
 });
 
 fn render_suggestion(suggestion: &Suggestion, context: &HashMap<String, String>) -> Suggestion {

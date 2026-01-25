@@ -69,7 +69,6 @@ branches_sharing_code = "allow"
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust" }
 tokio = { version = "1.43", features = ["full"] }
 thiserror = "2.0"
 anyhow = "1.0"

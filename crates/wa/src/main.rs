@@ -1457,10 +1457,33 @@ fn build_send_dry_run_report(
     ctx.take_report()
 }
 
+fn resolve_workflow(name: &str) -> Option<std::sync::Arc<dyn wa_core::workflows::Workflow>> {
+    match name {
+        "handle_compaction" => Some(std::sync::Arc::new(
+            wa_core::workflows::HandleCompaction::default(),
+        )),
+        _ => None,
+    }
+}
+
+fn infer_workflow_action_type(step_name: &str) -> wa_core::dry_run::ActionType {
+    let name = step_name.to_lowercase();
+    if name.contains("send") {
+        wa_core::dry_run::ActionType::SendText
+    } else if name.contains("wait") || name.contains("stabilize") || name.contains("verify") {
+        wa_core::dry_run::ActionType::WaitFor
+    } else if name.contains("lock") {
+        wa_core::dry_run::ActionType::AcquireLock
+    } else {
+        wa_core::dry_run::ActionType::WorkflowStep
+    }
+}
+
 fn build_workflow_dry_run_report(
     command_ctx: &wa_core::dry_run::CommandContext,
     name: &str,
     pane: u64,
+    pane_info: Option<&wa_core::wezterm::PaneInfo>,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
         ActionType, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
@@ -1469,53 +1492,144 @@ fn build_workflow_dry_run_report(
     let mut ctx = command_ctx.dry_run_context();
 
     // Target resolution
-    ctx.set_target(
-        TargetResolution::new(pane, "local")
-            .with_title("(pane title)")
-            .with_agent_type("(detected agent)"),
-    );
+    if let Some(info) = pane_info {
+        let mut target =
+            TargetResolution::new(pane, info.inferred_domain()).with_is_active(info.is_active);
+        if let Some(title) = &info.title {
+            target = target.with_title(title.clone());
+        }
+        if let Some(cwd) = &info.cwd {
+            target = target.with_cwd(cwd.clone());
+        }
+        ctx.set_target(target);
+    } else {
+        ctx.set_target(TargetResolution::new(pane, "unknown"));
+        ctx.add_warning("Pane metadata unavailable; verify pane ID and daemon state.");
+    }
 
     // Policy evaluation for workflow
     let mut eval = PolicyEvaluation::new();
-    eval.add_check(PolicyCheck::passed(
-        "workflow_enabled",
-        format!("Workflow '{name}' is enabled"),
-    ));
-    eval.add_check(PolicyCheck::passed("pane_state", "Pane is in valid state"));
-    eval.add_check(PolicyCheck::passed("policy", "Workflow execution allowed"));
+    let workflow = resolve_workflow(name);
+    match workflow.as_ref() {
+        Some(wf) => {
+            eval.add_check(PolicyCheck::passed(
+                "workflow",
+                format!("Workflow '{name}' loaded"),
+            ));
+            if wf.is_enabled() {
+                eval.add_check(PolicyCheck::passed(
+                    "workflow_enabled",
+                    "Workflow is enabled",
+                ));
+            } else {
+                eval.add_check(PolicyCheck::failed(
+                    "workflow_enabled",
+                    "Workflow is disabled",
+                ));
+            }
+
+            if wf.requires_approval() {
+                eval.add_check(PolicyCheck::failed(
+                    "approval",
+                    "Workflow requires approval",
+                ));
+            } else {
+                eval.add_check(PolicyCheck::passed("approval", "No approval required"));
+            }
+
+            if wf.is_destructive() {
+                eval.add_check(PolicyCheck::failed(
+                    "destructive",
+                    "Workflow marked destructive",
+                ));
+            } else {
+                eval.add_check(PolicyCheck::passed(
+                    "destructive",
+                    "Workflow marked non-destructive",
+                ));
+            }
+        }
+        None => {
+            eval.add_check(PolicyCheck::failed(
+                "workflow",
+                format!("Workflow '{name}' not found"),
+            ));
+        }
+    }
+
+    if pane_info.is_some() {
+        eval.add_check(PolicyCheck::passed("pane", "Pane found"));
+    } else {
+        eval.add_check(PolicyCheck::failed(
+            "pane",
+            "Pane not found (dry-run uses best-effort resolution)",
+        ));
+    }
+
+    eval.add_check(
+        PolicyCheck::passed("pane_state", "Pane state not inspected during dry-run")
+            .with_details("Verify prompt/alt-screen state before execution."),
+    );
+    eval.add_check(
+        PolicyCheck::passed("policy", "Policy checks deferred to execution")
+            .with_details("Send steps remain policy-gated at runtime."),
+    );
     ctx.set_policy_evaluation(eval);
 
-    // Expected workflow steps (example for handle_compaction)
-    ctx.add_action(PlannedAction::new(
-        1,
-        ActionType::AcquireLock,
-        format!("Acquire workflow lock for pane {pane}"),
-    ));
-    ctx.add_action(PlannedAction::new(
-        2,
-        ActionType::WaitFor,
-        "Stabilize: wait for tail stability (no new deltas for N polls; max 2s)".to_string(),
-    ));
-    ctx.add_action(PlannedAction::new(
-        3,
-        ActionType::SendText,
-        "Send re-read instruction to agent".to_string(),
-    ));
-    ctx.add_action(PlannedAction::new(
-        4,
-        ActionType::WaitFor,
-        "Verify: wait for prompt boundary".to_string(),
-    ));
-    ctx.add_action(PlannedAction::new(
-        5,
-        ActionType::MarkEventHandled,
-        "Mark triggering event as handled".to_string(),
-    ));
-    ctx.add_action(PlannedAction::new(
-        6,
-        ActionType::ReleaseLock,
-        "Release workflow lock".to_string(),
-    ));
+    // Expected workflow steps
+    if let Some(wf) = workflow.as_ref() {
+        let mut step = 1u32;
+
+        ctx.add_action(PlannedAction::new(
+            step,
+            ActionType::AcquireLock,
+            format!("Acquire workflow lock for pane {pane}"),
+        ));
+        step += 1;
+
+        for workflow_step in wf.steps() {
+            let action_type = infer_workflow_action_type(&workflow_step.name);
+            let mut description = format!("{}: {}", workflow_step.name, workflow_step.description);
+            if action_type == ActionType::SendText {
+                description.push_str(" [policy-gated]");
+            }
+            let mut action = PlannedAction::new(step, action_type, description);
+            if action_type == ActionType::SendText {
+                action = action.with_metadata(serde_json::json!({
+                    "policy_gated": true,
+                }));
+            }
+            ctx.add_action(action);
+            step += 1;
+        }
+
+        let trigger_event_types = wf.trigger_event_types();
+        let trigger_rule_ids = wf.trigger_rule_ids();
+        if !trigger_event_types.is_empty() || !trigger_rule_ids.is_empty() {
+            let mut details = Vec::new();
+            if !trigger_event_types.is_empty() {
+                details.push(format!("event types: {}", trigger_event_types.join(", ")));
+            }
+            if !trigger_rule_ids.is_empty() {
+                details.push(format!("rule ids: {}", trigger_rule_ids.join(", ")));
+            }
+            let suffix = details.join("; ");
+            ctx.add_action(PlannedAction::new(
+                step,
+                ActionType::MarkEventHandled,
+                format!("Mark triggering event handled ({suffix})"),
+            ));
+            step += 1;
+        }
+
+        ctx.add_action(PlannedAction::new(
+            step,
+            ActionType::ReleaseLock,
+            "Release workflow lock".to_string(),
+        ));
+    } else {
+        ctx.add_warning("No workflow steps available; check workflow name.");
+    }
 
     ctx.take_report()
 }
@@ -3200,13 +3314,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "workflow run",
                                             true,
                                         );
+                                        let pane_info = wa_core::wezterm::WeztermClient::new()
+                                            .get_pane(pane_id)
+                                            .await
+                                            .ok();
                                         let report = build_workflow_dry_run_report(
                                             &command_ctx,
                                             &name,
                                             pane_id,
+                                            pane_info.as_ref(),
                                         );
-                                        let response =
-                                            RobotResponse::success(report, elapsed_ms(start));
+                                        let response = RobotResponse::success(
+                                            report.redacted(),
+                                            elapsed_ms(start),
+                                        );
                                         print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
@@ -4189,7 +4310,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
                     if command_ctx.is_dry_run() {
-                        let report = build_workflow_dry_run_report(&command_ctx, &name, pane);
+                        let wezterm = wa_core::wezterm::WeztermClient::new();
+                        let pane_info = wezterm.get_pane(pane).await.ok();
+                        let report = build_workflow_dry_run_report(
+                            &command_ctx,
+                            &name,
+                            pane,
+                            pane_info.as_ref(),
+                        );
                         println!("{}", wa_core::dry_run::format_human(&report));
                     } else {
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);

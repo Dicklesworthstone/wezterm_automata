@@ -23,7 +23,6 @@ wa-core.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toon_rust.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
