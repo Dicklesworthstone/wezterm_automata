@@ -2091,10 +2091,16 @@ async fn run_watcher(
 ) -> anyhow::Result<()> {
     use std::time::Duration;
     use wa_core::config::{Config, ConfigOverrides, HotReloadableConfig};
+    use wa_core::events::EventBus;
     use wa_core::lock::WatcherLock;
     use wa_core::patterns::PatternEngine;
+    use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
     use wa_core::runtime::{ObservationRuntime, RuntimeConfig};
     use wa_core::storage::StorageHandle;
+    use wa_core::workflows::{
+        HandleCompaction, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
+        WorkflowRunnerConfig,
+    };
 
     // Print resolved paths for diagnostic visibility
     tracing::info!(
@@ -2160,6 +2166,61 @@ async fn run_watcher(
         PatternEngine::new()
     };
 
+    // Create event bus for publishing detections to workflow runners
+    let event_bus = Arc::new(EventBus::new(1000));
+
+    // Set up workflow runner if auto_handle is enabled
+    let _workflow_runner_handle = if auto_handle {
+        // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
+        let workflow_storage_config = wa_core::storage::StorageConfig {
+            write_queue_size: config.storage.writer_queue_size as usize,
+        };
+        let storage_for_workflows =
+            Arc::new(StorageHandle::with_config(&db_path, workflow_storage_config).await?);
+
+        // Create policy engine (permissive defaults for auto-handling)
+        let policy_engine = PolicyEngine::permissive();
+        let wezterm_client = wa_core::wezterm::WeztermClient::new();
+        let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::new(
+            policy_engine,
+            wezterm_client,
+        )));
+
+        // Create workflow engine and lock manager
+        let workflow_engine = WorkflowEngine::new(config.workflows.max_concurrent as usize);
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+
+        // Create workflow runner
+        let runner_config = WorkflowRunnerConfig {
+            max_concurrent: config.workflows.max_concurrent as usize,
+            step_timeout_ms: config.workflows.default_step_timeout_ms,
+            ..Default::default()
+        };
+        let workflow_runner = WorkflowRunner::new(
+            workflow_engine,
+            lock_manager,
+            storage_for_workflows,
+            injector,
+            runner_config,
+        );
+
+        // Register built-in workflows
+        workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
+        tracing::info!("Registered workflow: handle_compaction");
+
+        // Spawn workflow runner event loop
+        let event_bus_clone = Arc::clone(&event_bus);
+        let runner_handle = tokio::spawn(async move {
+            tracing::info!("Workflow runner started, listening for detection events");
+            workflow_runner.run(&event_bus_clone).await;
+            tracing::info!("Workflow runner stopped");
+        });
+
+        Some(runner_handle)
+    } else {
+        None
+    };
+
     // Configure the runtime
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(poll_interval),
@@ -2171,8 +2232,9 @@ async fn run_watcher(
         max_concurrent_captures: 10,
     };
 
-    // Create and start the observation runtime
-    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine);
+    // Create and start the observation runtime (with event bus for workflow integration)
+    let mut runtime =
+        ObservationRuntime::new(runtime_config, storage, pattern_engine).with_event_bus(event_bus);
     let handle = runtime.start().await?;
     tracing::info!("Observation runtime started");
 

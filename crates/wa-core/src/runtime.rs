@@ -447,6 +447,7 @@ impl ObservationRuntime {
                 tailer_config,
                 capture_tx,
                 cursors,
+                Arc::clone(&registry), // Pass registry for authoritative state
                 Arc::clone(&shutdown_flag),
                 source,
             );
@@ -501,7 +502,7 @@ impl ObservationRuntime {
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
-        let _event_bus = self.event_bus.clone();
+        let event_bus = self.event_bus.clone();
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
@@ -564,8 +565,25 @@ impl ObservationRuntime {
                                 );
 
                                 match storage_guard.record_event(stored_event).await {
-                                    Ok(_) => {
+                                    Ok(event_id) => {
                                         metrics.events_recorded.fetch_add(1, Ordering::SeqCst);
+
+                                        // Publish to event bus for workflow runners (if configured)
+                                        if let Some(ref bus) = event_bus {
+                                            let event = crate::events::Event::PatternDetected {
+                                                pane_id,
+                                                detection: detection.clone(),
+                                                event_id: Some(event_id),
+                                            };
+                                            let delivered = bus.publish(event);
+                                            if delivered == 0 {
+                                                debug!(
+                                                    pane_id = pane_id,
+                                                    rule_id = %detection.rule_id,
+                                                    "No subscribers for detection event bus"
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         error!(
