@@ -185,7 +185,7 @@ wa robot events --unhandled
 ## Toolchain: Rust & Cargo
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+- **Unsafe code:** Forbidden (via `[workspace.lints.rust]` in Cargo.toml)
 - **Workspace:** Multi-crate (wa, wa-core, fuzz)
 
 ### Key Dependencies
@@ -347,7 +347,7 @@ block_alt_screen = true
 ```
 wezterm_automata/
 ├── crates/
-│   ├── wa/           # CLI binary (main.rs ~5000 lines)
+│   ├── wa/           # CLI binary (main.rs ~6000 lines)
 │   └── wa-core/      # Core library
 │       └── src/
 │           ├── config.rs      # Configuration parsing
