@@ -84,7 +84,7 @@ rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 # Pattern matching
 aho-corasick = "1.1.4"
 memchr = "2.7.6"
-fancy-regex = "0.14"
+fancy-regex = "0.17"
 regex = "1.12.2"
 
 # Crypto / randomness
@@ -92,7 +92,7 @@ rand = "0.9.2"
 sha2 = "0.10.9"
 
 # Config
-toml = "0.8.23"
+toml = "0.9.11"
 toml_edit = "0.24.0"
 
 # Serialization
@@ -106,7 +106,7 @@ ratatui = "0.30.0"
 crossterm = "0.29.0"
 
 # Benchmarking
-criterion = { version = "0.7.0", features = ["async_tokio"] }
+criterion = { version = "0.8.1", features = ["async_tokio"] }
 
 # Internal crates
 wa-core = { path = "crates/wa-core" }
