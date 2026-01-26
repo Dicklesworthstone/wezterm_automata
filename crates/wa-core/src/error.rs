@@ -290,6 +290,9 @@ pub enum StorageError {
 
     #[error("Database corruption detected: {details}")]
     Corruption { details: String },
+
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl StorageError {
@@ -319,6 +322,9 @@ impl StorageError {
             )
             .command("Run diagnostics", "wa doctor")
             .alternative("Delete the database file and restart with fresh data."),
+            Self::NotFound(_) => Remediation::new("The requested resource was not found.")
+                .command("List resources", "wa status")
+                .alternative("Verify the resource exists before accessing it."),
         }
     }
 }

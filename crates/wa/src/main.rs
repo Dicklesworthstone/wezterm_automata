@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wa_core::logging::{LogConfig, LogError, init_logging};
+use wa_core::storage::{MigrationPlan, MigrationStatusReport};
 
 /// WezTerm Automata - Terminal hypervisor for AI agents
 #[derive(Parser)]
@@ -5135,8 +5136,8 @@ async fn handle_db_command(
     layout: &wa_core::config::WorkspaceLayout,
 ) -> anyhow::Result<()> {
     use wa_core::storage::{
-        MigrationDirection, MigrationPlan, MigrationStatusReport, SCHEMA_VERSION,
-        migrate_database_to_version, migration_plan_for_path, migration_status_for_path,
+        MigrationDirection, SCHEMA_VERSION, migrate_database_to_version,
+        migration_plan_for_path, migration_status_for_path,
     };
 
     let db_path = &layout.db_path;

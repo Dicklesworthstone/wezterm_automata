@@ -65,7 +65,7 @@ pub fn generate_pane_uuid(domain: &str, pane_id: u64, created_at: i64) -> String
     hasher.update(created_at.to_le_bytes());
 
     // Add random entropy to ensure uniqueness even if same pane_id reappears
-    let entropy: [u8; 8] = rand::thread_rng().r#gen();
+    let entropy: [u8; 8] = rand::rng().random();
     hasher.update(entropy);
 
     let hash = hasher.finalize();

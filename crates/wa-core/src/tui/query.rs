@@ -163,17 +163,23 @@ impl ProductionQueryClient {
 
 impl QueryClient for ProductionQueryClient {
     fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
-        // Use tokio runtime to run async code
-        let rt = tokio::runtime::Handle::try_current()
+        // Get a handle to the current tokio runtime
+        let handle = tokio::runtime::Handle::try_current()
             .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
 
         let wezterm = &self.wezterm;
-        rt.block_on(async {
-            wezterm
-                .list_panes()
-                .await
-                .map(|panes| panes.iter().map(PaneView::from).collect())
-                .map_err(|e| QueryError::WeztermError(e.to_string()))
+
+        // Use block_in_place to safely bridge sync/async from within a runtime.
+        // This moves the current thread out of the async context temporarily,
+        // allowing block_on to work without causing "nested runtime" panics.
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                wezterm
+                    .list_panes()
+                    .await
+                    .map(|panes| panes.iter().map(PaneView::from).collect())
+                    .map_err(|e| QueryError::WeztermError(e.to_string()))
+            })
         })
     }
 

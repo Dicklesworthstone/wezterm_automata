@@ -1,7 +1,7 @@
 //! Allow-once approval tokens for RequireApproval policy decisions.
 
 use rand::Rng;
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -235,11 +235,10 @@ fn summary_for_input(input: &PolicyInput) -> String {
 }
 
 fn generate_allow_once_code(len: usize) -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(len)
-        .map(char::from)
-        .map(|c| c.to_ascii_uppercase())
+        .map(|b: u8| char::from(b).to_ascii_uppercase())
         .collect()
 }
 

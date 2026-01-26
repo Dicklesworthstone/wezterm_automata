@@ -47,6 +47,7 @@ impl ErrorRenderer {
                 StorageError::MigrationFailed(_) => "WA-2002",
                 StorageError::FtsQueryError(_) => "WA-2020",
                 StorageError::Corruption { .. } => "WA-2030",
+                StorageError::NotFound(_) => "WA-2040",
             },
             Error::Pattern(e) => match e {
                 PatternError::InvalidRule(_) => "WA-3001",
