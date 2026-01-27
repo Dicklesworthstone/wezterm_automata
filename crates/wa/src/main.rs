@@ -501,6 +501,10 @@ enum WorkflowCommands {
     Status {
         /// Execution ID
         execution_id: String,
+
+        /// Include action plan and step logs
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -1203,6 +1207,8 @@ struct RobotWorkflowStatusData {
     completed_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     step_logs: Option<Vec<RobotWorkflowStepLog>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_plan: Option<RobotWorkflowActionPlan>,
 }
 
 /// Robot workflow step log entry (matches wa-robot-workflow-status.json schema)
@@ -1212,12 +1218,33 @@ struct RobotWorkflowStepLog {
     step_name: String,
     result_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result_data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_summary: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_refs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
     started_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<i64>,
+}
+
+/// Robot workflow action plan entry
+#[derive(Debug, serde::Serialize)]
+struct RobotWorkflowActionPlan {
+    plan_id: String,
+    plan_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
 }
 
 /// Robot workflow status list response (for --pane or --active)
@@ -3697,12 +3724,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                     step_index: log.step_index,
                                                                     step_name: log.step_name,
                                                                     result_type: log.result_type,
+                                                                    step_id: log.step_id,
+                                                                    step_kind: log.step_kind,
                                                                     result_data: log
                                                                         .result_data
                                                                         .and_then(|s| {
                                                                             serde_json::from_str(&s)
                                                                                 .ok()
                                                                         }),
+                                                                    policy_summary: log
+                                                                        .policy_summary
+                                                                        .and_then(|s| {
+                                                                            serde_json::from_str(&s)
+                                                                                .ok()
+                                                                        }),
+                                                                    verification_refs: log
+                                                                        .verification_refs
+                                                                        .and_then(|s| {
+                                                                            serde_json::from_str(&s)
+                                                                                .ok()
+                                                                        }),
+                                                                    error_code: log.error_code,
                                                                     started_at: log.started_at,
                                                                     completed_at: Some(
                                                                         log.completed_at,
@@ -3714,6 +3756,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 .collect(),
                                                         ),
                                                         Err(_) => None,
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                let action_plan = if verbose {
+                                                    match storage.get_action_plan(exec_id).await {
+                                                        Ok(Some(record)) => {
+                                                            Some(RobotWorkflowActionPlan {
+                                                                plan_id: record.plan_id,
+                                                                plan_hash: record.plan_hash,
+                                                                plan: serde_json::from_str(
+                                                                    &record.plan_json,
+                                                                )
+                                                                .ok(),
+                                                                created_at: Some(record.created_at),
+                                                            })
+                                                        }
+                                                        _ => None,
                                                     }
                                                 } else {
                                                     None
@@ -3754,6 +3814,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         .completed_at
                                                         .map(|c| c as u64),
                                                     step_logs,
+                                                    action_plan,
                                                 };
 
                                                 let response =
@@ -3858,6 +3919,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                     .completed_at
                                                                     .map(|c| c as u64),
                                                                 step_logs: None, // Not included in list mode
+                                                                action_plan: None,
                                                             }
                                                         })
                                                         .collect();
@@ -4365,10 +4427,119 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         println!("Workflow run not yet implemented");
                     }
                 }
-                WorkflowCommands::Status { execution_id } => {
+                WorkflowCommands::Status {
+                    execution_id,
+                    verbose,
+                } => {
                     tracing::info!("Getting status for execution {}", execution_id);
-                    // TODO: Implement workflow status
-                    println!("Workflow status not yet implemented");
+
+                    let layout = match config.workspace_layout(Some(&workspace_root)) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Failed to get workspace layout: {e}");
+                            return Ok(());
+                        }
+                    };
+
+                    let db_path = layout.db_path.to_string_lossy();
+                    let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to open storage: {e}");
+                            return Ok(());
+                        }
+                    };
+
+                    match storage.get_workflow(&execution_id).await {
+                        Ok(Some(record)) => {
+                            println!("Workflow: {} ({})", record.workflow_name, record.id);
+                            println!("Status: {}", record.status);
+                            println!("Pane: {}", record.pane_id);
+                            if let Some(event_id) = record.trigger_event_id {
+                                println!("Trigger event: {event_id}");
+                            }
+                            println!("Current step: {}", record.current_step);
+                            println!("Started at: {}", record.started_at);
+                            println!("Updated at: {}", record.updated_at);
+                            if let Some(completed_at) = record.completed_at {
+                                println!("Completed at: {completed_at}");
+                            }
+                            if let Some(error) = record.error.as_ref() {
+                                println!("Error: {error}");
+                            }
+
+                            if verbose {
+                                match storage.get_action_plan(&execution_id).await {
+                                    Ok(Some(plan)) => {
+                                        println!("\nAction plan:");
+                                        println!("  plan_id: {}", plan.plan_id);
+                                        println!("  plan_hash: {}", plan.plan_hash);
+                                        println!("  created_at: {}", plan.created_at);
+                                        match serde_json::from_str::<serde_json::Value>(
+                                            &plan.plan_json,
+                                        ) {
+                                            Ok(value) => {
+                                                if let Ok(pretty) =
+                                                    serde_json::to_string_pretty(&value)
+                                                {
+                                                    println!("{pretty}");
+                                                } else {
+                                                    println!("{}", plan.plan_json);
+                                                }
+                                            }
+                                            Err(_) => {
+                                                println!("{}", plan.plan_json);
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        println!("\nAction plan: <none>");
+                                    }
+                                    Err(e) => {
+                                        println!("\nAction plan: <error: {e}>");
+                                    }
+                                }
+
+                                match storage.get_step_logs(&execution_id).await {
+                                    Ok(logs) => {
+                                        if logs.is_empty() {
+                                            println!("\nStep logs: <none>");
+                                        } else {
+                                            println!("\nStep logs:");
+                                            for log in logs {
+                                                println!(
+                                                    "  [{}] {} ({})",
+                                                    log.step_index, log.step_name, log.result_type
+                                                );
+                                                if let Some(step_id) = log.step_id.as_ref() {
+                                                    println!("    step_id: {step_id}");
+                                                }
+                                                if let Some(step_kind) = log.step_kind.as_ref() {
+                                                    println!("    step_kind: {step_kind}");
+                                                }
+                                                if let Some(code) = log.error_code.as_ref() {
+                                                    println!("    error_code: {code}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("\nStep logs: <error: {e}>");
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            eprintln!("No workflow execution found with ID: {}", execution_id);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to query workflow: {e}");
+                        }
+                    }
+
+                    if let Err(e) = storage.shutdown().await {
+                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                    }
                 }
             }
         }
