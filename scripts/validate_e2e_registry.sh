@@ -26,11 +26,18 @@ checklist = checklist_path.read_text(encoding="utf-8")
 registry = registry_path.read_text(encoding="utf-8")
 
 # Extract scenario names referenced in checklist lines.
+# Expected format: "Scenario(s): name[, name2] (notes...)"
 scenario_refs = set()
 for match in re.finditer(r"Scenario\(s\):([^\n]+)", checklist):
     tail = match.group(1)
-    # Collect tokens that look like scenario names.
-    for name in re.findall(r"[a-z][a-z0-9_\-]+", tail):
+    # Drop parenthetical notes.
+    tail = re.sub(r"\([^)]*\)", "", tail)
+    for part in tail.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        # Only take the first token (scenario name).
+        name = name.split()[0].strip().lower()
         if name == "none":
             continue
         scenario_refs.add(name)
