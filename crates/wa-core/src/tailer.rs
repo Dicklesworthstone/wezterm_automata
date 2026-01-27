@@ -624,16 +624,29 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_backpressure_records_timeout() {
-        let source = Arc::new(FixedSource);
+        // Use a slow source that holds the permit long enough for the second
+        // tailer to timeout waiting for channel capacity.
+        let active = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        // Source delay must be longer than send_timeout so second tailer times out
+        let source = Arc::new(CountingSource::new(
+            active.clone(),
+            max.clone(),
+            Duration::from_millis(50), // Longer than send_timeout
+        ));
+
         let config = TailerConfig {
             min_interval: Duration::from_millis(1),
             max_interval: Duration::from_millis(50),
             max_concurrent: 2,
-            send_timeout: Duration::from_millis(10),
+            send_timeout: Duration::from_millis(10), // Short timeout
             ..Default::default()
         };
 
-        let (tx, _rx) = mpsc::channel(1);
+        // Channel capacity of 1 + keep receiver alive (but don't consume)
+        // so second send times out instead of getting ChannelClosed
+        let (tx, rx) = mpsc::channel(1);
+        let _keep_rx_alive = rx; // Prevent receiver from being dropped
         let cursors = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
