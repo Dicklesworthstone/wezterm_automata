@@ -28,9 +28,10 @@ memchr.workspace = true
 fancy-regex.workspace = true
 regex.workspace = true
 
-# Approval tokens
+# Approval tokens and plan hashing
 rand.workspace = true
 sha2.workspace = true
+hex = "0.4"
 
 # Database
 rusqlite.workspace = true

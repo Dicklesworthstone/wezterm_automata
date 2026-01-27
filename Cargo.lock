@@ -3639,6 +3639,7 @@ dependencies = [
  "crossterm",
  "fancy-regex 0.14.0",
  "fs2",
+ "hex",
  "memchr",
  "proptest",
  "rand 0.9.2",
