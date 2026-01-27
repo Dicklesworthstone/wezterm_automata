@@ -1873,7 +1873,7 @@ enum WriteCommand {
     RecordGap {
         pane_id: u64,
         reason: String,
-        respond: oneshot::Sender<Result<Gap>>,
+        respond: oneshot::Sender<Result<Option<Gap>>>,
     },
     /// Record an event/detection
     RecordEvent {
@@ -2172,7 +2172,8 @@ impl StorageHandle {
     /// Record a gap event
     ///
     /// Indicates a discontinuity in capture for the given pane.
-    pub async fn record_gap(&self, pane_id: u64, reason: &str) -> Result<Gap> {
+    /// Returns `None` if the gap was skipped (e.g. at start of stream).
+    pub async fn record_gap(&self, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::RecordGap {
@@ -2760,6 +2761,21 @@ impl StorageHandle {
             })?;
 
             query_approval_token_by_hash(&conn, &code_hash)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get the maximum sequence number for a pane (to resume capture).
+    pub async fn get_max_seq(&self, pane_id: u64) -> Result<Option<u64>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_max_seq(&conn, pane_id)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -3394,7 +3410,7 @@ fn append_segment_sync(
 }
 
 /// Record a gap event (synchronous)
-fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Gap> {
+fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
     // Get the last sequence for this pane
@@ -3412,7 +3428,11 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Gap>
         .map_err(|e| StorageError::Database(format!("Failed to get last seq: {e}")))?
         .flatten();
 
-    let seq_before = last_seq.unwrap_or(0);
+    let Some(seq_before) = last_seq else {
+        // No segments yet, so no gap to record (start of stream)
+        return Ok(None);
+    };
+
     let seq_after = seq_before + 1;
     let now = now_ms();
 
@@ -3428,14 +3448,14 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Gap>
 
     let id = conn.last_insert_rowid();
 
-    Ok(Gap {
+    Ok(Some(Gap {
         id,
         pane_id,
         seq_before,
         seq_after,
         reason: reason.to_string(),
         detected_at: now,
-    })
+    }))
 }
 
 /// Record an event (synchronous)
@@ -4962,6 +4982,24 @@ fn query_approval_token_by_hash(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(StorageError::Database(format!("Approval token lookup failed: {e}")).into()),
     }
+}
+
+/// Query maximum sequence number for a pane
+fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+
+    conn.query_row(
+        "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
+        [pane_id_i64],
+        |row| {
+            let val: Option<i64> = row.get(0)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(val.map(|v| v as u64))
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+    .map(|opt| opt.flatten())
 }
 
 /// Query all panes
@@ -6580,7 +6618,9 @@ mod tests {
         }
 
         // Record a gap (simulating a discontinuity detected)
-        let gap = record_gap_sync(&conn, 1, "sequence_jump").unwrap();
+        let gap = record_gap_sync(&conn, 1, "sequence_jump")
+            .unwrap()
+            .expect("should return gap");
 
         // Verify gap was recorded
         assert_eq!(gap.pane_id, 1);
@@ -7244,13 +7284,13 @@ fn workflow_step_log_result_data_is_optional() {
         None,
         0,
         "simple_step",
-        None,
-        None,
+        None, // step_id
+        None, // step_kind
         "continue",
-        None, // No result data
-        None,
-        None,
-        None,
+        None, // result_data
+        None, // policy_summary
+        None, // verification_refs
+        None, // error_code
         now_ms,
         now_ms + 50,
     )
@@ -7422,13 +7462,8 @@ async fn storage_handle_insert_step_log_and_query() {
             None,
             0,
             "async_step",
-            None,
-            None,
             "continue",
             Some(r#"{"async": true}"#.to_string()),
-            None,
-            None,
-            None,
             1_700_000_000_000,
             1_700_000_000_050,
         )
@@ -7866,13 +7901,8 @@ mod storage_handle_tests {
                 None,
                 0,
                 "init",
-                None,
-                None,
                 "success",
                 Some(r#"{"message":"started"}"#.to_string()),
-                None,
-                None,
-                None,
                 now,
                 now + 100,
             )
@@ -7885,13 +7915,8 @@ mod storage_handle_tests {
                 None,
                 1,
                 "send_text",
-                None,
-                None,
                 "success",
                 Some(r#"{"chars":42}"#.to_string()),
-                None,
-                None,
-                None,
                 now + 100,
                 now + 200,
             )
@@ -7904,13 +7929,8 @@ mod storage_handle_tests {
                 None,
                 2,
                 "wait_for",
-                None,
-                None,
                 "success",
                 Some(r#"{"matched":true}"#.to_string()),
-                None,
-                None,
-                None,
                 now + 200,
                 now + 500,
             )

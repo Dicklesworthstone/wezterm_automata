@@ -25,8 +25,8 @@ use crate::ingest::PaneRegistry;
 /// Default IPC socket filename relative to workspace .wa directory.
 pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 
-/// Maximum message size in bytes (64KB).
-pub const MAX_MESSAGE_SIZE: usize = 65536;
+/// Maximum message size in bytes (128KB).
+pub const MAX_MESSAGE_SIZE: usize = 131072;
 
 /// Maximum title length in status updates (1KB).
 pub const MAX_TITLE_LENGTH: usize = 1024;

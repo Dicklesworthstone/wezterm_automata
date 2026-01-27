@@ -2224,8 +2224,8 @@ fn is_structured_uservar_name(name: &str) -> bool {
 }
 
 fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
-    // Maximum message size for IPC (64KB) - mirrors wa_core::ipc::MAX_MESSAGE_SIZE
-    const MAX_MESSAGE_SIZE: usize = 65536;
+    // Maximum message size for IPC (128KB) - mirrors wa_core::ipc::MAX_MESSAGE_SIZE
+    const MAX_MESSAGE_SIZE: usize = 131072;
 
     if name.trim().is_empty() {
         return Err("user-var name cannot be empty".to_string());

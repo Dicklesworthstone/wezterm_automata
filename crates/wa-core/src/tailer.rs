@@ -387,7 +387,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum PollOutcome {
+pub enum PollOutcome {
     Changed,
     NoChange,
     Backpressure,
@@ -663,6 +663,9 @@ mod tests {
         panes.insert(1, make_pane(1));
         panes.insert(2, make_pane(2));
         supervisor.sync_tailers(&panes);
+
+        // Wait for tailers to become ready to poll (min_interval must elapse)
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let mut join_set = JoinSet::new();
         supervisor.spawn_ready(&mut join_set);

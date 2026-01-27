@@ -439,9 +439,16 @@ impl ObservationRuntime {
 
                                 // Create cursor if observed
                                 if entry.should_observe() {
+                                    // Initialize cursor from storage to resume capture
+                                    let storage_guard = storage.lock().await;
+                                    let max_seq = storage_guard.get_max_seq(*pane_id).await.unwrap_or(None);
+                                    drop(storage_guard);
+
+                                    let next_seq = max_seq.map_or(0, |s| s + 1);
+
                                     {
                                         let mut cursors = cursors.write().await;
-                                        cursors.insert(*pane_id, PaneCursor::new(*pane_id));
+                                        cursors.insert(*pane_id, PaneCursor::from_seq(*pane_id, next_seq));
                                     }
 
                                     {
@@ -451,7 +458,7 @@ impl ObservationRuntime {
                                         contexts.insert(*pane_id, ctx);
                                     }
 
-                                    debug!(pane_id = pane_id, "Started observing pane");
+                                    debug!(pane_id = pane_id, next_seq = next_seq, "Started observing pane");
                                 } else if let Some(reason) = entry.observation.ignore_reason() {
                                     info!(
                                         pane_id = pane_id,
@@ -479,18 +486,8 @@ impl ObservationRuntime {
 
                         // Handle new generations (pane restarted)
                         for pane_id in &diff.new_generations {
-                            {
-                                let mut cursors = cursors.write().await;
-                                cursors.insert(*pane_id, PaneCursor::new(*pane_id));
-                            }
-
-                            {
-                                let mut contexts = detection_contexts.write().await;
-                                let mut ctx = DetectionContext::new();
-                                ctx.pane_id = Some(*pane_id);
-                                contexts.insert(*pane_id, ctx);
-                            }
-
+                            // Do NOT reset cursor seq to 0, it causes DB constraint violations.
+                            // We keep capturing monotonically on the same pane_id.
                             debug!(
                                 pane_id = pane_id,
                                 "Restarted observing pane (new generation)"

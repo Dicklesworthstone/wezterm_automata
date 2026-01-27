@@ -412,6 +412,19 @@ impl PaneCursor {
         }
     }
 
+    /// Create a new cursor starting from a specific sequence number.
+    #[must_use]
+    pub fn from_seq(pane_id: u64, next_seq: u64) -> Self {
+        Self {
+            pane_id,
+            next_seq,
+            last_snapshot: String::new(),
+            last_hash: None,
+            in_gap: false,
+            in_alt_screen: false,
+        }
+    }
+
     /// Get the last assigned sequence number.
     ///
     /// Returns -1 if no segments have been captured yet, otherwise
@@ -636,8 +649,11 @@ impl PaneRegistry {
                     entry.generation = entry.generation.saturating_add(1);
                     entry.decision_at = epoch_ms();
 
-                    // Reset cursor for new generation
-                    self.cursors.insert(pane_id, PaneCursor::new(pane_id));
+                    // Reset cursor for new generation - NOT SAFE due to unique constraint on (pane_id, seq)
+                    // If we reset cursor, next seq is 0, which likely exists.
+                    // Ideally we'd persist generation ID, but schema doesn't support it yet.
+                    // For now, we keep the sequence monotonic.
+                    // self.cursors.insert(pane_id, PaneCursor::new(pane_id));
                 } else if Self::has_metadata_changed(&entry.info, &pane) {
                     // Metadata changed but same generation
                     diff.changed_panes.push(pane_id);
@@ -960,7 +976,7 @@ pub async fn persist_captured_segment(
     // Record gap if the captured segment itself represents a discontinuity (overlap failure)
     let mut gap = match &captured.kind {
         CapturedSegmentKind::Gap { reason } => {
-            Some(storage.record_gap(captured.pane_id, reason).await?)
+            storage.record_gap(captured.pane_id, reason).await?
         }
         CapturedSegmentKind::Delta => None,
     };
@@ -982,7 +998,7 @@ pub async fn persist_captured_segment(
 
         // If we didn't already have a gap, use this one; otherwise the overlap gap takes precedence
         if gap.is_none() {
-            gap = Some(discontinuity_gap);
+            gap = discontinuity_gap;
         }
     }
 
