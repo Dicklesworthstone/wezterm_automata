@@ -285,6 +285,15 @@ pub enum StorageError {
     #[error("Migration failed: {0}")]
     MigrationFailed(String),
 
+    #[error("Database schema version ({current}) is newer than supported ({supported})")]
+    SchemaTooNew { current: i32, supported: i32 },
+
+    #[error("Database requires wa >= {min_compatible} (current {current})")]
+    WaTooOld {
+        current: String,
+        min_compatible: String,
+    },
+
     #[error("FTS query error: {0}")]
     FtsQueryError(String),
 
@@ -314,6 +323,22 @@ impl StorageError {
                     .command("Diagnostics", "wa doctor")
                     .alternative("Backup the database file before retrying.")
             }
+            Self::SchemaTooNew { current, supported } => Remediation::new(format!(
+                "Database schema version {current} is newer than supported ({supported}). Upgrade wa."
+            ))
+            .command(
+                "Upgrade wa",
+                "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+            )
+            .alternative("If you must stay on this version, restore an older database backup."),
+            Self::WaTooOld { min_compatible, .. } => Remediation::new(format!(
+                "This database requires wa {min_compatible} or newer."
+            ))
+            .command(
+                "Upgrade wa",
+                "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+            )
+            .alternative("Restore a database created by an older wa version."),
             Self::FtsQueryError(_) => Remediation::new("Invalid FTS query syntax.")
                 .command("Example search", "wa search \"term\"")
                 .alternative("Review FTS5 query syntax and try again."),
@@ -503,6 +528,14 @@ mod tests {
                 actual: 2,
             }),
             Error::Storage(StorageError::MigrationFailed("migrate".to_string())),
+            Error::Storage(StorageError::SchemaTooNew {
+                current: 9,
+                supported: 6,
+            }),
+            Error::Storage(StorageError::WaTooOld {
+                current: "0.1.0".to_string(),
+                min_compatible: "1.0.0".to_string(),
+            }),
             Error::Storage(StorageError::FtsQueryError("fts".to_string())),
             Error::Pattern(PatternError::InvalidRule("rule".to_string())),
             Error::Pattern(PatternError::InvalidRegex("regex".to_string())),

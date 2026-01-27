@@ -330,6 +330,46 @@ pub static WA_2002: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-2003: Database schema too new
+pub static WA_2003: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-2003",
+    category: ErrorCategory::Storage,
+    title: "Database schema too new",
+    description: "The database schema version is newer than this wa build supports.",
+    causes: &[
+        "Downgraded wa while keeping a newer database",
+        "Database was created by a newer wa version",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command(
+            "Upgrade wa",
+            "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+        ),
+        RecoveryStep::text("Restore a database backup created by an older wa version"),
+    ],
+    doc_link: None,
+};
+
+/// WA-2004: wa version too old for database
+pub static WA_2004: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-2004",
+    category: ErrorCategory::Storage,
+    title: "wa version too old",
+    description: "This database requires a newer wa version than the one currently running.",
+    causes: &[
+        "Downgraded wa while keeping a newer database",
+        "Database migrations raised the minimum compatible wa version",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command(
+            "Upgrade wa",
+            "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa",
+        ),
+        RecoveryStep::text("Restore an older database backup if upgrade is not possible"),
+    ],
+    doc_link: None,
+};
+
 /// WA-2010: Sequence discontinuity
 pub static WA_2010: ErrorCodeDef = ErrorCodeDef {
     code: "WA-2010",
@@ -782,6 +822,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         // Storage errors
         m.insert("WA-2001", &WA_2001);
         m.insert("WA-2002", &WA_2002);
+        m.insert("WA-2003", &WA_2003);
+        m.insert("WA-2004", &WA_2004);
         m.insert("WA-2010", &WA_2010);
         m.insert("WA-2020", &WA_2020);
         // Pattern errors

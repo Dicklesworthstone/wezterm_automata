@@ -45,6 +45,8 @@ impl ErrorRenderer {
                 StorageError::Database(_) => "WA-2001",
                 StorageError::SequenceDiscontinuity { .. } => "WA-2010",
                 StorageError::MigrationFailed(_) => "WA-2002",
+                StorageError::SchemaTooNew { .. } => "WA-2003",
+                StorageError::WaTooOld { .. } => "WA-2004",
                 StorageError::FtsQueryError(_) => "WA-2020",
                 StorageError::Corruption { .. } => "WA-2030",
                 StorageError::NotFound(_) => "WA-2040",
