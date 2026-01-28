@@ -26,11 +26,11 @@
 
 use std::collections::HashMap;
 
+use wa_core::error_codes::{ErrorCategory, get_error_code, list_error_codes};
 use wa_core::explanations::{
     format_explanation, get_explanation, list_template_ids, list_templates_by_category,
     render_explanation,
 };
-use wa_core::error_codes::{get_error_code, list_error_codes, ErrorCategory};
 
 // ============================================================================
 // wa why --list tests
@@ -91,7 +91,10 @@ fn wa_why_list_by_category_filters_correctly() {
 
     // Test workflow category
     let workflows = list_templates_by_category("workflow");
-    assert!(!workflows.is_empty(), "workflow category should not be empty");
+    assert!(
+        !workflows.is_empty(),
+        "workflow category should not be empty"
+    );
     for tmpl in &workflows {
         assert!(
             tmpl.id.starts_with("workflow."),
@@ -113,8 +116,8 @@ fn wa_why_list_by_category_filters_correctly() {
 
 #[test]
 fn wa_why_template_returns_structured_output() {
-    let template = get_explanation("deny.alt_screen")
-        .expect("deny.alt_screen template should exist");
+    let template =
+        get_explanation("deny.alt_screen").expect("deny.alt_screen template should exist");
 
     // Verify all required fields are populated
     assert!(!template.id.is_empty(), "Template ID should not be empty");
@@ -150,27 +153,42 @@ fn wa_why_template_returns_structured_output() {
 #[test]
 fn wa_why_template_includes_remediation() {
     // Test several templates to ensure they all have actionable remediation
-    let template_ids = ["deny.alt_screen", "deny.command_running", "workflow.usage_limit"];
+    let template_ids = [
+        "deny.alt_screen",
+        "deny.command_running",
+        "workflow.usage_limit",
+    ];
 
     for id in template_ids {
-        let template = get_explanation(id).unwrap_or_else(|| panic!("Template {} should exist", id));
+        let template =
+            get_explanation(id).unwrap_or_else(|| panic!("Template {} should exist", id));
 
         // Suggestions must be actionable (start with verbs)
         for suggestion in template.suggestions {
             let first_word = suggestion.split_whitespace().next().unwrap_or("");
             let actionable_verbs = [
-                "Exit", "Use", "Wait", "Check", "Run", "Configure", "Review",
-                "Let", "Consider", "Reduce", "Increase", "Verify", "Add",
-                "Update", "Enable",
+                "Exit",
+                "Use",
+                "Wait",
+                "Check",
+                "Run",
+                "Configure",
+                "Review",
+                "Let",
+                "Consider",
+                "Reduce",
+                "Increase",
+                "Verify",
+                "Add",
+                "Update",
+                "Enable",
             ];
 
             let is_actionable = actionable_verbs.iter().any(|v| first_word.starts_with(v));
             assert!(
                 is_actionable,
                 "Suggestion '{}' in template {} should start with actionable verb. Got: '{}'",
-                suggestion,
-                id,
-                first_word
+                suggestion, id, first_word
             );
         }
 
@@ -184,7 +202,11 @@ fn wa_why_template_includes_remediation() {
             );
         }
 
-        eprintln!("[ARTIFACT] Template {} has {} suggestions", id, template.suggestions.len());
+        eprintln!(
+            "[ARTIFACT] Template {} has {} suggestions",
+            id,
+            template.suggestions.len()
+        );
     }
 }
 
@@ -246,7 +268,10 @@ fn render_explanation_interpolates_context() {
     let rendered = render_explanation(template, &context);
 
     // Should not panic and should return non-empty content
-    assert!(!rendered.is_empty(), "Rendered explanation should not be empty");
+    assert!(
+        !rendered.is_empty(),
+        "Rendered explanation should not be empty"
+    );
 
     eprintln!("[ARTIFACT] Rendered with context: {}", rendered.len());
 }

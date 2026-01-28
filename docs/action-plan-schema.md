@@ -258,6 +258,13 @@ pub enum WaitCondition {
         idle_threshold_ms: u64,
     },
 
+    /// Wait for pane output tail to be stable
+    StableTail {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<u64>,
+        stable_for_ms: u64,
+    },
+
     /// Wait for external signal
     External {
         key: String,

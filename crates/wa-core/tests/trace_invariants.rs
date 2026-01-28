@@ -96,7 +96,10 @@ fn trace_evidence_serialization_stability() {
     // Required fields
     assert!(parsed.get("kind").is_some(), "Missing 'kind' field");
     // truncated is only serialized when true (skip_serializing_if = "std::ops::Not::not")
-    assert!(parsed.get("truncated").is_some(), "truncated should be present when true");
+    assert!(
+        parsed.get("truncated").is_some(),
+        "truncated should be present when true"
+    );
 
     // Values
     assert_eq!(parsed["kind"], "anchor");
@@ -143,7 +146,10 @@ fn trace_gate_serialization_stability() {
 
     // Required fields
     assert!(parsed_pass.get("gate").is_some(), "Missing 'gate' field");
-    assert!(parsed_pass.get("passed").is_some(), "Missing 'passed' field");
+    assert!(
+        parsed_pass.get("passed").is_some(),
+        "Missing 'passed' field"
+    );
 
     // Values
     assert_eq!(parsed_pass["gate"], "agent_type");
@@ -243,12 +249,7 @@ fn match_trace_serialization_stability() {
 
     // Required fields
     let required_fields = [
-        "pack_id",
-        "rule_id",
-        "eligible",
-        "gates",
-        "evidence",
-        "bounds",
+        "pack_id", "rule_id", "eligible", "gates", "evidence", "bounds",
     ];
     for field in required_fields {
         assert!(
@@ -291,7 +292,10 @@ fn match_trace_deterministic_field_ordering() {
 
     // Note: serde_json::Value uses BTreeMap internally, so field order is alphabetical
     eprintln!("[ARTIFACT] Original JSON length: {}", json1.len());
-    eprintln!("[ARTIFACT] Re-serialized JSON length: {}", re_serialized.len());
+    eprintln!(
+        "[ARTIFACT] Re-serialized JSON length: {}",
+        re_serialized.len()
+    );
 }
 
 /// Test deterministic ordering of gates list
@@ -313,7 +317,10 @@ fn gates_list_ordering_is_stable() {
     // Gates should maintain insertion order
     let gates = parsed1["gates"].as_array().expect("gates should be array");
     if gates.len() >= 2 {
-        assert_eq!(gates[0]["gate"], "agent_type", "First gate should be agent_type");
+        assert_eq!(
+            gates[0]["gate"], "agent_type",
+            "First gate should be agent_type"
+        );
         assert_eq!(gates[1]["gate"], "dedupe", "Second gate should be dedupe");
     }
 }
@@ -429,7 +436,10 @@ fn trace_evidence_truncated_flag_set() {
     let evidence = TraceEvidence {
         kind: "match".to_string(),
         label: None,
-        span: Some(TraceSpan { start: 0, end: 1000 }),
+        span: Some(TraceSpan {
+            start: 0,
+            end: 1000,
+        }),
         excerpt: Some("This excerpt was truncated to fit...".to_string()),
         truncated: true, // Flag must be set
     };
@@ -739,7 +749,10 @@ fn trace_bounds_empty_truncated_fields_deserialization_issue() {
     };
 
     let json = serde_json::to_string(&bounds).expect("serialize");
-    eprintln!("[ARTIFACT] TraceBounds JSON (empty truncated_fields): {}", json);
+    eprintln!(
+        "[ARTIFACT] TraceBounds JSON (empty truncated_fields): {}",
+        json
+    );
 
     // This will fail without #[serde(default)] on truncated_fields
     // We document this as expected behavior for now
@@ -762,7 +775,9 @@ fn match_trace_schema_structure() {
     assert!(value.is_object(), "MatchTrace should serialize to object");
     let obj = value.as_object().unwrap();
 
-    let required = ["pack_id", "rule_id", "eligible", "gates", "evidence", "bounds"];
+    let required = [
+        "pack_id", "rule_id", "eligible", "gates", "evidence", "bounds",
+    ];
     for field in required {
         assert!(obj.contains_key(field), "Missing required field: {}", field);
     }
@@ -789,7 +804,10 @@ fn trace_evidence_schema_structure() {
     // Required fields
     assert!(obj.contains_key("kind"), "Missing 'kind'");
     // truncated is conditionally serialized (only when true)
-    assert!(obj.contains_key("truncated"), "truncated should be present when true");
+    assert!(
+        obj.contains_key("truncated"),
+        "truncated should be present when true"
+    );
 
     // Optional fields should be present when set
     assert!(obj.contains_key("label"), "label should be present");
@@ -920,12 +938,24 @@ fn artifact_dump_redaction_patterns() {
     let redactor = Redactor::with_debug_markers();
 
     let test_cases = [
-        ("OpenAI key", "sk-proj-abc123def456ghi789jkl012mno345pqr678stu901vwx"),
-        ("Anthropic key", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456"),
+        (
+            "OpenAI key",
+            "sk-proj-abc123def456ghi789jkl012mno345pqr678stu901vwx",
+        ),
+        (
+            "Anthropic key",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456",
+        ),
         ("GitHub token", "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
         ("AWS Access Key", "AKIAIOSFODNN7EXAMPLE"),
-        ("Bearer token", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
-        ("Database URL", "postgres://user:secretpass@localhost:5432/db"),
+        (
+            "Bearer token",
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        ),
+        (
+            "Database URL",
+            "postgres://user:secretpass@localhost:5432/db",
+        ),
     ];
 
     for (name, secret) in test_cases {
