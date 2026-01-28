@@ -2920,13 +2920,13 @@ async fn run_watcher(
     tracing::info!(db_path = %db_path, "Storage initialized");
 
     // Create pattern engine
-    let pattern_engine = if no_patterns {
+    let pattern_engine = Arc::new(if no_patterns {
         tracing::info!("Pattern detection: disabled");
         PatternEngine::default()
     } else {
         tracing::info!("Pattern detection: enabled with builtin packs");
         PatternEngine::new()
-    };
+    });
 
     // Create event bus for publishing detections to workflow runners
     let event_bus = Arc::new(EventBus::new(1000));
