@@ -230,6 +230,15 @@ wa show <pane_id>           # Detailed pane info
 wa get-text <pane_id>       # Recent output from pane
 ```
 
+### Pane Actions
+
+```bash
+wa send <pane_id> "<text>"                 # Send input (policy-gated)
+wa send <pane_id> "<text>" --dry-run       # Preview without executing
+wa send <pane_id> "<text>" --wait-for "ok" # Verify via wait-for
+wa send <pane_id> "<text>" --no-paste --no-newline
+```
+
 ### Search
 
 ```bash
