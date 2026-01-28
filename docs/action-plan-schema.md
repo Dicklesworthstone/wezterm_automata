@@ -22,6 +22,67 @@ This document specifies the unified action plan schema for `wa` workflows. The g
 4. **Safety**: Explicit preconditions prevent partial execution
 5. **Idempotency**: Content-addressed steps enable safe retry
 
+## Mental Model (ActionPlan vs StepPlan)
+
+**ActionPlan** is the immutable, deterministic description of intended work. It is created *before* any side effects, persisted, and used for previews, approvals, and audit.
+
+**StepPlan** is the smallest unit of execution. Each step:
+
+- declares its **action** (what we will do),
+- declares **preconditions** (what must be true before the action),
+- declares **verification** (how we know it worked),
+- declares **failure handling** (what to do if verification fails),
+- carries an **idempotency key** (so retries do not double-apply).
+
+Plan-level preconditions apply to the entire plan. Step-level preconditions apply only to that step. Step-level `on_failure` overrides plan-level `on_failure`. Steps are **ordered and numbered**; plan execution is always sequential unless an explicit step expresses parallelism (not part of v1).
+
+## Execution Lifecycle
+
+1. **Build**: workflow or command constructs an ActionPlan (often via `ActionPlan::builder`).
+2. **Validate**: plan validation ensures step numbering and references are consistent.
+3. **Hash**: canonical hash is computed and stored in `plan_id` for approvals/idempotency.
+4. **Persist**: the plan is recorded before any side effects.
+5. **Execute**: each StepPlan is applied in order with precondition checks.
+6. **Verify**: verification strategy runs; outcomes are logged to step logs.
+7. **Finalize**: success or failure is recorded; plan/step logs remain durable.
+
+This lifecycle is what enables dry-run previews to be truthful and enables restart/resume without double-applying actions.
+
+## Plan Hashing and Approvals
+
+The plan hash is derived from a **canonical string** and excludes volatile data (e.g., `created_at`, `metadata`). Canonicalization currently includes:
+
+- `plan_version`, `workspace_id`, `title`
+- ordered step canonical strings
+- sorted global preconditions
+- optional plan-level `on_failure`
+
+Each StepPlan has its own canonical string that includes the action, preconditions, verification, and on-failure. Step idempotency keys are derived from a stable canonical representation of the action plus the step number. When adding fields or variants, ensure:
+
+- canonical strings are updated
+- tests for canonical stability are extended
+- hashes remain stable for semantically identical plans
+
+Approvals should bind to the plan hash (or the derived `plan_id`) so the approved plan cannot be swapped without invalidating the approval.
+
+## Extension Guidance (Adding New Step Kinds Safely)
+
+When introducing a new StepAction, Precondition, or Verification strategy:
+
+1. **Define the enum variant** in `crates/wa-core/src/plan.rs` with stable serde tags.
+2. **Implement canonical_string** for determinism. Avoid volatile fields (timestamps, random IDs).
+3. **Add tests** that assert canonical stability and serialization round-trips.
+4. **Wire policy/audit**:
+   - Ensure actions that mutate panes are policy-gated.
+   - Ensure any text payload is redacted in logs/audits (never store raw secrets).
+5. **Update renderers**:
+   - Human output (`wa` CLI) should show a clear summary line.
+   - Robot/MCP output should include structured fields without secrets.
+6. **Update JSON schemas** if ActionPlan shapes appear in robot/web outputs (e.g., `docs/json-schema/wa-robot-workflow-status.json`).
+7. **Document behavior** here so future contributors understand when to use the new step.
+
+If a step needs *conditional branching*, prefer representing it as multiple explicit steps plus a verification/abort strategy. Avoid implicit branching inside actions; it breaks determinism and preview accuracy.
+
 ## Rust Type Definitions
 
 ### Core Plan Structure
