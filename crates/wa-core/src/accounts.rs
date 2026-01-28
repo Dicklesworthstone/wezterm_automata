@@ -70,9 +70,9 @@ impl AccountRecord {
             name: usage.name.clone(),
             percent_remaining: usage.percent_remaining.unwrap_or(0.0),
             reset_at: usage.reset_at.clone(),
-            tokens_used: usage.tokens_used.map(|v| v as i64),
-            tokens_remaining: usage.tokens_remaining.map(|v| v as i64),
-            tokens_limit: usage.tokens_limit.map(|v| v as i64),
+            tokens_used: usage.tokens_used.and_then(|v| i64::try_from(v).ok()),
+            tokens_remaining: usage.tokens_remaining.and_then(|v| i64::try_from(v).ok()),
+            tokens_limit: usage.tokens_limit.and_then(|v| i64::try_from(v).ok()),
             last_refreshed_at: now_ms,
             last_used_at: None,
             created_at: now_ms,
@@ -293,8 +293,7 @@ pub fn select_account(
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -471,7 +470,7 @@ mod tests {
             tokens_used: Some(1000),
             tokens_remaining: Some(3000),
             tokens_limit: Some(4000),
-            extra: Default::default(),
+            extra: std::collections::HashMap::default(),
         };
 
         let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1_234_567_890);

@@ -32,10 +32,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use rusqlite::{
-    Connection, OptionalExtension, params,
-    types::Value as SqlValue,
-};
+use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -1064,8 +1061,7 @@ fn record_migration(conn: &Connection, version: i32, description: &str) -> Resul
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis() as i64);
 
     conn.execute(
         "INSERT INTO schema_version (version, applied_at, description) VALUES (?1, ?2, ?3)",
@@ -1526,10 +1522,7 @@ struct WaVersion {
 
 impl WaVersion {
     fn parse(input: &str) -> Option<Self> {
-        let core = input
-            .split(|c| c == '-' || c == '+')
-            .next()
-            .unwrap_or_default();
+        let core = input.split(['-', '+']).next().unwrap_or_default();
         let mut parts = core.split('.');
         let major: u64 = parts.next()?.parse().ok()?;
         let minor: u64 = parts.next().unwrap_or("0").parse().ok()?;
@@ -1638,7 +1631,7 @@ fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
     }
 
     let now_ms = now_epoch_ms();
-    let current_wa = crate::VERSION.to_string();
+    let mut current_wa = crate::VERSION.to_string();
 
     let existing = load_wa_meta(conn)?;
     match existing {
@@ -1658,14 +1651,14 @@ fn ensure_wa_meta(conn: &Connection, schema_version: i32) -> Result<()> {
                 WaVersion::parse(&meta.min_compatible_wa),
             ) {
                 if current > existing_min {
-                    min_compatible = current_wa.clone();
+                    min_compatible.clone_from(&current_wa);
                 }
             } else if meta.min_compatible_wa != current_wa {
-                min_compatible = current_wa.clone();
+                min_compatible.clone_from(&current_wa);
             }
 
             let created_by = if meta.created_by_wa.is_empty() {
-                current_wa.clone()
+                std::mem::take(&mut current_wa)
             } else {
                 meta.created_by_wa.clone()
             };
@@ -3334,8 +3327,7 @@ fn now_ms() -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn u64_to_i64(value: u64, label: &str) -> Result<i64> {
@@ -4105,15 +4097,19 @@ fn consume_approval_token_sync(
     };
 
     if let Some(mut record) = record {
-        let updated = tx.execute(
-            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
-            params![now, record.id],
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+        let updated = tx
+            .execute(
+                "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+                params![now, record.id],
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to consume approval token: {e}"))
+            })?;
 
         if updated == 0 {
-            tx.commit()
-                .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+            tx.commit().map_err(|e| {
+                StorageError::Database(format!("Failed to commit approval token: {e}"))
+            })?;
             return Ok(None);
         }
 
@@ -4213,15 +4209,19 @@ fn consume_approval_token_by_code_sync(
     };
 
     if let Some(mut record) = record {
-        let updated = tx.execute(
-            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
-            params![now, record.id],
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+        let updated = tx
+            .execute(
+                "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+                params![now, record.id],
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to consume approval token: {e}"))
+            })?;
 
         if updated == 0 {
-            tx.commit()
-                .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+            tx.commit().map_err(|e| {
+                StorageError::Database(format!("Failed to commit approval token: {e}"))
+            })?;
             return Ok(None);
         }
 
@@ -4265,7 +4265,6 @@ fn validate_fts_query(conn: &Connection, query: &str) -> Result<()> {
     }
 }
 
-
 /// Search using FTS5 with snippet extraction and BM25 scores
 ///
 /// Returns structured results with:
@@ -4298,15 +4297,14 @@ fn search_fts_with_snippets(
         params_vec.push(Box::new(suffix.to_string()));
         params_vec.push(Box::new(usize_to_i64(max_tokens, "max_tokens")?));
 
-        format!(
-            "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                    snippet(output_segments_fts, 0, ?2, ?3, '...', ?4) as snippet,
-                    highlight(output_segments_fts, 0, ?2, ?3) as highlight,
-                    bm25(output_segments_fts) as score
-             FROM output_segments s
-             JOIN output_segments_fts fts ON s.id = fts.rowid
-             WHERE output_segments_fts MATCH ?1"
-        )
+        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
+                snippet(output_segments_fts, 0, ?2, ?3, '...', ?4) as snippet,
+                highlight(output_segments_fts, 0, ?2, ?3) as highlight,
+                bm25(output_segments_fts) as score
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ?1"
+            .to_string()
     } else {
         String::from(
             "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
@@ -4999,7 +4997,7 @@ fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-    .map(|opt| opt.flatten())
+    .map(Option::flatten)
 }
 
 /// Query all panes

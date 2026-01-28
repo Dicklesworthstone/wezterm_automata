@@ -300,14 +300,14 @@ impl ObservationRuntime {
         let storage = Arc::clone(&self.storage);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let mut config_rx = self.config_rx.clone();
-        
+
         let initial_retention_days = self.config.retention_days;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
 
         tokio::spawn(async move {
             let mut retention_days = initial_retention_days;
             let mut checkpoint_secs = initial_checkpoint_secs;
-            
+
             // Run maintenance every minute, but only do expensive ops when needed
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             let mut last_retention_check = Instant::now();
@@ -338,8 +338,11 @@ impl ObservationRuntime {
                         // Run retention cleanup every hour (or if just started/updated)
                         if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
                             if retention_days > 0 {
-                                let cutoff_days = retention_days as u64;
-                                let cutoff_ms = epoch_ms() - (cutoff_days * 24 * 60 * 60 * 1000) as i64;
+                                let cutoff_days = u64::from(retention_days);
+                                let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
+                                let cutoff_ms = epoch_ms().saturating_sub(
+                                    i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX),
+                                );
                                 let storage_guard = storage.lock().await;
                                 if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
                                     error!(error = %e, "Retention cleanup failed");
@@ -355,7 +358,10 @@ impl ObservationRuntime {
                         }
 
                         // Run checkpoint/vacuum
-                        if checkpoint_secs > 0 && now.duration_since(last_checkpoint) >= Duration::from_secs(checkpoint_secs as u64) {
+                        if checkpoint_secs > 0
+                            && now.duration_since(last_checkpoint)
+                                >= Duration::from_secs(u64::from(checkpoint_secs))
+                        {
                             let storage_guard = storage.lock().await;
                             // Vacuum also handles WAL checkpointing implicitly in many cases,
                             // or we could add explicit checkpoint support. For now vacuum is good maintenance.
@@ -364,6 +370,7 @@ impl ObservationRuntime {
                             } else {
                                 debug!("Database maintenance (vacuum) completed");
                             }
+                            drop(storage_guard);
                             last_checkpoint = now;
                         }
                     }
@@ -441,14 +448,18 @@ impl ObservationRuntime {
                                 if entry.should_observe() {
                                     // Initialize cursor from storage to resume capture
                                     let storage_guard = storage.lock().await;
-                                    let max_seq = storage_guard.get_max_seq(*pane_id).await.unwrap_or(None);
+                                    let max_seq =
+                                        storage_guard.get_max_seq(*pane_id).await.unwrap_or(None);
                                     drop(storage_guard);
 
                                     let next_seq = max_seq.map_or(0, |s| s + 1);
 
                                     {
                                         let mut cursors = cursors.write().await;
-                                        cursors.insert(*pane_id, PaneCursor::from_seq(*pane_id, next_seq));
+                                        cursors.insert(
+                                            *pane_id,
+                                            PaneCursor::from_seq(*pane_id, next_seq),
+                                        );
                                     }
 
                                     {
@@ -458,7 +469,11 @@ impl ObservationRuntime {
                                         contexts.insert(*pane_id, ctx);
                                     }
 
-                                    debug!(pane_id = pane_id, next_seq = next_seq, "Started observing pane");
+                                    debug!(
+                                        pane_id = pane_id,
+                                        next_seq = next_seq,
+                                        "Started observing pane"
+                                    );
                                 } else if let Some(reason) = entry.observation.ignore_reason() {
                                     info!(
                                         pane_id = pane_id,
@@ -562,7 +577,7 @@ impl ObservationRuntime {
                 // (Using min_interval for responsiveness)
                 // Actually supervisor manages per-tailer intervals. We just need to wake up often enough to spawn ready tasks.
                 // A fixed tick is fine, supervisor filters ready tasks.
-                let tick_duration = Duration::from_millis(10); 
+                let tick_duration = Duration::from_millis(10);
 
                 tokio::select! {
                     _ = sync_tick.tick() => {
@@ -612,7 +627,7 @@ impl ObservationRuntime {
                         }
                     }
                     // Spawn new captures if slots available
-                    _ = tokio::time::sleep(tick_duration) => {
+                    () = tokio::time::sleep(tick_duration) => {
                          if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }

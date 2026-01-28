@@ -807,8 +807,7 @@ impl PolicyInput {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 impl DecisionContext {
@@ -1080,9 +1079,8 @@ struct CommandRule {
     reason: &'static str,
 }
 
-static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex")
-});
+static RM_RF_ROOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-rf\s+(/|~)(\s|$)").expect("rm -rf root regex"));
 static RM_RF_GENERIC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\brm\s+-rf\s+").expect("rm -rf regex"));
 static GIT_RESET_HARD: LazyLock<Regex> =
@@ -1782,9 +1780,7 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         match &input.command_text {
             Some(text) => {
                 let matches_any = match_on.command_patterns.iter().any(|pattern| {
-                    Regex::new(pattern)
-                        .map(|re| re.is_match(text))
-                        .unwrap_or(false)
+                    Regex::new(pattern).is_ok_and(|re| re.is_match(text))
                 });
                 if !matches_any {
                     return false;
@@ -1822,9 +1818,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         .replace('*', ".*")
         .replace('?', ".");
     let full_pattern = format!("^{regex_pattern}$");
-    Regex::new(&full_pattern)
-        .map(|re| re.is_match(text))
-        .unwrap_or(false)
+    Regex::new(&full_pattern).is_ok_and(|re| re.is_match(text))
 }
 
 // ============================================================================
@@ -2415,8 +2409,7 @@ impl InjectionResult {
     ) -> crate::storage::AuditActionRecord {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
         match self {
             Self::Allowed {

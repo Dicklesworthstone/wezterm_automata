@@ -283,8 +283,7 @@ fn now_ms() -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -323,7 +322,10 @@ mod tests {
         let fp1 = fingerprint_for_input(&input1);
         let fp2 = fingerprint_for_input(&input2);
 
-        assert_ne!(fp1, fp2, "Fingerprint should differ when command_text changes");
+        assert_ne!(
+            fp1, fp2,
+            "Fingerprint should differ when command_text changes"
+        );
     }
 
     #[tokio::test]

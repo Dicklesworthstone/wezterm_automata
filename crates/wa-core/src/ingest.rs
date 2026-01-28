@@ -975,9 +975,7 @@ pub async fn persist_captured_segment(
 ) -> Result<PersistedCapture> {
     // Record gap if the captured segment itself represents a discontinuity (overlap failure)
     let mut gap = match &captured.kind {
-        CapturedSegmentKind::Gap { reason } => {
-            storage.record_gap(captured.pane_id, reason).await?
-        }
+        CapturedSegmentKind::Gap { reason } => storage.record_gap(captured.pane_id, reason).await?,
         CapturedSegmentKind::Delta => None,
     };
 
@@ -1028,12 +1026,13 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
 
     // Fast path: pure append (current starts with previous)
     // This handles the common case efficiently (O(N)) and avoids the overlap limit
-    if current.len() > previous.len() && current.starts_with(previous) {
-        if current.is_char_boundary(previous.len()) {
-            return DeltaResult::Content(current[previous.len()..].to_string());
-        }
-        // If boundary check fails (should vary rare if starts_with matched), fall through to full check
+    if current.len() > previous.len()
+        && current.starts_with(previous)
+        && current.is_char_boundary(previous.len())
+    {
+        return DeltaResult::Content(current[previous.len()..].to_string());
     }
+    // If boundary check fails (should vary rare if starts_with matched), fall through to full check
 
     if overlap_size == 0 || current.is_empty() {
         return DeltaResult::Gap {

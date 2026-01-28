@@ -441,6 +441,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(dead_code)]
     struct FixedSource;
 
     impl PaneTextSource for FixedSource {

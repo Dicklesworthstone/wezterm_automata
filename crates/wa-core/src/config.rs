@@ -363,9 +363,7 @@ impl PaneFilterRule {
         }
         regex_pattern.push('$');
 
-        fancy_regex::Regex::new(&regex_pattern)
-            .map(|re| re.is_match(value).unwrap_or(false))
-            .unwrap_or(false)
+        fancy_regex::Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(value).unwrap_or(false))
     }
 
     /// Match title using substring or regex
@@ -374,8 +372,7 @@ impl PaneFilterRule {
             || title.to_lowercase().contains(&pattern.to_lowercase()),
             |regex_pat| {
                 fancy_regex::Regex::new(regex_pat)
-                    .map(|re| re.is_match(title).unwrap_or(false))
-                    .unwrap_or(false)
+                    .is_ok_and(|re| re.is_match(title).unwrap_or(false))
             },
         )
     }

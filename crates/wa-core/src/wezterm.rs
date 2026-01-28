@@ -588,7 +588,7 @@ impl WeztermClient {
 
         // List all panes to find neighbors
         let all_panes = self.list_panes().await?;
-        
+
         // Filter for panes in the same tab/window
         let tab_panes: Vec<&PaneInfo> = all_panes
             .iter()
@@ -604,24 +604,48 @@ impl WeztermClient {
         // Note: left_col/top_row might be viewport-relative or absolute depending on version
         // Assuming left_col/top_row are reliable spatial coordinates.
         // Fallback: use cursor_x/y if viewport coords are missing (less reliable)
-        
-        let src_left = source_pane.left_col.unwrap_or(0) as i64;
+
+        let src_left = i64::from(source_pane.left_col.unwrap_or(0));
         let src_top = source_pane.top_row.unwrap_or(0);
-        let src_width = source_pane.size.as_ref().map(|s| s.cols).or(source_pane.cols).unwrap_or(0) as i64;
-        let src_height = source_pane.size.as_ref().map(|s| s.rows).or(source_pane.rows).unwrap_or(0) as i64;
-        
+        let src_width = source_pane
+            .size
+            .as_ref()
+            .map(|s| s.cols)
+            .or(source_pane.cols)
+            .unwrap_or(0);
+        let src_width = i64::from(src_width);
+        let src_height = source_pane
+            .size
+            .as_ref()
+            .map(|s| s.rows)
+            .or(source_pane.rows)
+            .unwrap_or(0);
+        let src_height = i64::from(src_height);
+
         let src_right = src_left + src_width;
         let src_bottom = src_top + src_height;
-        
+
         let mut best_candidate: Option<u64> = None;
         let mut min_distance = i64::MAX;
 
         for candidate in tab_panes {
-            let cand_left = candidate.left_col.unwrap_or(0) as i64;
+            let cand_left = i64::from(candidate.left_col.unwrap_or(0));
             let cand_top = candidate.top_row.unwrap_or(0);
-            let cand_width = candidate.size.as_ref().map(|s| s.cols).or(candidate.cols).unwrap_or(0) as i64;
-            let cand_height = candidate.size.as_ref().map(|s| s.rows).or(candidate.rows).unwrap_or(0) as i64;
-            
+            let cand_width = candidate
+                .size
+                .as_ref()
+                .map(|s| s.cols)
+                .or(candidate.cols)
+                .unwrap_or(0);
+            let cand_width = i64::from(cand_width);
+            let cand_height = candidate
+                .size
+                .as_ref()
+                .map(|s| s.rows)
+                .or(candidate.rows)
+                .unwrap_or(0);
+            let cand_height = i64::from(cand_height);
+
             let cand_right = cand_left + cand_width;
             let cand_bottom = cand_top + cand_height;
 
@@ -630,17 +654,17 @@ impl WeztermClient {
                     // Candidate is to the left if its right edge aligns with source left edge
                     // and they overlap vertically
                     cand_right <= src_left && (cand_top < src_bottom && cand_bottom > src_top)
-                },
+                }
                 MoveDirection::Right => {
                     // Candidate is to the right if its left edge aligns with source right edge
                     // and they overlap vertically
                     cand_left >= src_right && (cand_top < src_bottom && cand_bottom > src_top)
-                },
+                }
                 MoveDirection::Up => {
                     // Candidate is above if its bottom edge aligns with source top edge
                     // and they overlap horizontally
                     cand_bottom <= src_top && (cand_left < src_right && cand_right > src_left)
-                },
+                }
                 MoveDirection::Down => {
                     // Candidate is below if its top edge aligns with source bottom edge
                     // and they overlap horizontally
@@ -922,7 +946,7 @@ impl Default for WaitOptions {
             tail_lines: 200,
             escapes: false,
             poll_initial: Duration::from_millis(50),
-            poll_max: Duration::from_millis(1000),
+            poll_max: Duration::from_secs(1),
             max_polls: 10_000,
         }
     }
