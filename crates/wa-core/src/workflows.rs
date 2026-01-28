@@ -3406,8 +3406,58 @@ impl WorkflowRunner {
         }
 
         while current_step < step_count {
-            // Execute the step
-            let step_result = workflow.execute_step(&mut ctx, current_step).await;
+            let step_plan = ctx.get_step_plan(current_step).cloned();
+            let mut idempotency_skip: Option<(i64, Option<String>)> = None;
+            let mut idempotency_abort: Option<String> = None;
+
+            if let Some(step_plan) = step_plan.as_ref() {
+                if step_plan.idempotent {
+                    match check_step_idempotency(
+                        &self.storage,
+                        execution_id,
+                        &step_plan.step_id,
+                        current_step,
+                    )
+                    .await
+                    {
+                        IdempotencyCheckResult::AlreadyCompleted {
+                            completed_at,
+                            previous_result,
+                        } => {
+                            tracing::info!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Skipping idempotent step already completed"
+                            );
+                            idempotency_skip = Some((completed_at, previous_result));
+                        }
+                        IdempotencyCheckResult::PartiallyExecuted { started_at } => {
+                            let reason = format!(
+                                "Idempotent step {} was started at {} but not completed",
+                                step_plan.step_id, started_at
+                            );
+                            tracing::warn!(
+                                execution_id,
+                                step_index = current_step,
+                                step_id = %step_plan.step_id,
+                                "Idempotent step partially executed; aborting"
+                            );
+                            idempotency_abort = Some(reason);
+                        }
+                        IdempotencyCheckResult::NotExecuted => {}
+                    }
+                }
+            }
+
+            // Execute the step (or skip/abort based on idempotency)
+            let step_result = if let Some(reason) = idempotency_abort {
+                StepResult::Abort { reason }
+            } else if idempotency_skip.is_some() {
+                StepResult::Continue
+            } else {
+                workflow.execute_step(&mut ctx, current_step).await
+            };
 
             // Log step result
             let result_type = match &step_result {
@@ -3424,10 +3474,10 @@ impl WorkflowRunner {
                 .get(current_step)
                 .map_or("unknown", |s| s.name.as_str());
 
-            let step_plan = ctx.get_step_plan(current_step);
-            let step_id = step_plan.map(|step| step.step_id.0.clone());
-            let step_kind = step_plan.map(|step| step.action.action_type_name().to_string());
-            let verification_refs = build_verification_refs(&step_result, step_plan);
+            let step_plan_ref = step_plan.as_ref();
+            let step_id = step_plan_ref.map(|step| step.step_id.0.clone());
+            let step_kind = step_plan_ref.map(|step| step.action.action_type_name().to_string());
+            let verification_refs = build_verification_refs(&step_result, step_plan_ref);
             let step_error_code = step_error_code_from_result(&step_result);
 
             // Build result data, enriching with plan information if available (wa-upg.2.3)
@@ -3442,9 +3492,17 @@ impl WorkflowRunner {
                 }
 
                 // Include step action type from plan if available
-                if let Some(step_plan) = step_plan {
+                if let Some(step_plan) = step_plan_ref {
                     data["action_type"] = serde_json::json!(step_plan.action.action_type_name());
                     data["step_description"] = serde_json::json!(step_plan.description);
+                }
+
+                if let Some((completed_at, previous_result)) = &idempotency_skip {
+                    data["idempotency_skip"] = serde_json::json!(true);
+                    data["previous_completed_at"] = serde_json::json!(completed_at);
+                    if let Some(previous_result) = previous_result {
+                        data["previous_result"] = serde_json::json!(previous_result);
+                    }
                 }
 
                 serde_json::to_string(&data).ok()
@@ -4949,6 +5007,77 @@ impl Workflow for HandleCompaction {
             WorkflowStep::new("send_prompt", "Send agent-specific context refresh prompt"),
             WorkflowStep::new("verify_send", "Verify the prompt was processed"),
         ]
+    }
+
+    fn to_action_plan(
+        &self,
+        ctx: &WorkflowContext,
+        execution_id: &str,
+    ) -> Option<crate::plan::ActionPlan> {
+        let pane_id = ctx.pane_id();
+        let workspace_id = ctx.workspace_id().unwrap_or("default");
+        let prompt = Self::get_prompt_for_agent(ctx);
+
+        let check_guards = crate::plan::StepPlan::new(
+            1,
+            crate::plan::StepAction::Custom {
+                action_type: "check_guards".to_string(),
+                payload: serde_json::json!({
+                    "pane_id": pane_id,
+                }),
+            },
+            "Validate pane state allows injection",
+        )
+        .idempotent();
+
+        let stabilize = crate::plan::StepPlan::new(
+            2,
+            crate::plan::StepAction::Custom {
+                action_type: "stabilize_output".to_string(),
+                payload: serde_json::json!({
+                    "pane_id": pane_id,
+                    "stable_for_ms": self.stabilization_ms,
+                    "timeout_ms": self.idle_timeout_ms,
+                }),
+            },
+            "Wait for compaction output to stabilize",
+        )
+        .idempotent();
+
+        let send_prompt = crate::plan::StepPlan::new(
+            3,
+            crate::plan::StepAction::SendText {
+                pane_id,
+                text: prompt.to_string(),
+                paste_mode: None,
+            },
+            "Send agent-specific context refresh prompt",
+        )
+        .idempotent();
+
+        let verify_send = crate::plan::StepPlan::new(
+            4,
+            crate::plan::StepAction::Custom {
+                action_type: "verify_send".to_string(),
+                payload: serde_json::json!({
+                    "pane_id": pane_id,
+                }),
+            },
+            "Verify the prompt was processed",
+        )
+        .idempotent();
+
+        Some(
+            crate::plan::ActionPlan::builder(self.description(), workspace_id)
+                .add_steps([check_guards, stabilize, send_prompt, verify_send])
+                .metadata(serde_json::json!({
+                    "workflow_name": self.name(),
+                    "execution_id": execution_id,
+                    "pane_id": pane_id,
+                }))
+                .created_at(now_ms())
+                .build(),
+        )
     }
 
     fn execute_step(
@@ -8044,6 +8173,70 @@ mod tests {
         }
     }
 
+    /// Workflow with a single idempotent SendText step.
+    struct IdempotentSendWorkflow;
+
+    impl Workflow for IdempotentSendWorkflow {
+        fn name(&self) -> &'static str {
+            "idempotent_send"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow with idempotent send step"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("idempotent_send")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("send", "Send test text")]
+        }
+
+        fn to_action_plan(
+            &self,
+            ctx: &WorkflowContext,
+            execution_id: &str,
+        ) -> Option<crate::plan::ActionPlan> {
+            let pane_id = ctx.pane_id();
+            let step = crate::plan::StepPlan::new(
+                1,
+                crate::plan::StepAction::SendText {
+                    pane_id,
+                    text: "hello".to_string(),
+                    paste_mode: None,
+                },
+                "Send test text",
+            )
+            .idempotent();
+
+            Some(
+                crate::plan::ActionPlan::builder(self.description(), "test-workspace")
+                    .add_step(step)
+                    .metadata(serde_json::json!({
+                        "workflow_name": self.name(),
+                        "execution_id": execution_id,
+                        "pane_id": pane_id,
+                    }))
+                    .created_at(now_ms())
+                    .build(),
+            )
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::send_text("hello"),
+                    _ => StepResult::abort("Unexpected step index"),
+                }
+            })
+        }
+    }
+
     /// Helper to create a test WorkflowRunner with storage
     async fn create_test_runner(
         db_path: &str,
@@ -8315,6 +8508,91 @@ mod tests {
         assert_eq!(step_logs[1].result_type, "continue");
         assert_eq!(step_logs[2].result_type, "continue");
         assert_eq!(step_logs[3].result_type, "done");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: idempotent steps are skipped on retry to avoid double-apply.
+    #[tokio::test]
+    async fn idempotent_step_skip_prevents_double_send() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_idempotent_skip.db")
+            .to_string_lossy()
+            .to_string();
+
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
+            ),
+        ));
+
+        let runner = WorkflowRunner::new(
+            engine,
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        let pane_id = 47u64;
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(IdempotentSendWorkflow));
+
+        let detection = make_test_detection("idempotent_send.test");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+        let execution_id = start_result.execution_id().unwrap();
+
+        let workflow = runner.find_workflow_by_name("idempotent_send").unwrap();
+        let ctx = WorkflowContext::new(
+            Arc::clone(&storage),
+            pane_id,
+            PaneCapabilities::default(),
+            execution_id,
+        );
+        let plan = workflow
+            .to_action_plan(&ctx, execution_id)
+            .expect("plan required");
+        let step = &plan.steps[0];
+
+        let result_data = serde_json::json!({
+            "idempotency_key": step.step_id.0,
+        })
+        .to_string();
+
+        storage
+            .insert_step_log(
+                execution_id,
+                None,
+                0,
+                "send",
+                Some(step.step_id.0.clone()),
+                Some(step.action.action_type_name().to_string()),
+                "continue",
+                Some(result_data),
+                None,
+                None,
+                None,
+                now_ms(),
+                now_ms(),
+            )
+            .await
+            .unwrap();
+
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+
+        assert!(
+            exec_result.is_completed(),
+            "Workflow should complete when idempotent step is skipped"
+        );
 
         storage.shutdown().await.unwrap();
     }
