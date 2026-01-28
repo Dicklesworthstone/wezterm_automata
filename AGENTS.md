@@ -245,6 +245,93 @@ cargo test pattern_matching
 
 ---
 
+## Pattern Rules Tooling
+
+Robot mode includes commands for inspecting and validating pattern rules.
+
+### List Rules
+
+```bash
+# List all rules
+wa robot rules list
+
+# Filter by agent type
+wa robot rules list --agent-type codex
+
+# Include descriptions
+wa robot rules list --verbose
+```
+
+### Test Rules
+
+```bash
+# Test text against all rules
+wa robot rules test "Usage limit reached. Try again at 2026-01-20 12:34 UTC"
+
+# With full trace
+wa robot rules test "some text" --trace
+```
+
+### Show Rule Details
+
+```bash
+# Show specific rule
+wa robot rules show "codex.usage.reached"
+```
+
+### Lint Rules (Pack Validation)
+
+```bash
+# Basic lint (ID naming + regex validation)
+wa robot rules lint
+
+# Include fixture coverage check
+wa robot rules lint --fixtures
+
+# Strict mode (fail on warnings)
+wa robot rules lint --fixtures --strict
+```
+
+Lint checks:
+- **Naming**: Rule IDs must start with `codex.`, `claude_code.`, `gemini.`, or `wezterm.`
+- **Agent type alignment**: Rule ID prefix must match its agent_type field
+- **Regex safety**: Warns about nested wildcards (potential ReDoS), excessive length (>500 chars), consecutive spaces
+- **Fixture coverage**: Each rule should have at least one corpus fixture (with `--fixtures`)
+
+### Rule Drift Workflow
+
+When agent output patterns change (new versions, updated prompts), follow this fixture-first workflow:
+
+1. **Capture**: Record the new output that isn't matching
+   ```bash
+   wa robot get-text <pane_id> --tail 500 > /tmp/new_output.txt
+   ```
+
+2. **Add fixture**: Create a minimal test case
+   ```bash
+   # Copy relevant snippet to corpus
+   cp /tmp/new_output.txt crates/wa-core/tests/corpus/<agent>/<event>.txt
+
+   # Create expected output (initially empty to see what matches)
+   echo "[]" > crates/wa-core/tests/corpus/<agent>/<event>.expect.json
+   ```
+
+3. **Test and iterate**: Run corpus tests to see the diff
+   ```bash
+   cargo test corpus_fixtures_match_expected
+   ```
+
+4. **Update rule**: Modify anchors/regex in the pack definition until the test passes
+
+5. **Validate**: Run the linter to ensure no regressions
+   ```bash
+   wa robot rules lint --fixtures --strict
+   ```
+
+6. **Ship**: Commit the fixture and rule changes together
+
+---
+
 ## Common Agent Workflows
 
 ### 1. Monitor Multiple Agents
