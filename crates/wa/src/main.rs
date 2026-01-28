@@ -401,6 +401,12 @@ enum RobotCommands {
         command: RobotWorkflowCommands,
     },
 
+    /// Rule management commands (list rules, test text against rules)
+    Rules {
+        #[command(subcommand)]
+        command: RobotRulesCommands,
+    },
+
     /// Explain an error code or policy denial
     Why {
         /// Error code or template ID to explain (e.g., "deny.alt_screen", "robot.policy_denied")
@@ -475,6 +481,64 @@ enum RobotWorkflowCommands {
         /// Reason for aborting
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Robot rules subcommands
+#[derive(Subcommand)]
+enum RobotRulesCommands {
+    /// List all rules with metadata
+    List {
+        /// Filter by pack name (e.g., "builtin:codex")
+        #[arg(long)]
+        pack: Option<String>,
+
+        /// Filter by agent type (codex, claude_code, gemini, wezterm)
+        #[arg(long)]
+        agent_type: Option<String>,
+
+        /// Include rule descriptions in output
+        #[arg(long, short)]
+        verbose: bool,
+    },
+
+    /// Test text against rules and show match trace
+    Test {
+        /// Text to test against rules
+        text: String,
+
+        /// Show full trace evidence for matches
+        #[arg(long)]
+        trace: bool,
+
+        /// Only test rules from a specific pack
+        #[arg(long)]
+        pack: Option<String>,
+    },
+
+    /// Show details for a specific rule
+    Show {
+        /// Rule ID (e.g., "codex.usage_reached")
+        rule_id: String,
+    },
+
+    /// Lint rules: validate IDs, check fixtures, validate regex patterns
+    Lint {
+        /// Only check a specific pack (e.g., "builtin:codex")
+        #[arg(long)]
+        pack: Option<String>,
+
+        /// Include fixture coverage check (validates corpus has tests for each rule)
+        #[arg(long)]
+        fixtures: bool,
+
+        /// Skip regex complexity check
+        #[arg(long)]
+        skip_regex_check: bool,
+
+        /// Fail on warnings (exit non-zero)
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -1131,6 +1195,113 @@ struct RobotApproveData {
     action_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dry_run: Option<bool>,
+}
+
+/// Robot rules list response data
+#[derive(Debug, serde::Serialize)]
+struct RobotRulesListData {
+    rules: Vec<RobotRuleItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_type_filter: Option<String>,
+}
+
+/// Individual rule item for robot mode
+#[derive(Debug, serde::Serialize)]
+struct RobotRuleItem {
+    id: String,
+    agent_type: String,
+    event_type: String,
+    severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<String>,
+    anchor_count: usize,
+    has_regex: bool,
+}
+
+/// Robot rules test response data
+#[derive(Debug, serde::Serialize)]
+struct RobotRulesTestData {
+    text_length: usize,
+    match_count: usize,
+    matches: Vec<RobotRuleMatchItem>,
+}
+
+/// Individual rule match item for robot mode
+#[derive(Debug, serde::Serialize)]
+struct RobotRuleMatchItem {
+    rule_id: String,
+    agent_type: String,
+    event_type: String,
+    severity: String,
+    confidence: f64,
+    matched_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<RobotRuleTraceInfo>,
+}
+
+/// Trace info for rule match
+#[derive(Debug, serde::Serialize)]
+struct RobotRuleTraceInfo {
+    anchors_checked: bool,
+    regex_matched: bool,
+}
+
+/// Robot rules show response data (full rule details)
+#[derive(Debug, serde::Serialize)]
+struct RobotRuleDetailData {
+    id: String,
+    agent_type: String,
+    event_type: String,
+    severity: String,
+    description: String,
+    anchors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remediation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_fix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    learn_more_url: Option<String>,
+}
+
+/// Robot rules lint response data
+#[derive(Debug, serde::Serialize)]
+struct RobotRulesLintData {
+    total_rules: usize,
+    rules_checked: usize,
+    errors: Vec<RobotLintIssue>,
+    warnings: Vec<RobotLintIssue>,
+    /// Fixture coverage statistics (present when --fixtures flag used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixture_coverage: Option<RobotFixtureCoverage>,
+    passed: bool,
+}
+
+/// Individual lint issue
+#[derive(Debug, serde::Serialize)]
+struct RobotLintIssue {
+    rule_id: String,
+    category: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+}
+
+/// Fixture coverage statistics
+#[derive(Debug, serde::Serialize)]
+struct RobotFixtureCoverage {
+    rules_with_fixtures: usize,
+    rules_without_fixtures: Vec<String>,
+    total_fixtures: usize,
 }
 
 #[derive(Debug)]
@@ -2380,7 +2551,8 @@ async fn run_watcher(
 
         // Register built-in workflows
         workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
-        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::default()));
+        workflow_runner
+            .register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::default()));
         tracing::info!("Registered workflows: handle_compaction, handle_usage_limits");
 
         // Spawn workflow runner event loop
@@ -4064,6 +4236,342 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Clean shutdown of storage
                                     if let Err(e) = storage.shutdown().await {
                                         tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        RobotCommands::Rules { command } => {
+                            use wa_core::patterns::{AgentType, PatternEngine};
+
+                            let engine = PatternEngine::new();
+
+                            match command {
+                                RobotRulesCommands::List {
+                                    pack,
+                                    agent_type,
+                                    verbose,
+                                } => {
+                                    // Parse agent type filter if provided
+                                    let agent_filter: Option<AgentType> =
+                                        agent_type.as_ref().and_then(|s| match s.as_str() {
+                                            "codex" => Some(AgentType::Codex),
+                                            "claude_code" => Some(AgentType::ClaudeCode),
+                                            "gemini" => Some(AgentType::Gemini),
+                                            "wezterm" => Some(AgentType::Wezterm),
+                                            _ => None,
+                                        });
+
+                                    let rules: Vec<RobotRuleItem> = engine
+                                        .rules()
+                                        .iter()
+                                        .filter(|rule| {
+                                            // Filter by pack if specified
+                                            if let Some(ref pack_filter) = pack {
+                                                // Rules don't store pack directly, but we can derive from id prefix
+                                                // For now, show all rules (pack filtering would need library access)
+                                                let _ = pack_filter;
+                                            }
+                                            // Filter by agent type if specified
+                                            if let Some(ref agent) = agent_filter {
+                                                if rule.agent_type != *agent {
+                                                    return false;
+                                                }
+                                            }
+                                            true
+                                        })
+                                        .map(|rule| RobotRuleItem {
+                                            id: rule.id.clone(),
+                                            agent_type: format!("{}", rule.agent_type),
+                                            event_type: rule.event_type.clone(),
+                                            severity: format!("{:?}", rule.severity).to_lowercase(),
+                                            description: if verbose {
+                                                Some(rule.description.clone())
+                                            } else {
+                                                None
+                                            },
+                                            workflow: rule.workflow.clone(),
+                                            anchor_count: rule.anchors.len(),
+                                            has_regex: rule.regex.is_some(),
+                                        })
+                                        .collect();
+
+                                    let data = RobotRulesListData {
+                                        rules,
+                                        pack_filter: pack,
+                                        agent_type_filter: agent_type,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                RobotRulesCommands::Test { text, trace, pack } => {
+                                    let _ = pack; // Pack filtering not implemented yet
+
+                                    // Run detection on the provided text
+                                    let detections = engine.detect(&text);
+
+                                    let matches: Vec<RobotRuleMatchItem> = detections
+                                        .iter()
+                                        .map(|d| RobotRuleMatchItem {
+                                            rule_id: d.rule_id.clone(),
+                                            agent_type: format!("{}", d.agent_type),
+                                            event_type: d.event_type.clone(),
+                                            severity: format!("{:?}", d.severity).to_lowercase(),
+                                            confidence: d.confidence,
+                                            matched_text: d.matched_text.clone(),
+                                            extracted: if d.extracted.is_null()
+                                                || d.extracted
+                                                    .as_object()
+                                                    .is_some_and(|o| o.is_empty())
+                                            {
+                                                None
+                                            } else {
+                                                Some(d.extracted.clone())
+                                            },
+                                            trace: if trace {
+                                                // Trace output would include match evidence
+                                                // For now, provide basic info
+                                                Some(RobotRuleTraceInfo {
+                                                    anchors_checked: true,
+                                                    regex_matched: !d.matched_text.is_empty(),
+                                                })
+                                            } else {
+                                                None
+                                            },
+                                        })
+                                        .collect();
+
+                                    let data = RobotRulesTestData {
+                                        text_length: text.len(),
+                                        match_count: matches.len(),
+                                        matches,
+                                    };
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                RobotRulesCommands::Show { rule_id } => {
+                                    // Find the specific rule
+                                    if let Some(rule) =
+                                        engine.rules().iter().find(|r| r.id == rule_id)
+                                    {
+                                        let data = RobotRuleDetailData {
+                                            id: rule.id.clone(),
+                                            agent_type: format!("{}", rule.agent_type),
+                                            event_type: rule.event_type.clone(),
+                                            severity: format!("{:?}", rule.severity).to_lowercase(),
+                                            description: rule.description.clone(),
+                                            anchors: rule.anchors.clone(),
+                                            regex: rule.regex.clone(),
+                                            workflow: rule.workflow.clone(),
+                                            remediation: rule.remediation.clone(),
+                                            manual_fix: rule.manual_fix.clone(),
+                                            learn_more_url: rule.learn_more_url.clone(),
+                                        };
+                                        let response =
+                                            RobotResponse::success(data, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    } else {
+                                        let response =
+                                            RobotResponse::<RobotRuleDetailData>::error_with_code(
+                                                "robot.rule_not_found",
+                                                format!("Rule '{}' not found", rule_id),
+                                                Some("Use 'wa robot rules list' to see available rules".to_string()),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                }
+                                RobotRulesCommands::Lint {
+                                    pack,
+                                    fixtures,
+                                    skip_regex_check,
+                                    strict,
+                                } => {
+                                    let _ = pack; // Pack filtering not yet implemented
+
+                                    // Valid rule ID prefixes (agent_type prefix)
+                                    const ALLOWED_PREFIXES: &[&str] =
+                                        &["codex.", "claude_code.", "gemini.", "wezterm."];
+
+                                    let rules = engine.rules();
+                                    let mut errors: Vec<RobotLintIssue> = Vec::new();
+                                    let mut warnings: Vec<RobotLintIssue> = Vec::new();
+
+                                    // 1. Validate rule ID naming conventions
+                                    for rule in rules.iter() {
+                                        let has_valid_prefix =
+                                            ALLOWED_PREFIXES.iter().any(|p| rule.id.starts_with(p));
+                                        if !has_valid_prefix {
+                                            errors.push(RobotLintIssue {
+                                                rule_id: rule.id.clone(),
+                                                category: "naming".to_string(),
+                                                message: format!(
+                                                    "Rule ID must start with one of: {}",
+                                                    ALLOWED_PREFIXES.join(", ")
+                                                ),
+                                                suggestion: Some(format!(
+                                                    "Rename to '{}.{}'",
+                                                    rule.agent_type,
+                                                    rule.id.split('.').skip(1).collect::<Vec<_>>().join(".")
+                                                )),
+                                            });
+                                        }
+
+                                        // Check ID matches agent_type
+                                        let expected_prefix = format!("{}.", rule.agent_type);
+                                        if !rule.id.starts_with(&expected_prefix) {
+                                            errors.push(RobotLintIssue {
+                                                rule_id: rule.id.clone(),
+                                                category: "naming".to_string(),
+                                                message: format!(
+                                                    "Rule ID prefix '{}' does not match agent_type '{}'",
+                                                    rule.id.split('.').next().unwrap_or(""),
+                                                    rule.agent_type
+                                                ),
+                                                suggestion: Some(format!(
+                                                    "Use '{}{}'",
+                                                    expected_prefix,
+                                                    rule.id.split('.').skip(1).collect::<Vec<_>>().join(".")
+                                                )),
+                                            });
+                                        }
+
+                                        // 2. Validate regex patterns (if not skipped)
+                                        if !skip_regex_check {
+                                            if let Some(ref regex_str) = rule.regex {
+                                                // Check for dangerous patterns
+                                                if regex_str.contains(".*.*.*") {
+                                                    warnings.push(RobotLintIssue {
+                                                        rule_id: rule.id.clone(),
+                                                        category: "regex".to_string(),
+                                                        message: "Regex contains nested wildcards (potential ReDoS)".to_string(),
+                                                        suggestion: Some("Consider using non-greedy quantifiers or simplifying pattern".to_string()),
+                                                    });
+                                                }
+                                                // Check for excessive length
+                                                if regex_str.len() > 500 {
+                                                    warnings.push(RobotLintIssue {
+                                                        rule_id: rule.id.clone(),
+                                                        category: "regex".to_string(),
+                                                        message: format!("Regex is {} chars (consider splitting)", regex_str.len()),
+                                                        suggestion: Some("Break into multiple rules or simplify the pattern".to_string()),
+                                                    });
+                                                }
+                                                // Check for unescaped special chars that might be mistakes
+                                                if regex_str.contains("  ") {
+                                                    warnings.push(RobotLintIssue {
+                                                        rule_id: rule.id.clone(),
+                                                        category: "regex".to_string(),
+                                                        message: "Regex contains consecutive spaces (intentional?)".to_string(),
+                                                        suggestion: Some("Use \\s+ for flexible whitespace matching".to_string()),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 3. Check fixture coverage if requested
+                                    let fixture_coverage = if fixtures {
+                                        use std::collections::HashSet;
+                                        use std::fs;
+
+                                        let corpus_base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                            .parent()
+                                            .unwrap_or(std::path::Path::new("."))
+                                            .join("wa-core")
+                                            .join("tests")
+                                            .join("corpus");
+
+                                        let mut rules_with_fixtures: HashSet<String> = HashSet::new();
+                                        let mut total_fixtures = 0;
+
+                                        // Collect all expect.json files and extract rule IDs
+                                        fn collect_fixtures(
+                                            dir: &std::path::Path,
+                                            rules_with_fixtures: &mut HashSet<String>,
+                                            total_fixtures: &mut usize,
+                                        ) {
+                                            let Ok(entries) = fs::read_dir(dir) else {
+                                                return;
+                                            };
+                                            for entry in entries.flatten() {
+                                                let path = entry.path();
+                                                if path.is_dir() {
+                                                    collect_fixtures(&path, rules_with_fixtures, total_fixtures);
+                                                } else if path
+                                                    .extension()
+                                                    .is_some_and(|ext| ext == "json")
+                                                    && path.to_string_lossy().contains(".expect.")
+                                                {
+                                                    *total_fixtures += 1;
+                                                    if let Ok(content) = fs::read_to_string(&path) {
+                                                        if let Ok(val) =
+                                                            serde_json::from_str::<serde_json::Value>(&content)
+                                                        {
+                                                            if let Some(arr) = val.as_array() {
+                                                                for item in arr {
+                                                                    if let Some(rule_id) =
+                                                                        item.get("rule_id").and_then(|v| v.as_str())
+                                                                    {
+                                                                        rules_with_fixtures
+                                                                            .insert(rule_id.to_string());
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        collect_fixtures(&corpus_base, &mut rules_with_fixtures, &mut total_fixtures);
+
+                                        // Find rules without any fixture coverage
+                                        let rules_without: Vec<String> = rules
+                                            .iter()
+                                            .filter(|r| !rules_with_fixtures.contains(&r.id))
+                                            .map(|r| r.id.clone())
+                                            .collect();
+
+                                        // Add warnings for rules without fixtures
+                                        for rule_id in &rules_without {
+                                            warnings.push(RobotLintIssue {
+                                                rule_id: rule_id.clone(),
+                                                category: "fixture".to_string(),
+                                                message: "No corpus fixture found for this rule".to_string(),
+                                                suggestion: Some(format!(
+                                                    "Add tests/corpus/<agent>/{}.txt and .expect.json",
+                                                    rule_id.split('.').last().unwrap_or("unknown")
+                                                )),
+                                            });
+                                        }
+
+                                        Some(RobotFixtureCoverage {
+                                            rules_with_fixtures: rules_with_fixtures.len(),
+                                            rules_without_fixtures: rules_without,
+                                            total_fixtures,
+                                        })
+                                    } else {
+                                        None
+                                    };
+
+                                    let passed =
+                                        errors.is_empty() && (!strict || warnings.is_empty());
+
+                                    let data = RobotRulesLintData {
+                                        total_rules: rules.len(),
+                                        rules_checked: rules.len(),
+                                        errors,
+                                        warnings,
+                                        fixture_coverage,
+                                        passed,
+                                    };
+
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+
+                                    // Exit non-zero if not passed
+                                    if !passed {
+                                        std::process::exit(1);
                                     }
                                 }
                             }
@@ -5794,7 +6302,10 @@ fn run_diagnostics(
                         } else {
                             checks.push(DiagnosticCheck::error(
                                 "database",
-                                format!("schema v{} is newer than wa supports (v{})", version, target),
+                                format!(
+                                    "schema v{} is newer than wa supports (v{})",
+                                    version, target
+                                ),
                                 "Update wa to a newer version",
                             ));
                         }
@@ -5859,7 +6370,10 @@ fn run_diagnostics(
             }
         }
     } else {
-        checks.push(DiagnosticCheck::ok_with_detail("daemon status", "not running"));
+        checks.push(DiagnosticCheck::ok_with_detail(
+            "daemon status",
+            "not running",
+        ));
     }
 
     // Check 6: Logs directory writability

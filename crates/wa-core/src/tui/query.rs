@@ -220,7 +220,9 @@ impl QueryClient for ProductionQueryClient {
                 rule_id: e.rule_id,
                 pane_id: e.pane_id,
                 severity: e.severity,
-                message: e.matched_text.unwrap_or_else(|| "Pattern matched".to_string()),
+                message: e
+                    .matched_text
+                    .unwrap_or_else(|| "Pattern matched".to_string()),
                 timestamp: e.detected_at,
                 handled: e.handled_at.is_some(),
             })
