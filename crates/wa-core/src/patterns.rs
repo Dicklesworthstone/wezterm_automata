@@ -2506,7 +2506,9 @@ mod tests {
     #[test]
     fn dedup_prevents_repeated_detections() {
         let engine = PatternEngine::new();
-        let text = "You've hit your usage limit, try again at 3pm";
+        // Include trailing period to prevent greedy regex from matching across
+        // concatenated text boundaries (the period stops `[^.]+` in the regex)
+        let text = "You've hit your usage limit, try again at 3pm.";
 
         let mut ctx = DetectionContext::new();
 
@@ -2545,7 +2547,7 @@ mod tests {
     #[test]
     fn dedup_clear_seen_resets() {
         let engine = PatternEngine::new();
-        let text = "You've hit your usage limit, try again at 3pm";
+        let text = "You've hit your usage limit, try again at 3pm.";
 
         let mut ctx = DetectionContext::new();
 

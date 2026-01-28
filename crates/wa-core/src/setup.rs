@@ -10,6 +10,7 @@
 //! - Lua: `-- WA-BEGIN` / `-- WA-END`
 //! - Shell: `# WA-BEGIN` / `# WA-END`
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -426,6 +427,244 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
         modified: true,
         message,
     })
+}
+
+// =============================================================================
+// SSH Config Parsing
+// =============================================================================
+
+/// Structured SSH host entry parsed from ~/.ssh/config
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshHost {
+    /// Host alias (the `Host` stanza name)
+    pub alias: String,
+    /// HostName value, if specified
+    pub hostname: Option<String>,
+    /// User value, if specified
+    pub user: Option<String>,
+    /// Port value, if specified
+    pub port: Option<u16>,
+    /// IdentityFile entries, in order
+    pub identity_files: Vec<String>,
+}
+
+impl SshHost {
+    /// Return identity file paths with redacted directories for safe display.
+    #[must_use]
+    pub fn redacted_identity_files(&self) -> Vec<String> {
+        self.identity_files
+            .iter()
+            .map(|path| redact_identity_path(path))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SshHostBlock {
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_files: Vec<String>,
+}
+
+/// Locate the default SSH config path (~/.ssh/config) if it exists.
+pub fn locate_ssh_config() -> Result<PathBuf> {
+    let path = dirs::home_dir()
+        .map(|home| home.join(".ssh/config"))
+        .ok_or_else(|| Error::SetupError("Could not determine home directory".to_string()))?;
+
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(Error::SetupError(format!(
+            "SSH config not found at {}",
+            path.display()
+        )))
+    }
+}
+
+/// Load and parse an SSH config file from disk.
+pub fn load_ssh_hosts(path: &Path) -> Result<Vec<SshHost>> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| Error::SetupError(format!("Failed to read {}: {}", path.display(), e)))?;
+    Ok(parse_ssh_config(&contents))
+}
+
+/// Parse the contents of an SSH config file into structured host entries.
+#[must_use]
+pub fn parse_ssh_config(contents: &str) -> Vec<SshHost> {
+    let mut hosts = Vec::new();
+    let mut alias_index: HashMap<String, usize> = HashMap::new();
+    let mut current_aliases: Vec<String> = Vec::new();
+    let mut current_block = SshHostBlock::default();
+
+    for raw_line in contents.lines() {
+        let line = strip_inline_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (key, raw_value) = split_key_value(line);
+        if key.is_empty() {
+            continue;
+        }
+
+        let key_lower = key.to_ascii_lowercase();
+        if key_lower == "host" {
+            flush_ssh_block(
+                &mut hosts,
+                &mut alias_index,
+                &current_aliases,
+                &current_block,
+            );
+            current_aliases = raw_value
+                .split_whitespace()
+                .filter(|alias| !is_wildcard_host(alias))
+                .map(str::to_string)
+                .collect();
+            current_block = SshHostBlock::default();
+            continue;
+        }
+
+        if current_aliases.is_empty() {
+            continue;
+        }
+
+        apply_ssh_directive(&mut current_block, &key_lower, raw_value);
+    }
+
+    flush_ssh_block(
+        &mut hosts,
+        &mut alias_index,
+        &current_aliases,
+        &current_block,
+    );
+
+    hosts
+}
+
+fn apply_ssh_directive(block: &mut SshHostBlock, key: &str, value: &str) {
+    let value = strip_quotes(value.trim());
+    if value.is_empty() {
+        return;
+    }
+
+    match key {
+        "hostname" => {
+            block.hostname = Some(value.to_string());
+        }
+        "user" => {
+            block.user = Some(value.to_string());
+        }
+        "port" => {
+            if let Ok(port) = value.parse::<u16>() {
+                block.port = Some(port);
+            }
+        }
+        "identityfile" => {
+            block.identity_files.push(value.to_string());
+        }
+        _ => {}
+    }
+}
+
+fn flush_ssh_block(
+    hosts: &mut Vec<SshHost>,
+    alias_index: &mut HashMap<String, usize>,
+    aliases: &[String],
+    block: &SshHostBlock,
+) {
+    if aliases.is_empty() {
+        return;
+    }
+
+    for alias in aliases {
+        if let Some(idx) = alias_index.get(alias).copied() {
+            let host = &mut hosts[idx];
+            merge_ssh_block(host, block);
+            continue;
+        }
+
+        let host = SshHost {
+            alias: alias.clone(),
+            hostname: block.hostname.clone(),
+            user: block.user.clone(),
+            port: block.port,
+            identity_files: block.identity_files.clone(),
+        };
+        alias_index.insert(alias.clone(), hosts.len());
+        hosts.push(host);
+    }
+}
+
+fn merge_ssh_block(host: &mut SshHost, block: &SshHostBlock) {
+    if let Some(hostname) = &block.hostname {
+        host.hostname = Some(hostname.clone());
+    }
+    if let Some(user) = &block.user {
+        host.user = Some(user.clone());
+    }
+    if let Some(port) = block.port {
+        host.port = Some(port);
+    }
+    if !block.identity_files.is_empty() {
+        host.identity_files.clone_from(&block.identity_files);
+    }
+}
+
+fn is_wildcard_host(alias: &str) -> bool {
+    alias.contains('*') || alias.contains('?')
+}
+
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn split_key_value(line: &str) -> (&str, &str) {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let key = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+
+    if rest.is_empty() {
+        if let Some((key, value)) = line.split_once('=') {
+            return (key.trim(), value.trim());
+        }
+    }
+
+    let rest = rest.strip_prefix('=').map_or(rest, str::trim);
+    (key, rest)
+}
+
+fn strip_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..bytes.len() - 1];
+        }
+    }
+    value
+}
+
+fn redact_identity_path(path: &str) -> String {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("redacted");
+    if path.starts_with('~') {
+        format!("~/{}", filename)
+    } else {
+        format!(".../{}", filename)
+    }
 }
 
 // =============================================================================
@@ -1042,5 +1281,46 @@ alias ll='ls -la'
         assert!(has_shell_wa_block(&content));
         // Fish snippet should have fish-specific syntax
         assert!(content.contains("--on-event fish_prompt"));
+    }
+
+    #[test]
+    fn parse_ssh_config_basic_fixture() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ssh_config/basic_config"
+        ));
+        let hosts = parse_ssh_config(fixture);
+
+        let aliases: Vec<_> = hosts.iter().map(|host| host.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["prod", "staging", "dev"]);
+        assert!(hosts
+            .iter()
+            .all(|host| !host.alias.contains('*') && !host.alias.contains('?')));
+
+        let prod = &hosts[0];
+        assert_eq!(prod.hostname.as_deref(), Some("prod.example.com"));
+        assert_eq!(prod.user.as_deref(), Some("ubuntu"));
+        assert_eq!(prod.port, Some(2222));
+        assert_eq!(
+            prod.identity_files,
+            vec!["~/.ssh/id_ed25519", "~/.ssh/id_ed25519_work"]
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_comments_fixture() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ssh_config/comments_config"
+        ));
+        let hosts = parse_ssh_config(fixture);
+        assert_eq!(hosts.len(), 1);
+
+        let host = &hosts[0];
+        assert_eq!(host.alias, "test");
+        assert_eq!(host.hostname.as_deref(), Some("test.example.com"));
+        assert_eq!(host.user.as_deref(), Some("alice"));
+        assert_eq!(host.port, Some(2200));
+        assert_eq!(host.identity_files, vec!["~/.ssh/id_rsa"]);
     }
 }
