@@ -116,7 +116,7 @@ test_risk_metadata_presence() {
     output=$(run_wa_timeout 10 robot send 0 "test command" --dry-run 2>&1 || true)
 
     # Save artifact
-    e2e_save_artifact "risk_metadata_presence" "dry_run_output.json" "$output"
+    e2e_add_file "risk_metadata_presence" "dry_run_output.json" "$output"
 
     # Check if output is valid JSON
     if ! echo "$output" | jq -e . >/dev/null 2>&1; then
@@ -157,7 +157,7 @@ test_low_risk_allows() {
     local output
     output=$(run_wa_timeout 10 robot state 2>&1 || true)
 
-    e2e_save_artifact "low_risk_allows" "state_output.json" "$output"
+    e2e_add_file "low_risk_allows" "state_output.json" "$output"
 
     # Check if output is valid JSON
     if ! echo "$output" | jq -e . >/dev/null 2>&1; then
@@ -195,7 +195,7 @@ test_risk_scoring_unit_tests() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk 2>&1 || true)
 
-    e2e_save_artifact "risk_scoring_unit_tests" "cargo_test_output.txt" "$output"
+    e2e_add_file "risk_scoring_unit_tests" "cargo_test_output.txt" "$output"
 
     # Check for test success
     if echo "$output" | grep -q "test result: ok"; then
@@ -220,7 +220,7 @@ test_risk_determinism() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_deterministic -- --nocapture 2>&1 || true)
 
-    e2e_save_artifact "risk_determinism" "determinism_test.txt" "$output"
+    e2e_add_file "risk_determinism" "determinism_test.txt" "$output"
 
     if echo "$output" | grep -q "test policy::tests::risk_score_deterministic ... ok"; then
         log_pass "Risk scoring is deterministic"
@@ -240,7 +240,7 @@ test_risk_factor_ordering() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_factors_have_stable_ordering -- --nocapture 2>&1 || true)
 
-    e2e_save_artifact "risk_factor_ordering" "ordering_test.txt" "$output"
+    e2e_add_file "risk_factor_ordering" "ordering_test.txt" "$output"
 
     if echo "$output" | grep -q "test policy::tests::risk_factors_have_stable_ordering ... ok"; then
         log_pass "Risk factor ordering is stable"
@@ -261,7 +261,7 @@ test_risk_decision_mapping() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_to_decision -- --nocapture 2>&1 || true)
 
-    e2e_save_artifact "risk_decision_mapping" "decision_tests.txt" "$output"
+    e2e_add_file "risk_decision_mapping" "decision_tests.txt" "$output"
 
     local all_passed=true
 
@@ -299,7 +299,7 @@ test_risk_json_schema() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_json_schema risk_factor_json_schema decision_context_risk -- --nocapture 2>&1 || true)
 
-    e2e_save_artifact "risk_json_schema" "schema_tests.txt" "$output"
+    e2e_add_file "risk_json_schema" "schema_tests.txt" "$output"
 
     local all_passed=true
 
@@ -337,7 +337,7 @@ test_risk_matrix() {
     local output
     output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_matrix -- --nocapture 2>&1 || true)
 
-    e2e_save_artifact "risk_matrix" "matrix_tests.txt" "$output"
+    e2e_add_file "risk_matrix" "matrix_tests.txt" "$output"
 
     local all_passed=true
 
