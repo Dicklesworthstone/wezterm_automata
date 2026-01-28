@@ -843,6 +843,8 @@ after";
         assert!(block.contains("wa_last_status_update"));
         assert!(block.contains("WA_STATUS_UPDATE_INTERVAL_MS"));
         assert!(block.contains("--from-status"));
+        // JSON escaping helper
+        assert!(block.contains("json_escape"));
     }
 
     // =========================================================================
