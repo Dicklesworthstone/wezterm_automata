@@ -195,7 +195,7 @@ pub enum BrowserStatus {
 pub struct BrowserContext {
     config: BrowserConfig,
     profiles_root: PathBuf,
-    status: BrowserStatus,
+    pub(crate) status: BrowserStatus,
 }
 
 impl BrowserContext {
