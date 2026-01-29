@@ -304,9 +304,63 @@ where
     wait_for(condition, timeout, backoff).await
 }
 
+/// Wait for a boolean condition to become true.
+///
+/// Simpler alternative to [`wait_for`] for cases where you just need
+/// a bool predicate without structured `WaitFor` returns.
+pub async fn wait_for_condition<F, Fut>(
+    description: impl Into<String>,
+    mut check: F,
+    timeout: Duration,
+) -> Result<(), WaitError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let desc = description.into();
+    let condition = WaitCondition::new(desc, move || {
+        let fut = check();
+        async move {
+            if fut.await {
+                WaitFor::Ready(())
+            } else {
+                WaitFor::not_ready(None::<String>)
+            }
+        }
+    });
+    wait_for(condition, timeout, Backoff::default()).await
+}
+
+/// Wait for a boolean condition with custom backoff.
+pub async fn wait_for_condition_with_backoff<F, Fut>(
+    description: impl Into<String>,
+    mut check: F,
+    timeout: Duration,
+    backoff: Backoff,
+) -> Result<(), WaitError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let desc = description.into();
+    let condition = WaitCondition::new(desc, move || {
+        let fut = check();
+        async move {
+            if fut.await {
+                WaitFor::Ready(())
+            } else {
+                WaitFor::not_ready(None::<String>)
+            }
+        }
+    });
+    wait_for(condition, timeout, backoff).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn backoff_schedule_increases_and_caps() {
@@ -329,6 +383,62 @@ mod tests {
         assert_eq!(delay, Duration::from_millis(70));
     }
 
+    #[test]
+    fn backoff_schedule_factor_three() {
+        let backoff = Backoff {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(100),
+            factor: 3,
+            max_retries: None,
+        };
+
+        let mut delay = backoff.initial;
+        assert_eq!(delay, Duration::from_millis(5));
+        delay = backoff.next_delay(delay);
+        assert_eq!(delay, Duration::from_millis(15));
+        delay = backoff.next_delay(delay);
+        assert_eq!(delay, Duration::from_millis(45));
+        delay = backoff.next_delay(delay);
+        // 45 * 3 = 135, capped at 100
+        assert_eq!(delay, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn backoff_default_is_sane() {
+        let b = Backoff::default();
+        assert_eq!(b.initial, Duration::from_millis(25));
+        assert_eq!(b.max, Duration::from_secs(1));
+        assert_eq!(b.factor, 2);
+        assert!(b.max_retries.is_none());
+    }
+
+    #[test]
+    fn wait_error_display_includes_all_fields() {
+        let err = WaitError {
+            expected: "database ready".to_string(),
+            last_observed: Some("connecting".to_string()),
+            retries: 5,
+            elapsed: Duration::from_millis(3200),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("database ready"), "should mention expected condition");
+        assert!(msg.contains("3200"), "should mention elapsed ms");
+        assert!(msg.contains("retries=5"), "should mention retry count");
+        assert!(msg.contains("connecting"), "should mention last observed state");
+    }
+
+    #[test]
+    fn wait_error_display_handles_none_observed() {
+        let err = WaitError {
+            expected: "ready".to_string(),
+            last_observed: None,
+            retries: 1,
+            elapsed: Duration::from_millis(100),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("<none>"), "should show <none> for missing observation");
+    }
+
     #[tokio::test]
     async fn wait_for_value_timeout_includes_debug_info() {
         let result = wait_for_value(|| async { 1u32 }, 2u32, Duration::from_millis(0)).await;
@@ -336,6 +446,96 @@ mod tests {
         assert!(err.expected.contains("value == 2"));
         assert_eq!(err.last_observed.as_deref(), Some("1"));
         assert_eq!(err.retries, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_succeeds_immediately() {
+        let result = wait_for_value(|| async { 42u32 }, 42u32, Duration::from_secs(1)).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn wait_for_predicate_succeeds_after_n_attempts() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+
+        let condition = WaitCondition::new("counter reaches 3", move || {
+            let n = counter2.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n >= 2 {
+                    WaitFor::Ready(n)
+                } else {
+                    WaitFor::not_ready(Some(format!("count={n}")))
+                }
+            }
+        });
+
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            factor: 2,
+            max_retries: None,
+        };
+
+        let result = wait_for(condition, Duration::from_secs(1), backoff).await;
+        let value = result.unwrap();
+        assert!(value >= 2, "should have succeeded after attempts");
+    }
+
+    #[tokio::test]
+    async fn wait_for_max_retries_exhausted() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+
+        let condition = WaitCondition::new("never ready", move || {
+            let n = counter2.fetch_add(1, Ordering::SeqCst);
+            async move {
+                WaitFor::<()>::not_ready(Some(format!("attempt={n}")))
+            }
+        });
+
+        let backoff = Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(5),
+            factor: 2,
+            max_retries: Some(3),
+        };
+
+        let result = wait_for(condition, Duration::from_secs(10), backoff).await;
+        let err = result.expect_err("should exhaust retries");
+        assert!(err.retries <= 3, "retries={} should be <= 3", err.retries);
+        assert!(err.expected.contains("never ready"));
+        assert!(err.last_observed.is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_succeeds() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+
+        let result = wait_for_condition(
+            "counter reaches 2",
+            move || {
+                let n = counter2.fetch_add(1, Ordering::SeqCst);
+                async move { n >= 1 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_times_out() {
+        let result = wait_for_condition(
+            "impossible",
+            || async { false },
+            Duration::from_millis(10),
+        )
+        .await;
+        let err = result.expect_err("should timeout");
+        assert!(err.expected.contains("impossible"));
+        assert!(err.retries >= 1);
     }
 
     #[tokio::test]
@@ -348,5 +548,86 @@ mod tests {
 
         let result = wait_for_quiescence(signals, Duration::from_millis(0)).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn wait_for_quiescence_timeout_with_pending_work() {
+        let signals = QuiescenceState {
+            pending: 5,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_millis(100),
+        };
+
+        let result = wait_for_quiescence(signals, Duration::from_millis(10)).await;
+        let err = result.expect_err("should timeout with pending work");
+        assert!(err.expected.contains("quiescence"));
+        assert!(err.last_observed.is_some());
+        let obs = err.last_observed.unwrap();
+        assert!(obs.contains("pending=5"), "should report pending count: {obs}");
+    }
+
+    #[test]
+    fn quiescence_state_quiet_with_no_activity() {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: None,
+            quiet_window: Duration::from_secs(10),
+        };
+        assert!(state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_state_not_quiet_with_pending() {
+        let state = QuiescenceState {
+            pending: 1,
+            last_activity: None,
+            quiet_window: Duration::from_millis(0),
+        };
+        assert!(!state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_state_not_quiet_within_window() {
+        let state = QuiescenceState {
+            pending: 0,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_secs(60),
+        };
+        // Recent activity + 60s window = not quiet yet
+        assert!(!state.is_quiet_at(Instant::now()));
+    }
+
+    #[test]
+    fn quiescence_describe_includes_fields() {
+        let state = QuiescenceState {
+            pending: 3,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_millis(500),
+        };
+        let desc = state.describe_at(Instant::now());
+        assert!(desc.contains("pending=3"));
+        assert!(desc.contains("quiet_window_ms=500"));
+    }
+
+    #[test]
+    fn wait_for_enum_constructors() {
+        let ready: WaitFor<i32> = WaitFor::ready(42);
+        assert!(matches!(ready, WaitFor::Ready(42)));
+
+        let not_ready: WaitFor<i32> = WaitFor::not_ready(Some("waiting".to_string()));
+        assert!(matches!(
+            not_ready,
+            WaitFor::NotReady {
+                last_observed: Some(_)
+            }
+        ));
+
+        let not_ready_none: WaitFor<i32> = WaitFor::not_ready(None::<String>);
+        assert!(matches!(
+            not_ready_none,
+            WaitFor::NotReady {
+                last_observed: None
+            }
+        ));
     }
 }
