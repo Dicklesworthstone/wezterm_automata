@@ -8252,7 +8252,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     use wa_core::diagnostic::{DiagnosticOptions, generate_bundle};
 
                     // Resolve output path
-                    let output_path = output.map(PathBuf::from);
+                    let output_path = output;
 
                     // If output path exists and --force not set, refuse
                     if let Some(ref path) = output_path {
