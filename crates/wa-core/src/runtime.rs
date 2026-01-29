@@ -269,6 +269,9 @@ impl ObservationRuntime {
 
         let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
 
+        // Clone capture_tx for queue depth instrumentation before moving it
+        let capture_tx_probe = capture_tx.clone();
+
         // Spawn discovery task
         let discovery_handle = self.spawn_discovery_task();
 
@@ -297,6 +300,7 @@ impl ObservationRuntime {
             config_tx: self.config_tx.clone(),
             event_bus: self.event_bus.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
+            capture_tx: capture_tx_probe,
         })
     }
 
@@ -842,9 +846,33 @@ pub struct RuntimeHandle {
     pub event_bus: Option<Arc<EventBus>>,
     /// Heartbeat registry for watchdog monitoring
     pub heartbeats: Arc<HeartbeatRegistry>,
+    /// Capture channel sender (cloned for queue depth instrumentation)
+    capture_tx: mpsc::Sender<CaptureEvent>,
 }
 
+/// Backpressure warning threshold as a fraction of channel capacity.
+///
+/// When queue depth exceeds this fraction of max capacity, a warning is
+/// included in the health snapshot.  0.75 = warn at 75% full.
+const BACKPRESSURE_WARN_RATIO: f64 = 0.75;
+
 impl RuntimeHandle {
+    /// Current capture channel queue depth (pending items waiting for persistence).
+    pub fn capture_queue_depth(&self) -> usize {
+        self.capture_tx.max_capacity() - self.capture_tx.capacity()
+    }
+
+    /// Maximum capture channel capacity.
+    pub fn capture_queue_capacity(&self) -> usize {
+        self.capture_tx.max_capacity()
+    }
+
+    /// Current write queue depth (pending commands for the storage writer thread).
+    pub async fn write_queue_depth(&self) -> usize {
+        let storage_guard = self.storage.lock().await;
+        storage_guard.write_queue_depth()
+    }
+
     /// Wait for all tasks to complete.
     pub async fn join(self) {
         let _ = self.discovery.await;
@@ -949,19 +977,54 @@ impl RuntimeHandle {
                 .collect()
         };
 
-        // Check DB writability with a lightweight health check
-        let db_writable = {
+        // Measure queue depths for backpressure visibility
+        let capture_depth = self.capture_queue_depth();
+        let capture_cap = self.capture_queue_capacity();
+
+        let (write_depth, write_cap, db_writable) = {
             let storage_guard = self.storage.lock().await;
-            storage_guard.is_writable().await
+            let wd = storage_guard.write_queue_depth();
+            let wc = storage_guard.write_queue_capacity();
+            let writable = storage_guard.is_writable().await;
+            (wd, wc, writable)
         };
+
+        // Generate backpressure warnings
+        let mut warnings = Vec::new();
+
+        #[allow(clippy::cast_precision_loss)]
+        if capture_cap > 0 {
+            let ratio = capture_depth as f64 / capture_cap as f64;
+            if ratio >= BACKPRESSURE_WARN_RATIO {
+                warnings.push(format!(
+                    "Capture queue backpressure: {capture_depth}/{capture_cap} ({:.0}%)",
+                    ratio * 100.0
+                ));
+            }
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        if write_cap > 0 {
+            let ratio = write_depth as f64 / write_cap as f64;
+            if ratio >= BACKPRESSURE_WARN_RATIO {
+                warnings.push(format!(
+                    "Write queue backpressure: {write_depth}/{write_cap} ({:.0}%)",
+                    ratio * 100.0
+                ));
+            }
+        }
+
+        if !db_writable {
+            warnings.push("Database is not writable".to_string());
+        }
 
         let snapshot = HealthSnapshot {
             timestamp: epoch_ms_u64(),
             observed_panes,
-            capture_queue_depth: 0, // Not easily accessible after start
-            write_queue_depth: 0,
+            capture_queue_depth: capture_depth,
+            write_queue_depth: write_depth,
             last_seq_by_pane,
-            warnings: vec![],
+            warnings,
             ingest_lag_avg_ms: self.metrics.avg_ingest_lag_ms(),
             ingest_lag_max_ms: self.metrics.max_ingest_lag_ms(),
             db_writable,
@@ -1199,5 +1262,106 @@ mod tests {
         assert_eq!(snapshot.ingest_lag_max_ms, 50);
         assert!(snapshot.db_writable);
         assert!(snapshot.db_last_write_at.is_some());
+    }
+
+    // =========================================================================
+    // Backpressure Instrumentation Tests (wa-upg.12.2)
+    // =========================================================================
+
+    #[test]
+    fn backpressure_warn_ratio_is_valid() {
+        assert!(BACKPRESSURE_WARN_RATIO > 0.0);
+        assert!(BACKPRESSURE_WARN_RATIO < 1.0);
+    }
+
+    #[test]
+    fn mpsc_queue_depth_computation_is_correct() {
+        // Validates the max_capacity - capacity pattern used by RuntimeHandle
+        let (tx, _rx) = mpsc::channel::<u8>(16);
+        let max_cap = tx.max_capacity();
+        assert_eq!(max_cap, 16);
+
+        // Empty queue: depth should be 0
+        let depth = max_cap - tx.capacity();
+        assert_eq!(depth, 0);
+    }
+
+    #[tokio::test]
+    async fn mpsc_queue_depth_increases_with_sends() {
+        let (tx, mut rx) = mpsc::channel::<u8>(16);
+
+        // Send some items
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        tx.send(3).await.unwrap();
+
+        let depth = tx.max_capacity() - tx.capacity();
+        assert_eq!(depth, 3);
+
+        // Drain one item, depth should decrease
+        let _ = rx.recv().await;
+        let depth = tx.max_capacity() - tx.capacity();
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn backpressure_warning_fires_above_threshold() {
+        // Test the same logic used in update_health_snapshot
+        let capacity = 100usize;
+        let depth_below = 74usize; // 74% — below 75%
+        let depth_at = 75usize; // 75% — at threshold
+        let depth_above = 80usize; // 80% — above threshold
+
+        #[allow(clippy::cast_precision_loss)]
+        let ratio_below = depth_below as f64 / capacity as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let ratio_at = depth_at as f64 / capacity as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let ratio_above = depth_above as f64 / capacity as f64;
+
+        assert!(ratio_below < BACKPRESSURE_WARN_RATIO, "74% should not trigger warning");
+        assert!(ratio_at >= BACKPRESSURE_WARN_RATIO, "75% should trigger warning");
+        assert!(ratio_above >= BACKPRESSURE_WARN_RATIO, "80% should trigger warning");
+    }
+
+    #[test]
+    fn backpressure_warning_message_format() {
+        // Verify the warning format matches what update_health_snapshot produces
+        let depth = 80usize;
+        let cap = 100usize;
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = depth as f64 / cap as f64;
+
+        let warning = format!(
+            "Capture queue backpressure: {depth}/{cap} ({:.0}%)",
+            ratio * 100.0
+        );
+
+        assert!(warning.contains("Capture queue backpressure"));
+        assert!(warning.contains("80/100"));
+        assert!(warning.contains("80%"));
+    }
+
+    #[test]
+    fn health_snapshot_with_queue_depths() {
+        use crate::crash::HealthSnapshot;
+
+        let snapshot = HealthSnapshot {
+            timestamp: 0,
+            observed_panes: 1,
+            capture_queue_depth: 500,
+            write_queue_depth: 200,
+            last_seq_by_pane: vec![],
+            warnings: vec!["Capture queue backpressure: 500/1024 (49%)".to_string()],
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: None,
+        };
+
+        assert_eq!(snapshot.capture_queue_depth, 500);
+        assert_eq!(snapshot.write_queue_depth, 200);
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert!(snapshot.warnings[0].contains("backpressure"));
     }
 }

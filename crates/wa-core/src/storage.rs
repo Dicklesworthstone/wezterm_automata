@@ -2841,6 +2841,19 @@ impl StorageHandle {
         Ok(deleted)
     }
 
+    /// Current write queue depth (pending commands waiting for the writer thread).
+    ///
+    /// Computed as `max_capacity - available_capacity`.  Zero means the writer
+    /// is idle; approaching `write_queue_size` means backpressure.
+    pub fn write_queue_depth(&self) -> usize {
+        self.write_tx.max_capacity() - self.write_tx.capacity()
+    }
+
+    /// Maximum write queue capacity (from `StorageConfig.write_queue_size`).
+    pub fn write_queue_capacity(&self) -> usize {
+        self.write_tx.max_capacity()
+    }
+
     /// Vacuum the database (explicit)
     pub async fn vacuum(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -9647,6 +9660,65 @@ mod storage_handle_tests {
         assert_eq!(report.inconsistent_panes, 2); // All panes marked
         assert!(!report.panes[0].fts_consistent);
         assert!(!report.panes[1].fts_consistent);
+    }
+}
+
+// =============================================================================
+// Queue Depth Instrumentation Tests (wa-upg.12.2)
+// =============================================================================
+
+#[cfg(test)]
+mod queue_depth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static QD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_path() -> String {
+        let id = QD_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        dir.join(format!("wa_qd_test_{id}_{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn write_queue_depth_starts_at_zero() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        assert_eq!(handle.write_queue_depth(), 0);
+        assert!(handle.write_queue_capacity() > 0);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn write_queue_capacity_matches_config() {
+        let db_path = temp_db_path();
+        let mut config = StorageConfig::default();
+        config.write_queue_size = 64;
+        let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        assert_eq!(handle.write_queue_capacity(), 64);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn write_queue_depth_is_bounded() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Queue depth should always be <= capacity
+        let depth = handle.write_queue_depth();
+        let cap = handle.write_queue_capacity();
+        assert!(depth <= cap, "depth ({depth}) should be <= capacity ({cap})");
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
     }
 }
 
