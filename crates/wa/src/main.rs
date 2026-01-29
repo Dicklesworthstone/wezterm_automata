@@ -6225,6 +6225,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     payload["health"] = serde_json::to_value(&snap)
                         .unwrap_or(serde_json::Value::Null);
                 }
+                if let Some(crash) =
+                    wa_core::crash::latest_crash_bundle(&layout.crash_dir)
+                {
+                    let mut crash_info = serde_json::json!({
+                        "bundle_path": crash.path.display().to_string(),
+                    });
+                    if let Some(ref report) = crash.report {
+                        crash_info["message"] = serde_json::Value::String(report.message.clone());
+                        crash_info["timestamp"] = serde_json::Value::Number(report.timestamp.into());
+                        if let Some(ref loc) = report.location {
+                            crash_info["location"] = serde_json::Value::String(loc.clone());
+                        }
+                    }
+                    if let Some(ref manifest) = crash.manifest {
+                        crash_info["created_at"] = serde_json::Value::String(manifest.created_at.clone());
+                    }
+                    payload["latest_crash"] = crash_info;
+                }
                 println!(
                     "{}",
                     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
@@ -6322,6 +6340,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let health_output =
                                     HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
                                 print!("{health_output}");
+                            }
+                        }
+
+                        // Show latest crash bundle if any
+                        if let Some(crash) =
+                            wa_core::crash::latest_crash_bundle(&layout.crash_dir)
+                        {
+                            if !output_format.is_json() {
+                                println!();
+                                let msg = crash
+                                    .report
+                                    .as_ref()
+                                    .map(|r| r.message.as_str())
+                                    .unwrap_or("unknown");
+                                let path = crash.path.display();
+                                println!("Last crash: {msg}");
+                                println!("  Bundle: {path}");
                             }
                         }
                     }
