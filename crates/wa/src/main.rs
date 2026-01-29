@@ -1271,6 +1271,8 @@ const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
+/// Cooldown period between account refreshes (milliseconds)
+const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RobotOutputFormat {
@@ -3246,6 +3248,26 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Check if a refresh is rate-limited based on the most recent refresh timestamp.
+///
+/// Returns `Some((seconds_since_last, seconds_to_wait))` if rate-limited,
+/// `None` if refresh is allowed.
+fn check_refresh_cooldown(
+    most_recent_refresh_ms: i64,
+    now_ms_val: i64,
+    cooldown_ms: i64,
+) -> Option<(i64, i64)> {
+    if most_recent_refresh_ms <= 0 {
+        return None;
+    }
+    let elapsed = now_ms_val - most_recent_refresh_ms;
+    if elapsed < cooldown_ms {
+        Some((elapsed / 1000, (cooldown_ms - elapsed) / 1000))
+    } else {
+        None
+    }
 }
 
 /// Apply tail truncation to text, returning the truncated text and truncation info
@@ -5875,6 +5897,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
                                     };
+
+                                    // Rate-limit: check last refresh time in DB
+                                    let db_path = layout.db_path.to_string_lossy();
+                                    {
+                                        if let Ok(storage_check) =
+                                            wa_core::storage::StorageHandle::new(&db_path).await
+                                        {
+                                            if let Ok(accounts) = storage_check
+                                                .get_accounts_by_service(&service)
+                                                .await
+                                            {
+                                                let now_check = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis()
+                                                    as i64;
+                                                let most_recent = accounts
+                                                    .iter()
+                                                    .map(|a| a.last_refreshed_at)
+                                                    .max()
+                                                    .unwrap_or(0);
+                                                if let Some((secs_ago, wait_secs)) =
+                                                    check_refresh_cooldown(
+                                                        most_recent,
+                                                        now_check,
+                                                        ROBOT_REFRESH_COOLDOWN_MS,
+                                                    )
+                                                {
+                                                    let response =
+                                                        RobotResponse::<RobotAccountsRefreshData>::error_with_code(
+                                                            "robot.rate_limited",
+                                                            format!(
+                                                                "Refresh rate limited: last refresh was {secs_ago}s ago (cooldown: {}s)",
+                                                                ROBOT_REFRESH_COOLDOWN_MS / 1000
+                                                            ),
+                                                            Some(format!(
+                                                                "Wait {wait_secs}s before refreshing again, or use 'wa robot accounts list' to see cached data."
+                                                            )),
+                                                            elapsed_ms(start),
+                                                        );
+                                                    print_robot_response(
+                                                        &response, format, stats,
+                                                    )?;
+                                                    let _ = storage_check.shutdown().await;
+                                                    return Ok(());
+                                                }
+                                            }
+                                            let _ = storage_check.shutdown().await;
+                                        }
+                                    }
 
                                     // Call caut refresh
                                     let caut = wa_core::caut::CautClient::new();
@@ -12873,6 +12945,207 @@ mod tests {
         let acc = &json["accounts"][0];
         assert_eq!(acc["account_id"].as_str().unwrap(), "test-acc");
         assert!((acc["percent_remaining"].as_f64().unwrap() - 75.0).abs() < 0.001);
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    // =========================================================================
+    // Robot accounts refresh + rate limiting tests (wa-nu4.1.5.5)
+    // =========================================================================
+
+    #[test]
+    fn refresh_cooldown_allows_when_no_prior_refresh() {
+        // No prior refresh (timestamp = 0) should always be allowed
+        assert!(check_refresh_cooldown(0, 100_000, 30_000).is_none());
+    }
+
+    #[test]
+    fn refresh_cooldown_allows_after_cooldown_expires() {
+        let last_refresh = 100_000;
+        let now = 131_000; // 31s later, cooldown is 30s
+        assert!(check_refresh_cooldown(last_refresh, now, 30_000).is_none());
+    }
+
+    #[test]
+    fn refresh_cooldown_blocks_within_cooldown() {
+        let last_refresh = 100_000;
+        let now = 110_000; // 10s later, cooldown is 30s
+        let result = check_refresh_cooldown(last_refresh, now, 30_000);
+        assert!(result.is_some());
+        let (secs_ago, wait_secs) = result.unwrap();
+        assert_eq!(secs_ago, 10);
+        assert_eq!(wait_secs, 20);
+    }
+
+    #[test]
+    fn refresh_cooldown_blocks_at_exact_boundary() {
+        let last_refresh = 100_000;
+        let now = 129_999; // 29.999s later, still within 30s
+        let result = check_refresh_cooldown(last_refresh, now, 30_000);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn refresh_cooldown_allows_at_exact_boundary() {
+        let last_refresh = 100_000;
+        let now = 130_000; // exactly 30s later
+        assert!(check_refresh_cooldown(last_refresh, now, 30_000).is_none());
+    }
+
+    #[test]
+    fn refresh_cooldown_allows_negative_timestamp() {
+        // Negative last_refresh should be treated as no prior refresh
+        assert!(check_refresh_cooldown(-1, 100_000, 30_000).is_none());
+    }
+
+    #[test]
+    fn refresh_cooldown_constant_is_30_seconds() {
+        assert_eq!(ROBOT_REFRESH_COOLDOWN_MS, 30_000);
+    }
+
+    #[tokio::test]
+    async fn robot_refresh_db_mirror_round_trip() {
+        // Simulate the refresh → DB mirror path:
+        // Parse CautRefresh fixture → from_caut → upsert → verify DB state
+        let (storage, db_path) = setup_storage("refresh_mirror").await;
+
+        let fixture = wa_core::caut::CautRefresh {
+            service: Some("openai".to_string()),
+            refreshed_at: Some("2026-01-28T12:00:00Z".to_string()),
+            accounts: vec![
+                wa_core::caut::CautAccountUsage {
+                    id: Some("acc-1".to_string()),
+                    name: Some("Primary".to_string()),
+                    percent_remaining: Some(85.0),
+                    tokens_used: Some(1500),
+                    tokens_remaining: Some(8500),
+                    tokens_limit: Some(10000),
+                    ..Default::default()
+                },
+                wa_core::caut::CautAccountUsage {
+                    id: Some("acc-2".to_string()),
+                    name: Some("Backup".to_string()),
+                    percent_remaining: Some(20.0),
+                    tokens_used: Some(8000),
+                    tokens_remaining: Some(2000),
+                    tokens_limit: Some(10000),
+                    ..Default::default()
+                },
+            ],
+            extra: Default::default(),
+        };
+
+        let now = 1706400000000_i64; // fixed timestamp for determinism
+
+        // Mirror into DB (same as handler does)
+        let mut account_infos = Vec::new();
+        for usage in &fixture.accounts {
+            let record = wa_core::accounts::AccountRecord::from_caut(
+                usage,
+                wa_core::caut::CautService::OpenAI,
+                now,
+            );
+            storage.upsert_account(record.clone()).await.unwrap();
+            account_infos.push(RobotAccountInfo {
+                account_id: record.account_id,
+                service: record.service,
+                name: record.name,
+                percent_remaining: record.percent_remaining,
+                reset_at: record.reset_at,
+                tokens_used: record.tokens_used,
+                tokens_remaining: record.tokens_remaining,
+                tokens_limit: record.tokens_limit,
+                last_refreshed_at: record.last_refreshed_at,
+                last_used_at: record.last_used_at,
+            });
+        }
+
+        // Build response
+        let data = RobotAccountsRefreshData {
+            service: "openai".to_string(),
+            refreshed_count: account_infos.len(),
+            refreshed_at: fixture.refreshed_at,
+            accounts: account_infos,
+        };
+        let json = serde_json::to_value(&data).unwrap();
+
+        // Verify response structure
+        assert_eq!(json["service"].as_str().unwrap(), "openai");
+        assert_eq!(json["refreshed_count"].as_u64().unwrap(), 2);
+        assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
+
+        // Verify DB state
+        let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
+        assert_eq!(db_accounts.len(), 2);
+        // Sorted by percent_remaining DESC
+        assert_eq!(db_accounts[0].account_id, "acc-1");
+        assert!((db_accounts[0].percent_remaining - 85.0).abs() < 0.001);
+        assert_eq!(db_accounts[1].account_id, "acc-2");
+        assert!((db_accounts[1].percent_remaining - 20.0).abs() < 0.001);
+
+        // Verify DB mirror is idempotent (refresh again with same data)
+        for usage in &fixture.accounts {
+            let record = wa_core::accounts::AccountRecord::from_caut(
+                usage,
+                wa_core::caut::CautService::OpenAI,
+                now + 1000,
+            );
+            storage.upsert_account(record).await.unwrap();
+        }
+        let db_after = storage.get_accounts_by_service("openai").await.unwrap();
+        assert_eq!(db_after.len(), 2); // still 2, not 4
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_refresh_db_mirror_updates_existing() {
+        // Verify that refresh updates percent_remaining for existing accounts
+        let (storage, db_path) = setup_storage("refresh_update").await;
+
+        let now = 1706400000000_i64;
+
+        // Initial insert
+        let initial = wa_core::accounts::AccountRecord {
+            id: 0,
+            account_id: "acc-1".to_string(),
+            service: "openai".to_string(),
+            name: Some("Test".to_string()),
+            percent_remaining: 90.0,
+            reset_at: None,
+            tokens_used: Some(1000),
+            tokens_remaining: Some(9000),
+            tokens_limit: Some(10000),
+            last_refreshed_at: now,
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        storage.upsert_account(initial).await.unwrap();
+
+        // Simulate refresh with new usage data
+        let refreshed_usage = wa_core::caut::CautAccountUsage {
+            id: Some("acc-1".to_string()),
+            name: Some("Test".to_string()),
+            percent_remaining: Some(50.0), // changed
+            tokens_used: Some(5000),       // changed
+            tokens_remaining: Some(5000),  // changed
+            tokens_limit: Some(10000),
+            ..Default::default()
+        };
+
+        let record = wa_core::accounts::AccountRecord::from_caut(
+            &refreshed_usage,
+            wa_core::caut::CautService::OpenAI,
+            now + 60_000, // 1 minute later
+        );
+        storage.upsert_account(record).await.unwrap();
+
+        let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
+        assert_eq!(db_accounts.len(), 1);
+        assert!((db_accounts[0].percent_remaining - 50.0).abs() < 0.001);
+        assert_eq!(db_accounts[0].tokens_used, Some(5000));
+        assert_eq!(db_accounts[0].last_refreshed_at, now + 60_000);
 
         cleanup_storage(storage, &db_path).await;
     }
