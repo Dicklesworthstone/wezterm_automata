@@ -572,6 +572,278 @@ impl SummaryRenderer {
 }
 
 // =============================================================================
+// Rules Renderer
+// =============================================================================
+
+/// Lightweight display item for a single rule (serializable for JSON output)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuleListItem {
+    /// Stable rule ID (e.g., "codex.usage_reached")
+    pub id: String,
+    /// Agent type (codex, claude_code, gemini, wezterm)
+    pub agent_type: String,
+    /// Event type emitted on match
+    pub event_type: String,
+    /// Severity level (info, warning, critical)
+    pub severity: String,
+    /// Human-readable description
+    pub description: String,
+    /// Suggested workflow name (if any)
+    pub workflow: Option<String>,
+    /// Number of anchors in the rule
+    pub anchor_count: usize,
+    /// Whether the rule has a regex extractor
+    pub has_regex: bool,
+}
+
+/// Result item from testing text against rules
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuleTestMatch {
+    /// Rule ID that matched
+    pub rule_id: String,
+    /// Agent type
+    pub agent_type: String,
+    /// Event type
+    pub event_type: String,
+    /// Severity
+    pub severity: String,
+    /// Confidence score (0.0–1.0)
+    pub confidence: f64,
+    /// The text fragment that matched
+    pub matched_text: String,
+    /// Extracted structured data (if any)
+    pub extracted: Option<serde_json::Value>,
+}
+
+/// Detail view for a single rule
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuleDetail {
+    pub id: String,
+    pub agent_type: String,
+    pub event_type: String,
+    pub severity: String,
+    pub description: String,
+    pub anchors: Vec<String>,
+    pub regex: Option<String>,
+    pub workflow: Option<String>,
+    pub remediation: Option<String>,
+    pub manual_fix: Option<String>,
+    pub learn_more_url: Option<String>,
+}
+
+/// Renderer for pattern rule listings
+pub struct RulesListRenderer;
+
+impl RulesListRenderer {
+    /// Render a list of rules as a table
+    #[must_use]
+    pub fn render(rules: &[RuleListItem], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(rules).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if rules.is_empty() {
+            return style.dim("No rules found\n");
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Rules ({}):\n", rules.len())));
+
+        let mut table = Table::new(vec![
+            Column::new("ID").min_width(20),
+            Column::new("AGENT").min_width(12),
+            Column::new("EVENT").min_width(16),
+            Column::new("SEV").min_width(8),
+            Column::new("REGEX").min_width(5),
+            Column::new("WORKFLOW").min_width(12),
+        ])
+        .with_format(ctx.format);
+
+        for rule in rules {
+            let severity = style.severity(&rule.severity, &rule.severity);
+            let has_regex = if rule.has_regex {
+                style.green("yes")
+            } else {
+                style.gray("-")
+            };
+            let workflow = rule
+                .workflow
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+
+            table.add_row(vec![
+                rule.id.clone(),
+                rule.agent_type.clone(),
+                rule.event_type.clone(),
+                severity,
+                has_regex,
+                workflow,
+            ]);
+        }
+
+        output.push_str(&table.render());
+
+        if ctx.verbose {
+            output.push_str(&style.dim("\n(use 'wa rules show <ID>' for full details)\n"));
+        }
+
+        output
+    }
+
+    /// Render a verbose list with descriptions
+    #[must_use]
+    pub fn render_verbose(rules: &[RuleListItem], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(rules).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if rules.is_empty() {
+            return style.dim("No rules found\n");
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Rules ({}):\n\n", rules.len())));
+
+        for rule in rules {
+            let severity = style.severity(&rule.severity, &rule.severity);
+            output.push_str(&format!(
+                "  {} [{}] {}\n",
+                style.bold(&rule.id),
+                severity,
+                rule.agent_type,
+            ));
+            output.push_str(&format!("    {}\n", rule.description));
+            if let Some(wf) = &rule.workflow {
+                output.push_str(&format!("    Workflow: {wf}\n"));
+            }
+            output.push('\n');
+        }
+
+        output
+    }
+}
+
+/// Renderer for rule test results
+pub struct RulesTestRenderer;
+
+impl RulesTestRenderer {
+    /// Render test results (matches from testing text against rules)
+    #[must_use]
+    pub fn render(matches: &[RuleTestMatch], text_len: usize, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            let wrapper = serde_json::json!({
+                "text_length": text_len,
+                "match_count": matches.len(),
+                "matches": matches,
+            });
+            return serde_json::to_string_pretty(&wrapper).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if matches.is_empty() {
+            return format!(
+                "{}\n",
+                style.dim(&format!("No matches ({text_len} bytes tested)"))
+            );
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!(
+            "Matches ({} hit{}, {} bytes tested):\n\n",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "s" },
+            text_len,
+        )));
+
+        for (i, m) in matches.iter().enumerate() {
+            let severity = style.severity(&m.severity, &m.severity);
+            output.push_str(&format!(
+                "  {}. {} [{}] confidence={:.2}\n",
+                i + 1,
+                style.bold(&m.rule_id),
+                severity,
+                m.confidence,
+            ));
+            output.push_str(&format!("     Agent: {}  Event: {}\n", m.agent_type, m.event_type));
+            output.push_str(&format!("     Matched: \"{}\"\n", truncate(&m.matched_text, 80)));
+
+            if let Some(ref extracted) = m.extracted {
+                if !extracted.is_null()
+                    && !extracted
+                        .as_object()
+                        .is_some_and(serde_json::Map::is_empty)
+                {
+                    let json =
+                        serde_json::to_string(extracted).unwrap_or_else(|_| "{}".to_string());
+                    output.push_str(&format!("     Extracted: {}\n", truncate(&json, 100)));
+                }
+            }
+
+            output.push('\n');
+        }
+
+        output
+    }
+}
+
+/// Renderer for rule detail view
+pub struct RuleDetailRenderer;
+
+impl RuleDetailRenderer {
+    /// Render a single rule's full details
+    #[must_use]
+    pub fn render(detail: &RuleDetail, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(detail).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+
+        let severity = style.severity(&detail.severity, &detail.severity);
+
+        output.push_str(&style.bold(&format!("Rule: {}\n", detail.id)));
+        output.push_str(&format!("  Agent:      {}\n", detail.agent_type));
+        output.push_str(&format!("  Event:      {}\n", detail.event_type));
+        output.push_str(&format!("  Severity:   {severity}\n"));
+        output.push_str(&format!("  Description: {}\n", detail.description));
+
+        output.push_str(&format!(
+            "\n  Anchors ({}):\n",
+            detail.anchors.len()
+        ));
+        for anchor in &detail.anchors {
+            output.push_str(&format!("    - \"{anchor}\"\n"));
+        }
+
+        if let Some(ref regex) = detail.regex {
+            output.push_str(&format!("\n  Regex: {regex}\n"));
+        }
+
+        if let Some(ref workflow) = detail.workflow {
+            output.push_str(&format!("\n  Workflow: {workflow}\n"));
+        }
+        if let Some(ref remediation) = detail.remediation {
+            output.push_str(&format!("  Remediation: {remediation}\n"));
+        }
+        if let Some(ref manual_fix) = detail.manual_fix {
+            output.push_str(&format!("  Manual fix: {manual_fix}\n"));
+        }
+        if let Some(ref url) = detail.learn_more_url {
+            output.push_str(&format!("  Learn more: {url}\n"));
+        }
+
+        output
+    }
+}
+
+// =============================================================================
 // Audit List Renderer
 // =============================================================================
 

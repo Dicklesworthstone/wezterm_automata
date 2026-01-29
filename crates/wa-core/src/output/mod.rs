@@ -36,6 +36,7 @@ pub use error_renderer::{ErrorRenderer, get_code_for_error, render_error};
 pub use format::{OutputFormat, detect_format};
 pub use renderers::{
     AuditListRenderer, EventListRenderer, PaneTableRenderer, Render, RenderContext,
-    SearchResultRenderer, WorkflowResultRenderer,
+    RuleDetail, RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer,
+    RulesTestRenderer, SearchResultRenderer, WorkflowResultRenderer,
 };
 pub use table::{Alignment, Column, Table};

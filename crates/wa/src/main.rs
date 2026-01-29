@@ -361,6 +361,12 @@ enum Commands {
         command: BackupCommands,
     },
 
+    /// Pattern detection rules (list, test, show)
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommands,
+    },
+
     /// Launch the interactive TUI (requires --features tui)
     #[cfg(feature = "tui")]
     Tui {
@@ -677,6 +683,45 @@ enum WorkflowCommands {
         /// Include action plan and step logs
         #[arg(long, short)]
         verbose: bool,
+    },
+}
+
+/// Human CLI rules subcommands
+#[derive(Subcommand)]
+enum RulesCommands {
+    /// List all pattern detection rules
+    List {
+        /// Filter by agent type (codex, claude_code, gemini, wezterm)
+        #[arg(long, short = 'a')]
+        agent_type: Option<String>,
+
+        /// Show descriptions for each rule
+        #[arg(long, short)]
+        verbose: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Test text against pattern rules
+    Test {
+        /// Text to test against all rules
+        text: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Show full details for a specific rule
+    Show {
+        /// Rule ID (e.g., "codex.usage_reached")
+        rule_id: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
     },
 }
 
@@ -7029,6 +7074,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Backup { command }) => {
             handle_backup_command(command, &layout, &workspace_root).await?;
+        }
+
+        Some(Commands::Rules { command }) => {
+            handle_rules_command(command)?;
         }
 
         #[cfg(feature = "tui")]
