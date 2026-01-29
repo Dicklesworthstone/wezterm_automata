@@ -483,6 +483,21 @@ SEE ALSO:
         json: bool,
     },
 
+    /// Generate a diagnostic bundle for bug reports
+    #[command(after_help = r#"EXAMPLES:
+    wa diag bundle                        Generate diagnostic bundle
+    wa diag bundle --output /tmp/diag     Write bundle to specific directory
+    wa diag bundle --force                Overwrite existing output directory
+    wa diag bundle --events 200           Include more recent events
+
+SEE ALSO:
+    wa doctor     Run diagnostics
+    wa status     System and pane overview"#)]
+    Diag {
+        #[command(subcommand)]
+        command: DiagCommands,
+    },
+
     /// Export an incident bundle for sharing or analysis
     #[command(after_help = r#"EXAMPLES:
     wa reproduce                      Export latest crash as incident bundle
@@ -659,6 +674,8 @@ SEE ALSO:
     wa export segments                    Export all output segments
     wa export events --pane-id 3          Export events for pane 3
     wa export audit --since 1706000000   Export audit since timestamp
+    wa export audit --actor workflow      Export workflow-initiated audit actions
+    wa export audit --action auth_required Export auth-related audit entries
     wa export workflows --limit 50        Export last 50 workflows
     wa export sessions --no-redact        Export sessions without redaction (WARNING)
     wa export reservations --pretty       Pretty-print JSON output
@@ -700,6 +717,14 @@ SEE ALSO:
         /// Maximum number of records to export (default: 10000)
         #[arg(long, short = 'l')]
         limit: Option<usize>,
+
+        /// Filter by actor kind (audit export only, e.g. "workflow", "operator")
+        #[arg(long)]
+        actor: Option<String>,
+
+        /// Filter by action kind (audit export only, e.g. "auth_required", "send_text")
+        #[arg(long)]
+        action: Option<String>,
 
         /// Disable secret redaction (WARNING: may expose sensitive data)
         #[arg(long)]
@@ -1174,6 +1199,32 @@ enum RulesCommands {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagCommands {
+    /// Generate a sanitized diagnostic bundle for bug reports
+    Bundle {
+        /// Output directory (default: workspace diag_dir)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Overwrite existing output directory
+        #[arg(long)]
+        force: bool,
+
+        /// Maximum number of recent events to include (default: 100)
+        #[arg(long, default_value = "100")]
+        events: usize,
+
+        /// Maximum number of recent audit actions to include (default: 50)
+        #[arg(long, default_value = "50")]
+        audit: usize,
+
+        /// Maximum number of recent workflow executions to include (default: 50)
+        #[arg(long, default_value = "50")]
+        workflows: usize,
     },
 }
 
@@ -8189,6 +8240,83 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Diag { command }) => {
+            match command {
+                DiagCommands::Bundle {
+                    output,
+                    force,
+                    events,
+                    audit,
+                    workflows,
+                } => {
+                    use wa_core::diagnostic::{DiagnosticOptions, generate_bundle};
+
+                    // Resolve output path
+                    let output_path = output.map(PathBuf::from);
+
+                    // If output path exists and --force not set, refuse
+                    if let Some(ref path) = output_path {
+                        if path.exists() && !force {
+                            eprintln!(
+                                "Error: Output directory already exists: {}",
+                                path.display()
+                            );
+                            eprintln!("Use --force to overwrite.");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    // Get workspace layout for DB path
+                    let layout = match config.workspace_layout(Some(&workspace_root)) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Error: Failed to get workspace layout: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let db_path = layout.db_path.to_string_lossy();
+                    let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Error: Failed to open storage: {e}");
+                            eprintln!("Is the database initialized? Run 'wa watch' first.");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let opts = DiagnosticOptions {
+                        event_limit: events,
+                        audit_limit: audit,
+                        workflow_limit: workflows,
+                        output: output_path,
+                    };
+
+                    eprintln!("Generating diagnostic bundle...");
+
+                    match generate_bundle(&config, &layout, &storage, &opts).await {
+                        Ok(result) => {
+                            eprintln!("Bundle generated: {}", result.output_path);
+                            eprintln!("  Files:      {}", result.file_count);
+                            eprintln!("  Total size: {} bytes", result.total_size_bytes);
+                            eprintln!();
+                            eprintln!(
+                                "All data is redacted. Safe to attach to bug reports."
+                            );
+                            // Print path on stdout for easy piping
+                            println!("{}", result.output_path);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to generate diagnostic bundle: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let _ = storage.shutdown().await;
+                }
+            }
+        }
+
         Some(Commands::Reproduce { kind, out, format }) => {
             use wa_core::crash::{IncidentKind, export_incident_bundle};
 
@@ -8726,6 +8854,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             since,
             until,
             limit,
+            actor,
+            action,
             no_redact,
             pretty,
             output,
@@ -8743,6 +8873,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+
+            // Warn about audit-only filters on non-audit kinds
+            if (actor.is_some() || action.is_some()) && export_kind != ExportKind::Audit {
+                eprintln!(
+                    "Warning: --actor and --action filters only apply to 'audit' exports; ignoring."
+                );
+            }
 
             // Warn about --no-redact
             if no_redact {
@@ -8781,6 +8918,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     until,
                     limit,
                 },
+                audit_actor: actor,
+                audit_action: action,
                 redact: !no_redact,
                 pretty,
             };

@@ -6136,6 +6136,161 @@ pub fn device_auth_outcome_to_step_result(outcome: &DeviceAuthStepOutcome) -> St
     }
 }
 
+// ============================================================================
+// Resume Session Step (wa-nu4.1.3.7)
+// ============================================================================
+//
+// After device auth completes, resume the Codex session with the saved
+// session ID and send "proceed." to continue. Verifies the session is
+// ready by waiting for a stable output marker.
+
+/// Configuration for the resume session step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResumeSessionConfig {
+    /// Template for the resume command. `{session_id}` is replaced at runtime.
+    pub resume_command_template: String,
+    /// Text to send after session resumes (triggers continuation).
+    pub proceed_text: String,
+    /// Wait for pane output to stabilize after sending the resume command (ms).
+    pub post_resume_stable_ms: u64,
+    /// Wait for pane output to stabilize after sending proceed (ms).
+    pub post_proceed_stable_ms: u64,
+    /// Maximum wait time for the resume command to take effect (ms).
+    pub resume_timeout_ms: u64,
+    /// Maximum wait time for the proceed signal to be acknowledged (ms).
+    pub proceed_timeout_ms: u64,
+}
+
+impl Default for ResumeSessionConfig {
+    fn default() -> Self {
+        Self {
+            resume_command_template: "cod resume {session_id}\n".to_string(),
+            proceed_text: "proceed.\n".to_string(),
+            post_resume_stable_ms: 3_000,
+            post_proceed_stable_ms: 5_000,
+            resume_timeout_ms: 30_000,
+            proceed_timeout_ms: 30_000,
+        }
+    }
+}
+
+/// Outcome of the resume session step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum ResumeSessionOutcome {
+    /// Session resumed and ready for continued interaction.
+    #[serde(rename = "ready")]
+    Ready {
+        /// Session ID that was resumed.
+        session_id: String,
+    },
+
+    /// Resume command sent but could not verify ready state within timeout.
+    ///
+    /// This is a soft failure — the session may still be resuming.
+    #[serde(rename = "timeout")]
+    VerifyTimeout {
+        /// Session ID attempted.
+        session_id: String,
+        /// Which phase timed out ("resume" or "proceed").
+        phase: String,
+        /// Time waited (ms).
+        waited_ms: u64,
+    },
+
+    /// Session could not be resumed due to an error.
+    #[serde(rename = "failed")]
+    Failed {
+        /// Human-readable error description.
+        error: String,
+    },
+}
+
+/// Format the resume command for a given session ID.
+///
+/// Replaces `{session_id}` in the template with the actual session ID.
+///
+/// # Panics
+///
+/// None — if `{session_id}` is not in the template, the template is returned as-is.
+#[must_use]
+pub fn format_resume_command(session_id: &str, config: &ResumeSessionConfig) -> String {
+    config
+        .resume_command_template
+        .replace("{session_id}", session_id)
+}
+
+/// Validate a session ID for resume.
+///
+/// Session IDs are hex UUIDs (e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890").
+/// Returns true if the ID has at least 8 hex characters separated by hyphens.
+#[must_use]
+pub fn validate_session_id(session_id: &str) -> bool {
+    let trimmed = session_id.trim();
+    if trimmed.len() < 8 {
+        return false;
+    }
+    // Must contain only hex chars and hyphens
+    trimmed
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Build the resume StepResult (sends resume command, waits for stable tail).
+///
+/// This returns a `StepResult::SendText` with a `StableTail` wait condition
+/// so the workflow runner handles the policy-gated injection and wait.
+#[must_use]
+pub fn build_resume_step_result(
+    session_id: &str,
+    config: &ResumeSessionConfig,
+) -> StepResult {
+    let command = format_resume_command(session_id, config);
+    StepResult::send_text_and_wait(
+        command,
+        WaitCondition::stable_tail(config.post_resume_stable_ms),
+        config.resume_timeout_ms,
+    )
+}
+
+/// Build the proceed StepResult (sends proceed text, waits for stable tail).
+///
+/// This returns a `StepResult::SendText` with a `StableTail` wait condition
+/// so the workflow runner handles the policy-gated injection and wait.
+#[must_use]
+pub fn build_proceed_step_result(config: &ResumeSessionConfig) -> StepResult {
+    StepResult::send_text_and_wait(
+        config.proceed_text.clone(),
+        WaitCondition::stable_tail(config.post_proceed_stable_ms),
+        config.proceed_timeout_ms,
+    )
+}
+
+/// Convert a [`ResumeSessionOutcome`] to a [`StepResult`] for workflow integration.
+///
+/// Mapping:
+/// - `Ready` → `StepResult::Done` (workflow complete)
+/// - `VerifyTimeout` → `StepResult::Done` with timeout info (non-fatal)
+/// - `Failed` → `StepResult::Abort`
+pub fn resume_outcome_to_step_result(outcome: &ResumeSessionOutcome) -> StepResult {
+    match outcome {
+        ResumeSessionOutcome::Ready { .. } => {
+            let json = serde_json::to_value(outcome).unwrap_or_default();
+            StepResult::Done { result: json }
+        }
+        ResumeSessionOutcome::VerifyTimeout { .. } => {
+            // Timeouts are soft failures — report but don't abort.
+            // The session may still be resuming; let the caller decide.
+            let json = serde_json::to_value(outcome).unwrap_or_default();
+            StepResult::Done { result: json }
+        }
+        ResumeSessionOutcome::Failed { error } => StepResult::Abort {
+            reason: format!("Resume session failed: {error}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11495,6 +11650,295 @@ Try again at 3:00 PM UTC.
                     result.get("elapsed_ms").and_then(|v| v.as_u64()),
                     Some(7890)
                 );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Resume Session Step Tests (wa-nu4.1.3.7)
+    // ========================================================================
+
+    mod resume_session_step_tests {
+        use super::*;
+
+        // -- ResumeSessionConfig --
+
+        #[test]
+        fn config_defaults() {
+            let config = ResumeSessionConfig::default();
+            assert!(config.resume_command_template.contains("{session_id}"));
+            assert_eq!(config.proceed_text, "proceed.\n");
+            assert_eq!(config.post_resume_stable_ms, 3_000);
+            assert_eq!(config.post_proceed_stable_ms, 5_000);
+            assert_eq!(config.resume_timeout_ms, 30_000);
+            assert_eq!(config.proceed_timeout_ms, 30_000);
+        }
+
+        #[test]
+        fn config_serde_round_trip() {
+            let config = ResumeSessionConfig::default();
+            let json = serde_json::to_string(&config).unwrap();
+            let parsed: ResumeSessionConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.resume_command_template, config.resume_command_template);
+            assert_eq!(parsed.proceed_text, config.proceed_text);
+            assert_eq!(parsed.post_resume_stable_ms, config.post_resume_stable_ms);
+        }
+
+        // -- format_resume_command --
+
+        #[test]
+        fn format_resume_command_default() {
+            let config = ResumeSessionConfig::default();
+            let cmd = format_resume_command("abc123-def456", &config);
+            assert_eq!(cmd, "cod resume abc123-def456\n");
+        }
+
+        #[test]
+        fn format_resume_command_custom_template() {
+            let config = ResumeSessionConfig {
+                resume_command_template: "codex resume {session_id} --continue\n".into(),
+                ..Default::default()
+            };
+            let cmd = format_resume_command("session-99", &config);
+            assert_eq!(cmd, "codex resume session-99 --continue\n");
+        }
+
+        #[test]
+        fn format_resume_command_no_placeholder() {
+            let config = ResumeSessionConfig {
+                resume_command_template: "fixed-command\n".into(),
+                ..Default::default()
+            };
+            let cmd = format_resume_command("ignored-id", &config);
+            assert_eq!(cmd, "fixed-command\n");
+        }
+
+        // -- validate_session_id --
+
+        #[test]
+        fn validate_session_id_valid_uuid() {
+            assert!(validate_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        }
+
+        #[test]
+        fn validate_session_id_valid_short_hex() {
+            assert!(validate_session_id("abcdef01"));
+        }
+
+        #[test]
+        fn validate_session_id_valid_with_hyphens() {
+            assert!(validate_session_id("abc-def-123"));
+        }
+
+        #[test]
+        fn validate_session_id_rejects_too_short() {
+            assert!(!validate_session_id("abc"));
+            assert!(!validate_session_id("1234567")); // 7 chars
+        }
+
+        #[test]
+        fn validate_session_id_rejects_empty() {
+            assert!(!validate_session_id(""));
+        }
+
+        #[test]
+        fn validate_session_id_rejects_non_hex() {
+            assert!(!validate_session_id("zzzzzzzz"));
+            assert!(!validate_session_id("abc!defg"));
+        }
+
+        #[test]
+        fn validate_session_id_trims_whitespace() {
+            assert!(validate_session_id("  abcdef01  "));
+        }
+
+        // -- ResumeSessionOutcome serde --
+
+        #[test]
+        fn outcome_ready_serde() {
+            let outcome = ResumeSessionOutcome::Ready {
+                session_id: "abc-123".into(),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"ready""#));
+            assert!(json.contains(r#""session_id":"abc-123""#));
+
+            let parsed: ResumeSessionOutcome = serde_json::from_str(&json).unwrap();
+            match parsed {
+                ResumeSessionOutcome::Ready { session_id } => {
+                    assert_eq!(session_id, "abc-123");
+                }
+                _ => panic!("Expected Ready variant"),
+            }
+        }
+
+        #[test]
+        fn outcome_verify_timeout_serde() {
+            let outcome = ResumeSessionOutcome::VerifyTimeout {
+                session_id: "def-456".into(),
+                phase: "proceed".into(),
+                waited_ms: 30_000,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"timeout""#));
+            assert!(json.contains(r#""phase":"proceed""#));
+            assert!(json.contains(r#""waited_ms":30000"#));
+        }
+
+        #[test]
+        fn outcome_failed_serde() {
+            let outcome = ResumeSessionOutcome::Failed {
+                error: "Policy denied".into(),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"failed""#));
+            assert!(json.contains(r#""error":"Policy denied""#));
+        }
+
+        // -- build_resume_step_result --
+
+        #[test]
+        fn resume_step_result_is_send_text() {
+            let config = ResumeSessionConfig::default();
+            let result = build_resume_step_result("abc-def-123", &config);
+            assert!(result.is_send_text());
+
+            if let StepResult::SendText {
+                text,
+                wait_for,
+                wait_timeout_ms,
+            } = result
+            {
+                assert_eq!(text, "cod resume abc-def-123\n");
+                assert!(wait_for.is_some());
+                match wait_for.unwrap() {
+                    WaitCondition::StableTail {
+                        pane_id,
+                        stable_for_ms,
+                    } => {
+                        assert_eq!(pane_id, None);
+                        assert_eq!(stable_for_ms, 3_000);
+                    }
+                    other => panic!("Expected StableTail, got {other:?}"),
+                }
+                assert_eq!(wait_timeout_ms, Some(30_000));
+            }
+        }
+
+        // -- build_proceed_step_result --
+
+        #[test]
+        fn proceed_step_result_is_send_text() {
+            let config = ResumeSessionConfig::default();
+            let result = build_proceed_step_result(&config);
+            assert!(result.is_send_text());
+
+            if let StepResult::SendText {
+                text,
+                wait_for,
+                wait_timeout_ms,
+            } = result
+            {
+                assert_eq!(text, "proceed.\n");
+                assert!(wait_for.is_some());
+                match wait_for.unwrap() {
+                    WaitCondition::StableTail {
+                        stable_for_ms, ..
+                    } => {
+                        assert_eq!(stable_for_ms, 5_000);
+                    }
+                    other => panic!("Expected StableTail, got {other:?}"),
+                }
+                assert_eq!(wait_timeout_ms, Some(30_000));
+            }
+        }
+
+        // -- resume_outcome_to_step_result mapping --
+
+        #[test]
+        fn outcome_to_step_result_ready_is_done() {
+            let outcome = ResumeSessionOutcome::Ready {
+                session_id: "abc".into(),
+            };
+            let step = resume_outcome_to_step_result(&outcome);
+            assert!(step.is_done());
+
+            if let StepResult::Done { result } = step {
+                assert_eq!(
+                    result.get("status").and_then(|v| v.as_str()),
+                    Some("ready")
+                );
+            }
+        }
+
+        #[test]
+        fn outcome_to_step_result_timeout_is_done() {
+            // Timeouts are soft failures — still Done, not Abort
+            let outcome = ResumeSessionOutcome::VerifyTimeout {
+                session_id: "abc".into(),
+                phase: "resume".into(),
+                waited_ms: 30_000,
+            };
+            let step = resume_outcome_to_step_result(&outcome);
+            assert!(step.is_done());
+
+            if let StepResult::Done { result } = step {
+                assert_eq!(
+                    result.get("status").and_then(|v| v.as_str()),
+                    Some("timeout")
+                );
+            }
+        }
+
+        #[test]
+        fn outcome_to_step_result_failed_is_abort() {
+            let outcome = ResumeSessionOutcome::Failed {
+                error: "Policy denied send".into(),
+            };
+            let step = resume_outcome_to_step_result(&outcome);
+            assert!(step.is_terminal());
+
+            match step {
+                StepResult::Abort { reason } => {
+                    assert!(reason.contains("Policy denied send"));
+                }
+                other => panic!("Expected Abort, got {other:?}"),
+            }
+        }
+
+        // -- Custom config --
+
+        #[test]
+        fn custom_config_affects_step_results() {
+            let config = ResumeSessionConfig {
+                resume_command_template: "codex resume {session_id}\n".into(),
+                proceed_text: "continue.\n".into(),
+                post_resume_stable_ms: 1_000,
+                post_proceed_stable_ms: 2_000,
+                resume_timeout_ms: 10_000,
+                proceed_timeout_ms: 15_000,
+            };
+
+            let resume = build_resume_step_result("session-42", &config);
+            if let StepResult::SendText {
+                text,
+                wait_timeout_ms,
+                ..
+            } = resume
+            {
+                assert_eq!(text, "codex resume session-42\n");
+                assert_eq!(wait_timeout_ms, Some(10_000));
+            }
+
+            let proceed = build_proceed_step_result(&config);
+            if let StepResult::SendText {
+                text,
+                wait_timeout_ms,
+                ..
+            } = proceed
+            {
+                assert_eq!(text, "continue.\n");
+                assert_eq!(wait_timeout_ms, Some(15_000));
             }
         }
     }

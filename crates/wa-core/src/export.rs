@@ -90,6 +90,10 @@ pub struct ExportHeader {
 pub struct ExportOptions {
     pub kind: ExportKind,
     pub query: ExportQuery,
+    /// Filter by actor kind (audit exports only)
+    pub audit_actor: Option<String>,
+    /// Filter by action kind (audit exports only)
+    pub audit_action: Option<String>,
     pub redact: bool,
     pub pretty: bool,
 }
@@ -189,6 +193,8 @@ pub async fn export_jsonl<W: Write>(
                 pane_id: opts.query.pane_id,
                 since: opts.query.since,
                 until: opts.query.until,
+                actor_kind: opts.audit_actor.clone(),
+                action_kind: opts.audit_action.clone(),
                 ..Default::default()
             };
             let mut records = storage.get_audit_actions(query).await?;
@@ -452,6 +458,8 @@ mod tests {
         let opts = ExportOptions {
             kind: ExportKind::Segments,
             query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
             redact: false,
             pretty: false,
         };
@@ -512,6 +520,8 @@ mod tests {
         let opts = ExportOptions {
             kind: ExportKind::Segments,
             query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
             redact: true,
             pretty: false,
         };
@@ -574,6 +584,8 @@ mod tests {
                 pane_id: Some(1),
                 ..Default::default()
             },
+            audit_actor: None,
+            audit_action: None,
             redact: false,
             pretty: false,
         };
@@ -621,6 +633,8 @@ mod tests {
         let opts = ExportOptions {
             kind: ExportKind::Segments,
             query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
             redact: false,
             pretty: true,
         };
@@ -631,6 +645,206 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         // Pretty format should have indentation
         assert!(output.contains("  \""));
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_audit_with_actor_filter() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_export_audit_{}.db",
+            std::process::id()
+        ));
+        let db_path = tmp.to_string_lossy().to_string();
+
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+
+        // Insert a pane (required for FK)
+        let pane = crate::storage::PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1000,
+            last_seen_at: 1000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        // Insert two audit actions with different actor_kinds
+        let action1 = crate::storage::AuditActionRecord {
+            id: 0,
+            ts: 1000,
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("wf-1".to_string()),
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "auth_required".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+        storage.record_audit_action(action1).await.unwrap();
+
+        let action2 = crate::storage::AuditActionRecord {
+            id: 0,
+            ts: 2000,
+            actor_kind: "operator".to_string(),
+            actor_id: Some("human-1".to_string()),
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+        storage.record_audit_action(action2).await.unwrap();
+
+        // Export with actor filter = "workflow"
+        let opts = ExportOptions {
+            kind: ExportKind::Audit,
+            query: ExportQuery::default(),
+            audit_actor: Some("workflow".to_string()),
+            audit_action: None,
+            redact: true,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+        assert_eq!(count, 1);
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 record
+
+        // Verify the record is the workflow one
+        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(record["actor_kind"], "workflow");
+        assert_eq!(record["action_kind"], "auth_required");
+
+        // Export with action filter = "send_text"
+        let opts2 = ExportOptions {
+            kind: ExportKind::Audit,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: Some("send_text".to_string()),
+            redact: true,
+            pretty: false,
+        };
+
+        let mut buf2 = Vec::new();
+        let count2 = export_jsonl(&storage, &opts2, &mut buf2).await.unwrap();
+        assert_eq!(count2, 1);
+
+        let output2 = String::from_utf8(buf2).unwrap();
+        let lines2: Vec<&str> = output2.trim().lines().collect();
+        let record2: serde_json::Value = serde_json::from_str(lines2[1]).unwrap();
+        assert_eq!(record2["actor_kind"], "operator");
+        assert_eq!(record2["action_kind"], "send_text");
+
+        // Export all audit (no actor/action filter) should return 2
+        let opts3 = ExportOptions {
+            kind: ExportKind::Audit,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
+            redact: true,
+            pretty: false,
+        };
+
+        let mut buf3 = Vec::new();
+        let count3 = export_jsonl(&storage, &opts3, &mut buf3).await.unwrap();
+        assert_eq!(count3, 2);
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn export_audit_redacts_fields() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_export_audit_redact_{}.db",
+            std::process::id()
+        ));
+        let db_path = tmp.to_string_lossy().to_string();
+
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+
+        let pane = crate::storage::PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1000,
+            last_seen_at: 1000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        let action = crate::storage::AuditActionRecord {
+            id: 0,
+            ts: 1000,
+            actor_kind: "workflow".to_string(),
+            actor_id: None,
+            pane_id: Some(1),
+            domain: None,
+            action_kind: "test".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            rule_id: None,
+            input_summary: Some("input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+        storage.record_audit_action(action).await.unwrap();
+
+        let opts = ExportOptions {
+            kind: ExportKind::Audit,
+            query: ExportQuery::default(),
+            audit_actor: None,
+            audit_action: None,
+            redact: true,
+            pretty: false,
+        };
+
+        let mut buf = Vec::new();
+        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.trim().lines().collect();
+        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+        // Decision reason and input summary should be redacted
+        let reason = record["decision_reason"].as_str().unwrap();
+        assert!(reason.contains("[REDACTED]"));
+        assert!(!reason.contains("sk-abc123"));
+
+        let summary = record["input_summary"].as_str().unwrap();
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains("sk-abc123"));
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
