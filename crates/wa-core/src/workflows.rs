@@ -5410,10 +5410,55 @@ impl Workflow for HandleUsageLimits {
 
                     match result {
                         Ok(selection) => {
-                            let json = serde_json::to_value(selection).unwrap_or_default();
-                            StepResult::done(json)
+                            if selection.selected.is_some() {
+                                // Account available — proceed with failover
+                                let json = serde_json::to_value(&selection).unwrap_or_default();
+                                StepResult::done(json)
+                            } else {
+                                // All accounts exhausted — enter safe fallback path (wa-4r7)
+                                tracing::warn!(
+                                    pane_id,
+                                    total = selection.explanation.total_considered,
+                                    "handle_usage_limits: all accounts exhausted, entering fallback"
+                                );
+
+                                // Fetch accounts for reset time calculation
+                                let accounts = storage
+                                    .get_accounts_by_service("openai")
+                                    .await
+                                    .unwrap_or_default();
+                                let exhaustion = crate::accounts::build_exhaustion_info(
+                                    &accounts,
+                                    selection.explanation,
+                                );
+
+                                let plan = build_all_accounts_exhausted_plan(
+                                    pane_id,
+                                    exhaustion.accounts_checked,
+                                    None, // resume_session_id not available at this step
+                                    exhaustion.earliest_reset_ms,
+                                    now_ms(),
+                                );
+
+                                tracing::info!(
+                                    pane_id,
+                                    accounts_checked = exhaustion.accounts_checked,
+                                    earliest_reset_ms = ?exhaustion.earliest_reset_ms,
+                                    earliest_reset_account = ?exhaustion.earliest_reset_account,
+                                    "handle_usage_limits: built fallback plan"
+                                );
+
+                                fallback_plan_to_step_result(&plan)
+                            }
                         }
-                        Err(e) => StepResult::abort(e.to_string()),
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                "handle_usage_limits: account selection failed"
+                            );
+                            StepResult::abort(e.to_string())
+                        }
                     }
                 }
                 _ => StepResult::abort("Unexpected step"),

@@ -296,6 +296,147 @@ pub fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+// ============================================================================
+// Multi-account exhaustion (wa-4r7)
+// ============================================================================
+
+/// Information about account exhaustion across all configured accounts.
+///
+/// Built when [`AccountSelectionResult::selected`] is `None`, indicating that
+/// no accounts are above the selection threshold. This struct captures
+/// the data needed to build a fallback plan and schedule auto-resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountExhaustionInfo {
+    /// How many accounts were checked.
+    pub accounts_checked: u32,
+    /// Earliest known reset time across all accounts (epoch ms), if any.
+    ///
+    /// Derived from parsing each account's `reset_at` field.
+    /// `None` if no account has a known reset time.
+    pub earliest_reset_ms: Option<i64>,
+    /// Account ID with the earliest reset (for display purposes).
+    pub earliest_reset_account: Option<String>,
+    /// The selection explanation from the failed selection attempt.
+    pub explanation: SelectionExplanation,
+}
+
+/// Parse a `reset_at` string (ISO 8601 or epoch-ms) into epoch milliseconds.
+///
+/// Returns `None` if the string is empty, unparseable, or represents a past time.
+#[must_use]
+pub fn parse_reset_at_ms(reset_at: &str) -> Option<i64> {
+    let trimmed = reset_at.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Try epoch milliseconds first (all digits)
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return trimmed.parse::<i64>().ok();
+    }
+
+    // Try common ISO 8601 formats via manual parsing
+    // Format: "2026-01-29T12:00:00Z" or "2026-01-29T12:00:00+00:00"
+    // We use a simple heuristic: if it starts with a 4-digit year, try chrono-like parsing
+    if trimmed.len() >= 10 && trimmed.as_bytes()[4] == b'-' {
+        // Attempt: replace T with space, strip timezone suffix, parse as NaiveDateTime
+        let cleaned = trimmed
+            .replace('T', " ")
+            .replace('Z', "")
+            .trim_end_matches("+00:00")
+            .trim_end_matches("+0000")
+            .to_string();
+
+        // Parse "YYYY-MM-DD HH:MM:SS" manually
+        let parts: Vec<&str> = cleaned.split(' ').collect();
+        if let Some(date_str) = parts.first() {
+            let date_parts: Vec<&str> = date_str.split('-').collect();
+            if date_parts.len() == 3 {
+                if let (Ok(y), Ok(m), Ok(d)) = (
+                    date_parts[0].parse::<i64>(),
+                    date_parts[1].parse::<u32>(),
+                    date_parts[2].parse::<u32>(),
+                ) {
+                    let (h, min, s) = if let Some(time_str) = parts.get(1) {
+                        let time_parts: Vec<&str> = time_str.split(':').collect();
+                        (
+                            time_parts.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                            time_parts.get(1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                            time_parts.get(2).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                    // Days from epoch (simplified — not handling leap seconds)
+                    let days = days_from_epoch(y, m, d);
+                    let secs = days * 86_400 + i64::from(h) * 3_600 + i64::from(min) * 60 + i64::from(s);
+                    return Some(secs * 1_000);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Calculate days from Unix epoch (1970-01-01) for a given date.
+///
+/// Uses a simplified algorithm; accurate for dates 1970-2099.
+fn days_from_epoch(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 { month + 9 } else { month - 3 };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * i64::from(m) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Find the earliest reset time across a set of accounts.
+///
+/// Returns `(earliest_reset_ms, account_id)` for the account with the
+/// soonest known reset time, or `(None, None)` if no accounts have a reset time.
+#[must_use]
+pub fn find_earliest_reset(accounts: &[AccountRecord]) -> (Option<i64>, Option<String>) {
+    let mut earliest: Option<(i64, String)> = None;
+
+    for acct in accounts {
+        if let Some(ref reset_str) = acct.reset_at {
+            if let Some(ms) = parse_reset_at_ms(reset_str) {
+                match &earliest {
+                    None => earliest = Some((ms, acct.account_id.clone())),
+                    Some((current_ms, _)) if ms < *current_ms => {
+                        earliest = Some((ms, acct.account_id.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    match earliest {
+        Some((ms, id)) => (Some(ms), Some(id)),
+        None => (None, None),
+    }
+}
+
+/// Build an [`AccountExhaustionInfo`] from a failed selection result and the accounts list.
+#[must_use]
+pub fn build_exhaustion_info(
+    accounts: &[AccountRecord],
+    explanation: SelectionExplanation,
+) -> AccountExhaustionInfo {
+    let (earliest_reset_ms, earliest_reset_account) = find_earliest_reset(accounts);
+
+    AccountExhaustionInfo {
+        accounts_checked: accounts.len() as u32,
+        earliest_reset_ms,
+        earliest_reset_account,
+        explanation,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,8 +704,8 @@ mod tests {
     fn select_at_exact_threshold_included() {
         // Account at exactly threshold should be included (>= check)
         let accounts = vec![
-            make_account("alpha", 5.0, None),  // exactly at threshold
-            make_account("beta", 4.99, None),  // just below
+            make_account("alpha", 5.0, None), // exactly at threshold
+            make_account("beta", 4.99, None), // just below
         ];
         let config = AccountSelectionConfig {
             threshold_percent: 5.0,
@@ -608,7 +749,11 @@ mod tests {
         let accounts: Vec<AccountRecord> = (0..50)
             .map(|i| {
                 let pct = (i as f64 * 2.0) % 100.0;
-                let last_used = if i % 3 == 0 { None } else { Some(i as i64 * 100) };
+                let last_used = if i % 3 == 0 {
+                    None
+                } else {
+                    Some(i as i64 * 100)
+                };
                 make_account(&format!("acct-{i:03}"), pct, last_used)
             })
             .collect();
@@ -696,5 +841,187 @@ mod tests {
         assert_eq!(result.explanation.filtered_out.len(), 10);
         assert_eq!(result.explanation.candidates.len(), 1);
         assert_eq!(result.explanation.selection_reason, "Only eligible account");
+    }
+
+    // ========================================================================
+    // Multi-account exhaustion tests (wa-4r7)
+    // ========================================================================
+
+    fn make_account_with_reset(
+        id: &str,
+        pct: f64,
+        reset_at: Option<&str>,
+    ) -> AccountRecord {
+        AccountRecord {
+            id: 0,
+            account_id: id.to_string(),
+            service: "openai".to_string(),
+            name: Some(id.to_string()),
+            percent_remaining: pct,
+            reset_at: reset_at.map(ToString::to_string),
+            tokens_used: None,
+            tokens_remaining: None,
+            tokens_limit: None,
+            last_refreshed_at: 1000,
+            last_used_at: None,
+            created_at: 1000,
+            updated_at: 1000,
+        }
+    }
+
+    // -- parse_reset_at_ms --
+
+    #[test]
+    fn parse_reset_at_ms_epoch_millis() {
+        assert_eq!(parse_reset_at_ms("1700000000000"), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn parse_reset_at_ms_iso8601_utc() {
+        let ms = parse_reset_at_ms("2026-01-29T12:00:00Z");
+        assert!(ms.is_some());
+        let val = ms.unwrap();
+        // Should be roughly 2026-01-29 12:00:00 UTC in epoch ms
+        assert!(val > 1_700_000_000_000, "should be after 2023: {val}");
+    }
+
+    #[test]
+    fn parse_reset_at_ms_iso8601_offset() {
+        let ms = parse_reset_at_ms("2026-01-29T12:00:00+00:00");
+        assert!(ms.is_some());
+    }
+
+    #[test]
+    fn parse_reset_at_ms_empty_string() {
+        assert_eq!(parse_reset_at_ms(""), None);
+        assert_eq!(parse_reset_at_ms("  "), None);
+    }
+
+    #[test]
+    fn parse_reset_at_ms_garbage() {
+        assert_eq!(parse_reset_at_ms("not-a-date"), None);
+    }
+
+    #[test]
+    fn parse_reset_at_ms_date_only() {
+        let ms = parse_reset_at_ms("2026-01-29");
+        assert!(ms.is_some());
+        // Should be midnight
+        let val = ms.unwrap();
+        assert_eq!(val % (86_400 * 1_000), 0, "should be midnight: {val}");
+    }
+
+    // -- find_earliest_reset --
+
+    #[test]
+    fn find_earliest_reset_no_accounts() {
+        let (ms, acct) = find_earliest_reset(&[]);
+        assert!(ms.is_none());
+        assert!(acct.is_none());
+    }
+
+    #[test]
+    fn find_earliest_reset_no_reset_times() {
+        let accounts = vec![
+            make_account_with_reset("a", 0.0, None),
+            make_account_with_reset("b", 0.0, None),
+        ];
+        let (ms, acct) = find_earliest_reset(&accounts);
+        assert!(ms.is_none());
+        assert!(acct.is_none());
+    }
+
+    #[test]
+    fn find_earliest_reset_single_account() {
+        let accounts = vec![make_account_with_reset("a", 0.0, Some("1700000000000"))];
+        let (ms, acct) = find_earliest_reset(&accounts);
+        assert_eq!(ms, Some(1_700_000_000_000));
+        assert_eq!(acct.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn find_earliest_reset_picks_soonest() {
+        let accounts = vec![
+            make_account_with_reset("late", 0.0, Some("1700000000000")),
+            make_account_with_reset("early", 0.0, Some("1600000000000")),
+            make_account_with_reset("mid", 0.0, Some("1650000000000")),
+        ];
+        let (ms, acct) = find_earliest_reset(&accounts);
+        assert_eq!(ms, Some(1_600_000_000_000));
+        assert_eq!(acct.as_deref(), Some("early"));
+    }
+
+    #[test]
+    fn find_earliest_reset_skips_none() {
+        let accounts = vec![
+            make_account_with_reset("no-reset", 0.0, None),
+            make_account_with_reset("has-reset", 0.0, Some("1700000000000")),
+        ];
+        let (ms, acct) = find_earliest_reset(&accounts);
+        assert_eq!(ms, Some(1_700_000_000_000));
+        assert_eq!(acct.as_deref(), Some("has-reset"));
+    }
+
+    // -- build_exhaustion_info --
+
+    #[test]
+    fn build_exhaustion_info_captures_all_fields() {
+        let accounts = vec![
+            make_account_with_reset("a", 0.0, Some("1700000000000")),
+            make_account_with_reset("b", 2.0, Some("1800000000000")),
+        ];
+        let explanation = SelectionExplanation {
+            total_considered: 2,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "All below threshold".to_string(),
+        };
+
+        let info = build_exhaustion_info(&accounts, explanation);
+
+        assert_eq!(info.accounts_checked, 2);
+        assert_eq!(info.earliest_reset_ms, Some(1_700_000_000_000));
+        assert_eq!(info.earliest_reset_account.as_deref(), Some("a"));
+        assert_eq!(info.explanation.total_considered, 2);
+    }
+
+    #[test]
+    fn build_exhaustion_info_no_reset_times() {
+        let accounts = vec![
+            make_account_with_reset("x", 0.0, None),
+        ];
+        let explanation = SelectionExplanation {
+            total_considered: 1,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "No eligible accounts".to_string(),
+        };
+
+        let info = build_exhaustion_info(&accounts, explanation);
+
+        assert_eq!(info.accounts_checked, 1);
+        assert!(info.earliest_reset_ms.is_none());
+        assert!(info.earliest_reset_account.is_none());
+    }
+
+    #[test]
+    fn exhaustion_info_serde_round_trip() {
+        let accounts = vec![
+            make_account_with_reset("a", 0.0, Some("1700000000000")),
+        ];
+        let explanation = SelectionExplanation {
+            total_considered: 1,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "test".to_string(),
+        };
+        let info = build_exhaustion_info(&accounts, explanation);
+
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: AccountExhaustionInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.accounts_checked, info.accounts_checked);
+        assert_eq!(parsed.earliest_reset_ms, info.earliest_reset_ms);
+        assert_eq!(parsed.earliest_reset_account, info.earliest_reset_account);
     }
 }
