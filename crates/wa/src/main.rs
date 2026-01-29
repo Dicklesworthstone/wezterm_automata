@@ -592,6 +592,35 @@ SEE ALSO:
         command: RulesCommands,
     },
 
+    /// Show prioritized issues needing attention
+    #[command(after_help = r#"EXAMPLES:
+    wa triage                         Prioritized triage overview
+    wa triage -f json                 Machine-readable output
+    wa triage --severity error        Only show errors
+    wa triage --only events           Only unhandled events
+
+SEE ALSO:
+    wa doctor     System health diagnostics
+    wa events     Raw event listing
+    wa status     Pane and system overview"#)]
+    Triage {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Minimum severity to show (error, warning, info)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Only show a specific section (health, crashes, events, workflows)
+        #[arg(long)]
+        only: Option<String>,
+
+        /// Show additional detail for each item
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Launch the interactive TUI (requires --features tui)
     #[cfg(feature = "tui")]
     #[command(after_help = r#"EXAMPLES:
@@ -7621,6 +7650,294 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Rules { command }) => {
             handle_rules_command(command);
+        }
+
+        Some(Commands::Triage {
+            format,
+            severity,
+            only,
+            verbose: verbose_flag,
+        }) => {
+            use wa_core::output::{OutputFormat, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let show_all = only.is_none();
+            let section = only.as_deref().unwrap_or("");
+
+            // Collect triage items as JSON values for uniform sorting/filtering
+            let mut items: Vec<serde_json::Value> = Vec::new();
+
+            // 1. Health diagnostics (in-process snapshot)
+            if show_all || section == "health" {
+                if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
+                    use wa_core::output::{HealthDiagnosticStatus, HealthSnapshotRenderer};
+                    let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+                    for hc in &checks {
+                        let sev = match hc.status {
+                            HealthDiagnosticStatus::Error => "error",
+                            HealthDiagnosticStatus::Warning => "warning",
+                            _ => continue, // skip OK/info health checks in triage
+                        };
+                        items.push(serde_json::json!({
+                            "section": "health",
+                            "severity": sev,
+                            "title": hc.name,
+                            "detail": hc.detail,
+                            "action": "wa doctor",
+                        }));
+                    }
+                }
+            }
+
+            // 2. Recent crash bundles
+            if show_all || section == "crashes" {
+                if let Some(bundle) =
+                    wa_core::crash::latest_crash_bundle(&layout.crash_dir)
+                {
+                    let detail = if let Some(ref report) = bundle.report {
+                        let msg = if report.message.len() > 100 {
+                            format!("{}...", &report.message[..97])
+                        } else {
+                            report.message.clone()
+                        };
+                        format!(
+                            "{msg} (at {})",
+                            report.location.as_deref().unwrap_or("unknown")
+                        )
+                    } else if let Some(ref manifest) = bundle.manifest {
+                        format!("crash at {}", manifest.created_at)
+                    } else {
+                        "crash bundle found".to_string()
+                    };
+                    items.push(serde_json::json!({
+                        "section": "crashes",
+                        "severity": "warning",
+                        "title": "Recent crash",
+                        "detail": detail,
+                        "action": "wa reproduce --kind crash",
+                        "bundle_path": bundle.path.display().to_string(),
+                    }));
+                }
+            }
+
+            // 3. Unhandled events + 4. Incomplete workflows (both need DB)
+            let needs_db =
+                show_all || section == "events" || section == "workflows";
+            if needs_db {
+                let db_path = layout.db_path.to_string_lossy();
+                let storage_result =
+                    wa_core::storage::StorageHandle::new(&db_path).await;
+
+                match storage_result {
+                    Ok(storage) => {
+                        // Unhandled events
+                        if show_all || section == "events" {
+                            let query = wa_core::storage::EventQuery {
+                                limit: Some(20),
+                                pane_id: None,
+                                rule_id: None,
+                                event_type: None,
+                                unhandled_only: true,
+                                since: None,
+                                until: None,
+                            };
+                            if let Ok(events) =
+                                storage.get_events(query).await
+                            {
+                                for event in &events {
+                                    items.push(serde_json::json!({
+                                        "section": "events",
+                                        "severity": event.severity,
+                                        "title": format!(
+                                            "[pane {}] {}: {}",
+                                            event.pane_id,
+                                            event.event_type,
+                                            event.rule_id
+                                        ),
+                                        "detail": event.matched_text
+                                            .as_deref()
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(120)
+                                            .collect::<String>(),
+                                        "action": format!(
+                                            "wa events --pane {} --unhandled",
+                                            event.pane_id
+                                        ),
+                                        "event_id": event.id,
+                                        "pane_id": event.pane_id,
+                                        "detected_at": event.detected_at,
+                                    }));
+                                }
+                            }
+                        }
+
+                        // Incomplete workflows
+                        if show_all || section == "workflows" {
+                            if let Ok(workflows) =
+                                storage.find_incomplete_workflows().await
+                            {
+                                for wf in &workflows {
+                                    items.push(serde_json::json!({
+                                        "section": "workflows",
+                                        "severity": "info",
+                                        "title": format!(
+                                            "{} (pane {})",
+                                            wf.workflow_name, wf.pane_id
+                                        ),
+                                        "detail": format!(
+                                            "status={}, step={}",
+                                            wf.status, wf.current_step
+                                        ),
+                                        "action": format!(
+                                            "wa workflow status {}",
+                                            wf.id
+                                        ),
+                                        "workflow_id": wf.id,
+                                        "pane_id": wf.pane_id,
+                                        "started_at": wf.started_at,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        items.push(serde_json::json!({
+                            "section": "health",
+                            "severity": "warning",
+                            "title": "Database unavailable",
+                            "detail": format!(
+                                "Could not open storage: {e}"
+                            ),
+                            "action": "wa watch",
+                        }));
+                    }
+                }
+            }
+
+            // Severity ranking for sorting/filtering
+            let severity_rank = |s: &str| -> u8 {
+                match s {
+                    "error" => 3,
+                    "warning" => 2,
+                    "info" => 1,
+                    _ => 0,
+                }
+            };
+
+            // Apply severity filter
+            if let Some(ref min_sev) = severity {
+                let min_rank = severity_rank(min_sev);
+                items.retain(|item| {
+                    let sev =
+                        item["severity"].as_str().unwrap_or("info");
+                    severity_rank(sev) >= min_rank
+                });
+            }
+
+            // Sort: errors first, then warnings, then info
+            items.sort_by(|a, b| {
+                let sa = severity_rank(
+                    a["severity"].as_str().unwrap_or("info"),
+                );
+                let sb = severity_rank(
+                    b["severity"].as_str().unwrap_or("info"),
+                );
+                sb.cmp(&sa)
+            });
+
+            // Render output
+            if output_format.is_json() {
+                let result = serde_json::json!({
+                    "ok": true,
+                    "version": wa_core::VERSION,
+                    "total": items.len(),
+                    "items": items,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| "{}".to_string())
+                );
+            } else if items.is_empty() {
+                println!("wa triage - Nothing needs attention\n");
+                println!(
+                    "All clear. No unhandled events, crashes, or health issues."
+                );
+            } else {
+                println!(
+                    "wa triage - {} item(s) need attention\n",
+                    items.len()
+                );
+
+                let mut current_section = "";
+                for item in &items {
+                    let sec =
+                        item["section"].as_str().unwrap_or("unknown");
+                    if sec != current_section {
+                        if !current_section.is_empty() {
+                            println!();
+                        }
+                        let header = match sec {
+                            "health" => "Health Issues",
+                            "crashes" => "Recent Crashes",
+                            "events" => "Unhandled Events",
+                            "workflows" => "Active Workflows",
+                            _ => sec,
+                        };
+                        println!("{header}:");
+                        current_section = sec;
+                    }
+
+                    let sev =
+                        item["severity"].as_str().unwrap_or("info");
+                    let icon = match sev {
+                        "error" => "[ERROR]",
+                        "warning" => "[WARN] ",
+                        _ => "[INFO] ",
+                    };
+                    let title = item["title"].as_str().unwrap_or("");
+                    println!("  {icon} {title}");
+
+                    if verbose_flag || cli.verbose > 0 {
+                        if let Some(detail) = item["detail"].as_str() {
+                            if !detail.is_empty() {
+                                println!("         {detail}");
+                            }
+                        }
+                    }
+                    if let Some(action) = item["action"].as_str() {
+                        println!("         -> {action}");
+                    }
+                }
+
+                println!();
+                let errors = items
+                    .iter()
+                    .filter(|i| i["severity"] == "error")
+                    .count();
+                let warnings = items
+                    .iter()
+                    .filter(|i| i["severity"] == "warning")
+                    .count();
+                let infos = items.len() - errors - warnings;
+                let mut parts = Vec::new();
+                if errors > 0 {
+                    parts.push(format!("{errors} error(s)"));
+                }
+                if warnings > 0 {
+                    parts.push(format!("{warnings} warning(s)"));
+                }
+                if infos > 0 {
+                    parts.push(format!("{infos} info"));
+                }
+                println!("Summary: {}", parts.join(", "));
+            }
         }
 
         #[cfg(feature = "tui")]
