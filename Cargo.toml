@@ -102,6 +102,8 @@ missing_fields_in_debug = "allow"
 too_long_first_doc_paragraph = "allow"
 # Unnecessary wraps acceptable for error handling consistency
 unnecessary_wraps = "allow"
+# Default unit struct construction acceptable
+default_constructed_unit_structs = "allow"
 # Pass by value acceptable for small types
 needless_pass_by_value = "allow"
 # Sort on primitives acceptable

@@ -8943,7 +8943,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     use std::io::Write;
                     let stdout = std::io::stdout();
                     let mut handle = stdout.lock();
-                    let _ = handle.write_all(&buffer);
+                    if let Err(e) = handle.write_all(&buffer) {
+                        eprintln!("Error: Failed to write to stdout: {e}");
+                        std::process::exit(1);
+                    }
                 }
                 count
             };

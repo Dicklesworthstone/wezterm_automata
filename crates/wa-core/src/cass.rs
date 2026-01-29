@@ -164,6 +164,9 @@ pub enum CassError {
     OutputTooLarge { bytes: usize, max_bytes: usize },
     #[error("cass returned invalid JSON: {message}")]
     InvalidJson { message: String, preview: String },
+    /// Reserved for future use when cass CLI returns explicit "no results" errors.
+    /// Currently, empty search results are not treated as errors (the query succeeded
+    /// with zero hits). This variant exists for API completeness and future CLI changes.
     #[error("cass returned no results for query")]
     NoResults { query: String },
     #[error("cass I/O error: {message}")]
@@ -384,16 +387,16 @@ impl CassClient {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let bytes = stdout.len();
-        if bytes > self.max_output_bytes {
+        // Check raw byte length BEFORE allocating string to prevent OOM on huge outputs
+        let raw_bytes = output.stdout.len();
+        if raw_bytes > self.max_output_bytes {
             return Err(CassError::OutputTooLarge {
-                bytes,
+                bytes: raw_bytes,
                 max_bytes: self.max_output_bytes,
             });
         }
 
-        Ok(stdout)
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
 
