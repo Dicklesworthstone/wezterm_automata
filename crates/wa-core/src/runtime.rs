@@ -365,18 +365,23 @@ impl ObservationRuntime {
                             last_retention_check = now;
                         }
 
-                        // Run checkpoint/vacuum
+                        // Run WAL checkpoint + PRAGMA optimize (lightweight)
                         if checkpoint_secs > 0
                             && now.duration_since(last_checkpoint)
                                 >= Duration::from_secs(u64::from(checkpoint_secs))
                         {
                             let storage_guard = storage.lock().await;
-                            // Vacuum also handles WAL checkpointing implicitly in many cases,
-                            // or we could add explicit checkpoint support. For now vacuum is good maintenance.
-                            if let Err(e) = storage_guard.vacuum().await {
-                                error!(error = %e, "Database maintenance (vacuum) failed");
-                            } else {
-                                debug!("Database maintenance (vacuum) completed");
+                            match storage_guard.checkpoint().await {
+                                Ok(result) => {
+                                    debug!(
+                                        wal_pages = result.wal_pages,
+                                        optimized = result.optimized,
+                                        "WAL checkpoint completed"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "WAL checkpoint failed");
+                                }
                             }
                             drop(storage_guard);
                             last_checkpoint = now;

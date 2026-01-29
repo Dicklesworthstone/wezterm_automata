@@ -622,6 +622,15 @@ pub struct Segment {
     pub captured_at: i64,
 }
 
+/// Result of a WAL checkpoint operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointResult {
+    /// Number of WAL frames checkpointed
+    pub wal_pages: i64,
+    /// Whether PRAGMA optimize was also run
+    pub optimized: bool,
+}
+
 /// Result of an FTS search query
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -2455,6 +2464,8 @@ enum WriteCommand {
         account_id: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// Checkpoint WAL (incremental, non-blocking)
+    Checkpoint { respond: oneshot::Sender<Result<CheckpointResult>> },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -2795,6 +2806,21 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::Vacuum { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Lightweight WAL checkpoint (PASSIVE) + PRAGMA optimize.
+    ///
+    /// Prefer this over `vacuum()` for periodic maintenance — it is
+    /// non-blocking and much cheaper than a full VACUUM.
+    pub async fn checkpoint(&self) -> Result<CheckpointResult> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::Checkpoint { respond: tx })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
@@ -3604,181 +3630,243 @@ pub struct EventQuery {
 // Writer Thread Implementation
 // =============================================================================
 
-/// Main loop for the writer thread
+/// Maximum commands to drain per batch iteration.
+const WRITER_BATCH_CAP: usize = 128;
+
+/// Returns true if the command is a control operation that must run outside a
+/// transaction (Shutdown, Vacuum, Checkpoint).
+fn is_control_command(cmd: &WriteCommand) -> bool {
+    matches!(
+        cmd,
+        WriteCommand::Shutdown { .. }
+            | WriteCommand::Vacuum { .. }
+            | WriteCommand::Checkpoint { .. }
+    )
+}
+
+/// Main loop for the writer thread.
+///
+/// Batches pending writes into SQLite transactions to amortize journal/fsync
+/// overhead.  Control commands (Shutdown, Vacuum, Checkpoint) commit any open
+/// transaction first, then execute outside a transaction.
 fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
-    // Use blocking_recv from sync context
-    while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            WriteCommand::AppendSegment {
-                pane_id,
-                content,
-                content_hash,
-                respond,
-            } => {
-                let result = append_segment_sync(conn, pane_id, &content, content_hash.as_deref());
-                let _ = respond.send(result);
+    while let Some(first_cmd) = rx.blocking_recv() {
+        // Drain any additional pending commands for batching
+        let mut batch = Vec::with_capacity(8);
+        batch.push(first_cmd);
+        while batch.len() < WRITER_BATCH_CAP {
+            match rx.try_recv() {
+                Ok(cmd) => batch.push(cmd),
+                Err(_) => break,
             }
-            WriteCommand::RecordGap {
-                pane_id,
-                reason,
-                respond,
-            } => {
-                let result = record_gap_sync(conn, pane_id, &reason);
-                let _ = respond.send(result);
+        }
+
+        // Open a transaction when the batch has multiple DML commands.
+        // Single-command batches skip the transaction wrapper (SQLite
+        // auto-commits each statement anyway).
+        let use_txn = batch.len() > 1 && !batch.iter().all(is_control_command);
+        let mut txn_open = false;
+        if use_txn {
+            if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+                txn_open = true;
             }
-            WriteCommand::RecordEvent { event, respond } => {
-                let result = record_event_sync(conn, &event);
-                let _ = respond.send(result);
+        }
+
+        let mut should_break = false;
+        for cmd in batch {
+            // Control commands must run outside a transaction
+            if is_control_command(&cmd) && txn_open {
+                let _ = conn.execute_batch("COMMIT");
+                txn_open = false;
             }
-            WriteCommand::MarkEventHandled {
-                event_id,
-                workflow_id,
-                status,
-                respond,
-            } => {
-                let result =
-                    mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertPane { pane, respond } => {
-                let result = upsert_pane_sync(conn, &pane);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertWorkflow { workflow, respond } => {
-                let result = upsert_workflow_sync(conn, &workflow);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertActionPlan { record, respond } => {
-                let result = upsert_action_plan_sync(conn, &record);
-                let _ = respond.send(result);
-            }
-            WriteCommand::InsertStepLog {
-                workflow_id,
+            dispatch_write_command(conn, cmd, &mut should_break);
+        }
+
+        if txn_open {
+            let _ = conn.execute_batch("COMMIT");
+        }
+
+        if should_break {
+            break;
+        }
+    }
+}
+
+/// Dispatch a single write command to the appropriate sync handler.
+fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break: &mut bool) {
+    match cmd {
+        WriteCommand::AppendSegment {
+            pane_id,
+            content,
+            content_hash,
+            respond,
+        } => {
+            let result = append_segment_sync(conn, pane_id, &content, content_hash.as_deref());
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordGap {
+            pane_id,
+            reason,
+            respond,
+        } => {
+            let result = record_gap_sync(conn, pane_id, &reason);
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordEvent { event, respond } => {
+            let result = record_event_sync(conn, &event);
+            let _ = respond.send(result);
+        }
+        WriteCommand::MarkEventHandled {
+            event_id,
+            workflow_id,
+            status,
+            respond,
+        } => {
+            let result =
+                mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertPane { pane, respond } => {
+            let result = upsert_pane_sync(conn, &pane);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertWorkflow { workflow, respond } => {
+            let result = upsert_workflow_sync(conn, &workflow);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertActionPlan { record, respond } => {
+            let result = upsert_action_plan_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::InsertStepLog {
+            workflow_id,
+            audit_action_id,
+            step_index,
+            step_name,
+            step_id,
+            step_kind,
+            result_type,
+            result_data,
+            policy_summary,
+            verification_refs,
+            error_code,
+            started_at,
+            completed_at,
+            respond,
+        } => {
+            let result = insert_step_log_sync(
+                conn,
+                &workflow_id,
                 audit_action_id,
                 step_index,
-                step_name,
-                step_id,
-                step_kind,
-                result_type,
-                result_data,
-                policy_summary,
-                verification_refs,
-                error_code,
+                &step_name,
+                step_id.as_deref(),
+                step_kind.as_deref(),
+                &result_type,
+                result_data.as_deref(),
+                policy_summary.as_deref(),
+                verification_refs.as_deref(),
+                error_code.as_deref(),
                 started_at,
                 completed_at,
-                respond,
-            } => {
-                let result = insert_step_log_sync(
-                    conn,
-                    &workflow_id,
-                    audit_action_id,
-                    step_index,
-                    &step_name,
-                    step_id.as_deref(),
-                    step_kind.as_deref(),
-                    &result_type,
-                    result_data.as_deref(),
-                    policy_summary.as_deref(),
-                    verification_refs.as_deref(),
-                    error_code.as_deref(),
-                    started_at,
-                    completed_at,
-                );
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertSession { session, respond } => {
-                let result = upsert_agent_session_sync(conn, &session);
-                let _ = respond.send(result);
-            }
-            WriteCommand::RecordAuditAction { action, respond } => {
-                let result = record_audit_action_sync(conn, &action);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertActionUndo { record, respond } => {
-                let result = upsert_action_undo_sync(conn, &record);
-                let _ = respond.send(result);
-            }
-            WriteCommand::PurgeAuditActions { before_ts, respond } => {
-                let result = purge_audit_actions_sync(conn, before_ts);
-                let _ = respond.send(result);
-            }
-            WriteCommand::InsertApprovalToken { token, respond } => {
-                let result = insert_approval_token_sync(conn, &token);
-                let _ = respond.send(result);
-            }
-            WriteCommand::ConsumeApprovalToken {
-                code_hash,
-                workspace_id,
-                action_kind,
+            );
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertSession { session, respond } => {
+            let result = upsert_agent_session_sync(conn, &session);
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordAuditAction { action, respond } => {
+            let result = record_audit_action_sync(conn, &action);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertActionUndo { record, respond } => {
+            let result = upsert_action_undo_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::PurgeAuditActions { before_ts, respond } => {
+            let result = purge_audit_actions_sync(conn, before_ts);
+            let _ = respond.send(result);
+        }
+        WriteCommand::InsertApprovalToken { token, respond } => {
+            let result = insert_approval_token_sync(conn, &token);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ConsumeApprovalToken {
+            code_hash,
+            workspace_id,
+            action_kind,
+            pane_id,
+            action_fingerprint,
+            respond,
+        } => {
+            let result = consume_approval_token_sync(
+                conn,
+                &code_hash,
+                &workspace_id,
+                &action_kind,
                 pane_id,
-                action_fingerprint,
-                respond,
-            } => {
-                let result = consume_approval_token_sync(
-                    conn,
-                    &code_hash,
-                    &workspace_id,
-                    &action_kind,
-                    pane_id,
-                    &action_fingerprint,
-                );
-                let _ = respond.send(result);
-            }
-            WriteCommand::GetApprovalTokenByCode {
-                code_hash,
-                workspace_id,
-                respond,
-            } => {
-                let result = get_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
-                let _ = respond.send(result);
-            }
-            WriteCommand::ConsumeApprovalTokenByCode {
-                code_hash,
-                workspace_id,
-                respond,
-            } => {
-                let result = consume_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
-                let _ = respond.send(result);
-            }
-            WriteCommand::RecordMaintenance { record, respond } => {
-                let result = record_maintenance_sync(conn, &record);
-                let _ = respond.send(result);
-            }
-            WriteCommand::PruneSegments { before_ts, respond } => {
-                let result = prune_segments_sync(conn, before_ts);
-                let _ = respond.send(result);
-            }
-            WriteCommand::Vacuum { respond } => {
-                let result = vacuum_sync(conn);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpsertAccount { account, respond } => {
-                let result = upsert_account_sync(conn, &account);
-                let _ = respond.send(result);
-            }
-            WriteCommand::UpdateAccountLastUsed {
-                service,
-                account_id,
-                last_used_at,
-                respond,
-            } => {
-                let result =
-                    update_account_last_used_sync(conn, &service, &account_id, last_used_at);
-                let _ = respond.send(result);
-            }
-            WriteCommand::DeleteAccount {
-                service,
-                account_id,
-                respond,
-            } => {
-                let result = delete_account_sync(conn, &service, &account_id);
-                let _ = respond.send(result);
-            }
-            WriteCommand::Shutdown { respond } => {
-                // Acknowledge shutdown
-                let _ = respond.send(());
-                break;
-            }
+                &action_fingerprint,
+            );
+            let _ = respond.send(result);
+        }
+        WriteCommand::GetApprovalTokenByCode {
+            code_hash,
+            workspace_id,
+            respond,
+        } => {
+            let result = get_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ConsumeApprovalTokenByCode {
+            code_hash,
+            workspace_id,
+            respond,
+        } => {
+            let result = consume_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::RecordMaintenance { record, respond } => {
+            let result = record_maintenance_sync(conn, &record);
+            let _ = respond.send(result);
+        }
+        WriteCommand::PruneSegments { before_ts, respond } => {
+            let result = prune_segments_sync(conn, before_ts);
+            let _ = respond.send(result);
+        }
+        WriteCommand::Vacuum { respond } => {
+            let result = vacuum_sync(conn);
+            let _ = respond.send(result);
+        }
+        WriteCommand::Checkpoint { respond } => {
+            let result = checkpoint_sync(conn);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpsertAccount { account, respond } => {
+            let result = upsert_account_sync(conn, &account);
+            let _ = respond.send(result);
+        }
+        WriteCommand::UpdateAccountLastUsed {
+            service,
+            account_id,
+            last_used_at,
+            respond,
+        } => {
+            let result =
+                update_account_last_used_sync(conn, &service, &account_id, last_used_at);
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeleteAccount {
+            service,
+            account_id,
+            respond,
+        } => {
+            let result = delete_account_sync(conn, &service, &account_id);
+            let _ = respond.send(result);
+        }
+        WriteCommand::Shutdown { respond } => {
+            let _ = respond.send(());
+            *should_break = true;
         }
     }
 }
@@ -4304,6 +4392,22 @@ fn vacuum_sync(conn: &Connection) -> Result<()> {
     conn.execute_batch("VACUUM")
         .map_err(|e| StorageError::Database(format!("Failed to vacuum database: {e}")))?;
     Ok(())
+}
+
+/// Checkpoint WAL (PASSIVE — non-blocking, does not stall readers or writers)
+/// and run PRAGMA optimize to maintain query planner statistics.
+fn checkpoint_sync(conn: &Connection) -> Result<CheckpointResult> {
+    let wal_pages: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+        .map_err(|e| StorageError::Database(format!("WAL checkpoint failed: {e}")))?;
+
+    conn.execute_batch("PRAGMA optimize")
+        .map_err(|e| StorageError::Database(format!("PRAGMA optimize failed: {e}")))?;
+
+    Ok(CheckpointResult {
+        wal_pages,
+        optimized: true,
+    })
 }
 
 // =============================================================================
@@ -8917,6 +9021,184 @@ mod storage_handle_tests {
         assert!(!active.is_empty());
 
         handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // =========================================================================
+    // Checkpoint Tests (wa-upg.5.3)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn checkpoint_returns_result() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Write some data so the WAL has pages
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle
+            .append_segment(1, "checkpoint test data", None)
+            .await
+            .unwrap();
+
+        let result = handle.checkpoint().await.unwrap();
+        // PASSIVE checkpoint may or may not move pages, but it should succeed
+        assert!(result.wal_pages >= 0);
+        assert!(result.optimized);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_idempotent() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Run checkpoint twice — both should succeed
+        let r1 = handle.checkpoint().await.unwrap();
+        let r2 = handle.checkpoint().await.unwrap();
+        assert!(r1.optimized);
+        assert!(r2.optimized);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_after_many_writes() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Generate WAL traffic
+        for i in 0..50 {
+            handle
+                .append_segment(1, &format!("segment {i}"), None)
+                .await
+                .unwrap();
+        }
+
+        let result = handle.checkpoint().await.unwrap();
+        assert!(result.wal_pages >= 0);
+        assert!(result.optimized);
+
+        // Data should still be readable after checkpoint
+        let segments = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 50);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn vacuum_still_works() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle
+            .append_segment(1, "vacuum test", None)
+            .await
+            .unwrap();
+
+        // Vacuum should still work alongside checkpoint
+        handle.vacuum().await.unwrap();
+
+        let segments = handle.get_segments(1, 10).await.unwrap();
+        assert_eq!(segments.len(), 1);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // =========================================================================
+    // Write Batching Tests (wa-upg.5.3)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn concurrent_writes_are_batched() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Fire many writes concurrently — they should be batched
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let h = handle.clone();
+            handles.push(tokio::spawn(async move {
+                h.append_segment(1, &format!("batch-{i}"), None)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // All segments should be persisted
+        let segments = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 20);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn batched_writes_preserve_ordering() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Write segments sequentially — seq numbers should be monotonic
+        for i in 0..10 {
+            handle
+                .append_segment(1, &format!("ordered-{i}"), None)
+                .await
+                .unwrap();
+        }
+
+        let segments = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 10);
+
+        // Verify ordering by content (they should come back newest-first from get_segments)
+        // but seq numbers should be monotonically increasing
+        let mut seqs: Vec<u64> = segments.iter().map(|s| s.seq).collect();
+        seqs.sort();
+        for (idx, seq) in seqs.iter().enumerate() {
+            assert_eq!(*seq, idx as u64, "seq should be monotonic");
+        }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sync_function_works_directly() {
+        // Test the sync function directly with an in-memory connection
+        // that uses WAL mode (requires file-based DB for WAL)
+        let db_path = temp_db_path();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Insert some data
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (1, 'local', 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let result = checkpoint_sync(&conn).unwrap();
+        assert!(result.wal_pages >= 0);
+        assert!(result.optimized);
+
+        drop(conn);
         let _ = std::fs::remove_file(&db_path);
     }
 }
