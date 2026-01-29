@@ -55,6 +55,7 @@ pub mod error_codes;
 pub mod event_templates;
 pub mod events;
 pub mod explanations;
+pub mod export;
 pub mod ingest;
 #[cfg(unix)]
 pub mod ipc;
