@@ -20,9 +20,9 @@ use wa_core::storage::{MigrationPlan, MigrationStatusReport};
 #[command(name = "wa")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Enable verbose output
-    #[arg(short, long, global = true)]
-    verbose: bool,
+    /// Increase verbosity (-v for verbose, -vv for debug)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Configuration file path
     #[arg(short, long, global = true)]
@@ -39,6 +39,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the watcher daemon
+    #[command(after_help = r#"EXAMPLES:
+    wa watch                          Start daemon (backgrounds by default)
+    wa watch --foreground             Stay in foreground for debugging
+    wa watch --auto-handle            Enable automatic workflow execution
+    wa watch --poll-interval 2000     Poll WezTerm every 2 seconds
+
+SEE ALSO:
+    wa stop       Stop the running watcher
+    wa status     Show watcher and pane overview
+    wa doctor     Check environment prerequisites"#)]
     Watch {
         /// Enable automatic workflow handling
         #[arg(long)]
@@ -62,6 +72,16 @@ enum Commands {
     },
 
     /// Robot mode commands (machine-readable I/O)
+    #[command(after_help = r#"EXAMPLES:
+    wa robot state                    Get all panes as JSON
+    wa robot get-text 3               Get pane text (machine-readable)
+    wa robot send 3 "ls"              Send text via robot interface
+    wa robot events --unhandled       Unhandled events as JSON
+    wa robot -f json state            Force JSON output format
+
+SEE ALSO:
+    wa list       Human-readable pane listing
+    wa send       Human-readable send command"#)]
     Robot {
         /// Output format for robot responses
         #[arg(long, short = 'f', value_enum)]
@@ -76,7 +96,15 @@ enum Commands {
     },
 
     /// Search captured output (FTS query)
-    #[command(alias = "query")]
+    #[command(alias = "query", after_help = r#"EXAMPLES:
+    wa search "error"                 Find lines containing "error"
+    wa search "error" --pane 3        Search in specific pane
+    wa search "error OR warning"      FTS5 boolean query
+    wa search "error" -f json         Machine-readable output
+
+SEE ALSO:
+    wa list       List available panes
+    wa events     View detected events"#)]
     Search {
         /// Search query (FTS5 syntax)
         query: String,
@@ -99,6 +127,13 @@ enum Commands {
     },
 
     /// List panes and their status
+    #[command(after_help = r#"EXAMPLES:
+    wa list                           Show all observed and ignored panes
+    wa list --json                    Machine-readable pane listing
+
+SEE ALSO:
+    wa show       Show detailed pane information
+    wa status     Pane and system overview"#)]
     List {
         /// Output as JSON
         #[arg(long)]
@@ -106,6 +141,13 @@ enum Commands {
     },
 
     /// Show detailed pane information
+    #[command(after_help = r#"EXAMPLES:
+    wa show 3                         Show details for pane 3
+    wa show 3 --output                Include recent output text
+
+SEE ALSO:
+    wa list       List all panes
+    wa search     Search pane output"#)]
     Show {
         /// Pane ID to show
         pane_id: u64,
@@ -116,6 +158,15 @@ enum Commands {
     },
 
     /// Send text to a pane
+    #[command(after_help = r#"EXAMPLES:
+    wa send 3 "hello"                 Send text to pane 3
+    wa send 3 "ls" --wait-for "\\$"   Send and wait for prompt
+    wa send 3 "exit" --dry-run        Preview without executing
+    wa send 3 "cmd" --no-newline      Send without trailing newline
+
+SEE ALSO:
+    wa approve    Approve a denied action
+    wa why        Explain send denials"#)]
     Send {
         /// Target pane ID
         pane_id: u64,
@@ -149,6 +200,13 @@ enum Commands {
     },
 
     /// Get text from a pane
+    #[command(after_help = r#"EXAMPLES:
+    wa get-text 3                     Get recent text from pane 3
+    wa get-text 3 --escapes           Include ANSI escape sequences
+
+SEE ALSO:
+    wa search     Search across all panes
+    wa show       Show pane details"#)]
     GetText {
         /// Target pane ID
         pane_id: u64,
@@ -159,12 +217,29 @@ enum Commands {
     },
 
     /// Workflow commands
+    #[command(after_help = r#"EXAMPLES:
+    wa workflow list                  List workflow executions
+    wa workflow status <id>           Show specific execution details
+    wa workflow run <name>            Manually trigger a workflow
+
+SEE ALSO:
+    wa events     Detection events that trigger workflows
+    wa audit      Audit trail of workflow actions"#)]
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommands,
     },
 
     /// Show system status and pane overview
+    #[command(after_help = r#"EXAMPLES:
+    wa status                         System and pane overview
+    wa status -f json                 Machine-readable status
+    wa status --pane-id 3             Status for specific pane
+    wa status --health                Health check only
+
+SEE ALSO:
+    wa list       Detailed pane listing
+    wa doctor     Environment diagnostics"#)]
     Status {
         /// Output health check only (JSON)
         #[arg(long)]
@@ -188,6 +263,15 @@ enum Commands {
     },
 
     /// Show recent detection events
+    #[command(after_help = r#"EXAMPLES:
+    wa events                         Recent events (last 20)
+    wa events --pane-id 3             Events for specific pane
+    wa events --unhandled             Only unhandled events
+    wa events --rule-id codex.usage   Filter by detection rule
+
+SEE ALSO:
+    wa why        Explain event decisions
+    wa rules      List detection rules"#)]
     Events {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -218,6 +302,13 @@ enum Commands {
     ///
     /// Note: --from-status was removed in v0.2.0 (Lua performance optimization).
     /// Alt-screen detection is now handled via escape sequence parsing.
+    #[command(after_help = r#"EXAMPLES:
+    wa event --from-uservar --pane 3 --name wa_event --value <base64>
+                                      Ingest a user-var signal from pane 3
+
+SEE ALSO:
+    wa events     View detected events
+    wa watch      Start the watcher daemon"#)]
     Event {
         /// Event source is a WezTerm user-var change (currently the only supported source)
         #[arg(long)]
@@ -236,9 +327,21 @@ enum Commands {
         value: Option<String>,
     },
 
-    /// Explain decisions and workflows using built-in templates
+    /// Explain decisions and workflows using built-in templates or recent audit trail
+    #[command(after_help = r#"EXAMPLES:
+    wa why deny.alt_screen            Explain alt-screen denial
+    wa why --list                     List all explanation templates
+    wa why --recent                   Show recent deny decisions
+    wa why --recent --pane 3          Recent denials for pane 3
+    wa why --recent -f json           Machine-readable decision log
+
+SEE ALSO:
+    wa audit      Full audit trail
+    wa rules      Detection rule definitions
+    wa approve    Approve denied actions"#)]
     Why {
-        /// Template ID to explain (e.g., "deny.alt_screen")
+        /// Template ID to explain (e.g., "deny.alt_screen"), or decision type
+        /// when --recent is used (e.g., "denied", "require_approval")
         template_id: Option<String>,
 
         /// Filter templates by category prefix (deny/workflow/event)
@@ -252,9 +355,33 @@ enum Commands {
         /// List available templates
         #[arg(long)]
         list: bool,
+
+        /// Query recent actual decisions from the audit trail
+        #[arg(long)]
+        recent: bool,
+
+        /// Filter by pane ID (used with --recent)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Show a specific audit decision by record ID (used with --recent)
+        #[arg(long)]
+        decision_id: Option<i64>,
+
+        /// Maximum number of recent decisions to show (default: 5)
+        #[arg(long, default_value = "5")]
+        limit: usize,
     },
 
     /// Stop a running watcher in the current workspace
+    #[command(after_help = r#"EXAMPLES:
+    wa stop                           Graceful shutdown (SIGTERM)
+    wa stop --force                   SIGKILL after timeout
+    wa stop --timeout 10              Wait 10s before giving up
+
+SEE ALSO:
+    wa watch      Start the watcher daemon
+    wa status     Check if watcher is running"#)]
     Stop {
         /// Force kill with SIGKILL if graceful shutdown times out
         #[arg(long)]
@@ -266,6 +393,14 @@ enum Commands {
     },
 
     /// Submit an approval code for a pending action
+    #[command(after_help = r#"EXAMPLES:
+    wa approve AB12CD34              Submit an approval code
+    wa approve AB12CD34 --pane 3     Validate against specific pane
+    wa approve AB12CD34 --dry-run    Check status without consuming
+
+SEE ALSO:
+    wa why        Explain why an action was denied
+    wa audit      Review action history"#)]
     Approve {
         /// The approval code (8-character alphanumeric)
         code: String,
@@ -284,6 +419,18 @@ enum Commands {
     },
 
     /// Show audit trail (recent actions, policy decisions)
+    #[command(after_help = r#"EXAMPLES:
+    wa audit                          Recent audit records (last 20)
+    wa audit -l 50                    Show more records
+    wa audit -p 3                     Filter by pane
+    wa audit -d deny                  Only denied decisions
+    wa audit -k send_text             Only send_text actions
+    wa audit -f json                  Machine-readable output
+
+SEE ALSO:
+    wa why        Explain specific decisions
+    wa events     Detection events
+    wa approve    Approve denied actions"#)]
     Audit {
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -319,6 +466,13 @@ enum Commands {
     },
 
     /// Run diagnostics
+    #[command(after_help = r#"EXAMPLES:
+    wa doctor                         Run all environment checks
+    wa doctor --circuits              Show circuit breaker status
+
+SEE ALSO:
+    wa status     System and pane overview
+    wa config     Configuration management"#)]
     Doctor {
         /// Show circuit breaker status
         #[arg(long)]
@@ -326,6 +480,16 @@ enum Commands {
     },
 
     /// Setup helpers
+    #[command(after_help = r#"EXAMPLES:
+    wa setup --list-hosts             List SSH hosts from ~/.ssh/config
+    wa setup shell-hooks              Install shell integration hooks
+    wa setup shell-hooks --apply      Apply hook changes
+    wa setup lua-domain               Generate WezTerm SSH domain Lua
+    wa setup --dry-run                Preview all setup changes
+
+SEE ALSO:
+    wa config     Configuration management
+    wa doctor     Environment diagnostics"#)]
     Setup {
         /// List SSH hosts from ~/.ssh/config
         #[arg(long = "list-hosts")]
@@ -344,24 +508,57 @@ enum Commands {
     },
 
     /// Configuration management commands
+    #[command(after_help = r#"EXAMPLES:
+    wa config show                    Show current configuration
+    wa config show --effective --json Machine-readable effective config
+    wa config init                    Create default config file
+    wa config validate                Check config for errors
+
+SEE ALSO:
+    wa setup      Setup helpers
+    wa doctor     Environment diagnostics"#)]
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
 
     /// Database maintenance commands
+    #[command(after_help = r#"EXAMPLES:
+    wa db stats                       Show database size and record counts
+    wa db migrate                     Run pending migrations
+    wa db migrate --status            Check migration status
+
+SEE ALSO:
+    wa backup     Backup and restore
+    wa doctor     Environment diagnostics"#)]
     Db {
         #[command(subcommand)]
         command: DbCommands,
     },
 
     /// Backup and restore commands
+    #[command(after_help = r#"EXAMPLES:
+    wa backup create                  Create a database backup
+    wa backup list                    List available backups
+    wa backup restore <path>          Restore from a backup file
+
+SEE ALSO:
+    wa db         Database maintenance
+    wa config     Configuration management"#)]
     Backup {
         #[command(subcommand)]
         command: BackupCommands,
     },
 
     /// Pattern detection rules (list, test, show)
+    #[command(after_help = r#"EXAMPLES:
+    wa rules list                     List all detection rules
+    wa rules show codex.usage         Show a specific rule
+    wa rules test "Usage limit"       Test text against rules
+
+SEE ALSO:
+    wa events     Detection events
+    wa why        Explain rule decisions"#)]
     Rules {
         #[command(subcommand)]
         command: RulesCommands,
@@ -369,6 +566,14 @@ enum Commands {
 
     /// Launch the interactive TUI (requires --features tui)
     #[cfg(feature = "tui")]
+    #[command(after_help = r#"EXAMPLES:
+    wa tui                            Launch interactive dashboard
+    wa tui --debug                    Enable debug overlay
+    wa tui --refresh 2                Refresh every 2 seconds
+
+SEE ALSO:
+    wa status     CLI status overview
+    wa list       List panes"#)]
     Tui {
         /// Enable debug mode
         #[arg(long)]
@@ -582,9 +787,9 @@ enum RobotWorkflowCommands {
         #[arg(long)]
         active: bool,
 
-        /// Include step logs in response
-        #[arg(long, short)]
-        verbose: bool,
+        /// Include step logs in response (-v verbose, -vv debug)
+        #[arg(long, short, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 
     /// Abort a running workflow
@@ -611,9 +816,9 @@ enum RobotRulesCommands {
         #[arg(long)]
         agent_type: Option<String>,
 
-        /// Include rule descriptions in output
-        #[arg(long, short)]
-        verbose: bool,
+        /// Include rule descriptions in output (-v verbose, -vv debug)
+        #[arg(long, short, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 
     /// Test text against rules and show match trace
@@ -680,9 +885,9 @@ enum WorkflowCommands {
         /// Execution ID
         execution_id: String,
 
-        /// Include action plan and step logs
-        #[arg(long, short)]
-        verbose: bool,
+        /// Include action plan and step logs (-v verbose, -vv debug)
+        #[arg(long, short, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 }
 
@@ -695,9 +900,9 @@ enum RulesCommands {
         #[arg(long, short = 'a')]
         agent_type: Option<String>,
 
-        /// Show descriptions for each rule
-        #[arg(long, short)]
-        verbose: bool,
+        /// Show descriptions for each rule (-v verbose, -vv debug)
+        #[arg(long, short, action = clap::ArgAction::Count)]
+        verbose: u8,
 
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -3410,7 +3615,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     } = cli;
 
     let mut overrides = wa_core::config::ConfigOverrides::default();
-    if verbose {
+    if verbose > 0 {
         overrides.log_level = Some("debug".to_string());
     }
 
@@ -4593,7 +4798,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         match storage.get_workflow(exec_id).await {
                                             Ok(Some(record)) => {
                                                 // Get step logs if verbose
-                                                let step_logs = if verbose {
+                                                let step_logs = if verbose > 0 {
                                                     match storage.get_step_logs(exec_id).await {
                                                         Ok(logs) => Some(
                                                             logs.into_iter()
@@ -4637,7 +4842,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 } else {
                                                     None
                                                 };
-                                                let action_plan = if verbose {
+                                                let action_plan = if verbose > 0 {
                                                     match storage.get_action_plan(exec_id).await {
                                                         Ok(Some(record)) => {
                                                             Some(RobotWorkflowActionPlan {
@@ -4992,7 +5197,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             agent_type: format!("{}", rule.agent_type),
                                             event_type: rule.event_type.clone(),
                                             severity: format!("{:?}", rule.severity).to_lowercase(),
-                                            description: if verbose {
+                                            description: if verbose > 0 {
                                                 Some(rule.description.clone())
                                             } else {
                                                 None
@@ -5924,7 +6129,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 println!("Error: {error}");
                             }
 
-                            if verbose {
+                            if verbose > 0 {
                                 match storage.get_action_plan(&execution_id).await {
                                     Ok(Some(plan)) => {
                                         println!("\nAction plan:");
@@ -6008,21 +6213,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             pane_id,
         }) => {
             if health {
-                // Health check mode: simple JSON status
+                // Health check mode: JSON status including runtime health snapshot
                 let wezterm = wa_core::wezterm::WeztermClient::new();
-                let payload = serde_json::json!({
+                let snapshot = wa_core::crash::HealthSnapshot::get_global();
+                let mut payload = serde_json::json!({
                     "status": "ok",
                     "version": wa_core::VERSION,
                     "wezterm_circuit": wezterm.circuit_status(),
                 });
+                if let Some(snap) = snapshot {
+                    payload["health"] = serde_json::to_value(&snap)
+                        .unwrap_or(serde_json::Value::Null);
+                }
                 println!(
                     "{}",
                     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                // Rich status mode: pane table + summary
+                // Rich status mode: pane table + health summary
                 use wa_core::output::{
-                    OutputFormat, PaneTableRenderer, RenderContext, detect_format,
+                    HealthSnapshotRenderer, OutputFormat, PaneTableRenderer, RenderContext,
+                    detect_format,
                 };
 
                 let output_format = match format.to_lowercase().as_str() {
@@ -6095,6 +6306,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let ctx = RenderContext::new(output_format).verbose(cli.verbose);
                         let output = PaneTableRenderer::render(&records, &ctx);
                         print!("{output}");
+
+                        // Append health snapshot if daemon is running
+                        if let Some(snapshot) =
+                            wa_core::crash::HealthSnapshot::get_global()
+                        {
+                            if output_format.is_json() {
+                                // In JSON mode, print as separate object
+                                let health_json =
+                                    HealthSnapshotRenderer::render(&snapshot, &ctx);
+                                print!("{health_json}");
+                            } else {
+                                // In text mode, append compact health line
+                                println!();
+                                let health_output =
+                                    HealthSnapshotRenderer::render_compact(&snapshot, &ctx);
+                                print!("{health_output}");
+                            }
+                        }
                     }
                     Err(e) => {
                         if let wa_core::Error::Wezterm(
@@ -6232,6 +6461,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             category,
             format,
             list,
+            recent,
+            pane,
+            decision_id,
+            limit,
         }) => {
             use wa_core::explanations::{
                 format_explanation, get_explanation, list_template_ids, list_templates_by_category,
@@ -6244,6 +6477,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 _ => detect_format(),
             };
 
+            // --- Recent decision mode: query actual audit trail ---
+            if recent || decision_id.is_some() {
+                handle_why_recent(
+                    &config,
+                    &workspace_root,
+                    output_format,
+                    template_id.as_deref(),
+                    pane,
+                    decision_id,
+                    limit,
+                    cli.verbose,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // --- Template mode: static explanation lookup ---
             let should_list = list || template_id.is_none();
 
             if should_list {
@@ -6297,6 +6547,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                     println!();
                     println!("Usage: wa why <template_id>");
+                    println!("       wa why --recent [denied|require_approval] [--pane <id>]");
                 }
                 return Ok(());
             }
@@ -6638,7 +6889,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 ..Default::default()
             };
 
-            if cli.verbose {
+            if cli.verbose > 0 {
                 eprintln!("Workspace: {}", layout.root.display());
                 eprintln!("Database:  {}", layout.db_path.display());
                 if let Some(pane_id) = pane_id {
@@ -6695,8 +6946,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 check.print();
             }
 
-            let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
-            let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+            let mut has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+            let mut has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+
+            // Runtime health snapshot (only available when daemon is running in-process)
+            if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
+                use wa_core::output::{HealthDiagnosticStatus, HealthSnapshotRenderer};
+
+                println!();
+                println!("Runtime Health:");
+                let health_checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+                for hc in &health_checks {
+                    let diag = match hc.status {
+                        HealthDiagnosticStatus::Ok => {
+                            DiagnosticCheck::ok_with_detail(hc.name, &hc.detail)
+                        }
+                        HealthDiagnosticStatus::Info => {
+                            DiagnosticCheck::ok_with_detail(hc.name, &hc.detail)
+                        }
+                        HealthDiagnosticStatus::Warning => {
+                            has_warnings = true;
+                            DiagnosticCheck::warning(
+                                hc.name,
+                                &hc.detail,
+                                "Check wa status for details",
+                            )
+                        }
+                        HealthDiagnosticStatus::Error => {
+                            has_errors = true;
+                            DiagnosticCheck::error(
+                                hc.name,
+                                &hc.detail,
+                                "Investigate immediately: database may be unresponsive",
+                            )
+                        }
+                    };
+                    diag.print();
+                }
+            }
 
             if circuits {
                 use wa_core::circuit_breaker::{
@@ -7185,6 +7472,505 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
     }
 }
 
+/// Handle `wa why --recent`: query actual decisions from the audit trail and
+/// render explanations with evidence, rationale, and next-step suggestions.
+#[allow(clippy::too_many_arguments)]
+async fn handle_why_recent(
+    config: &wa_core::config::Config,
+    workspace_root: &std::path::Path,
+    output_format: wa_core::output::OutputFormat,
+    decision_type: Option<&str>,
+    pane: Option<u64>,
+    decision_id: Option<i64>,
+    limit: usize,
+    verbose: u8,
+) {
+    use wa_core::storage::AuditQuery;
+
+    // Resolve workspace layout
+    let layout = match config.workspace_layout(Some(workspace_root)) {
+        Ok(l) => l,
+        Err(e) => {
+            if output_format.is_json() {
+                println!(
+                    r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
+                    e,
+                    wa_core::VERSION
+                );
+            } else {
+                eprintln!("Error: Failed to get workspace layout: {e}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // Open storage
+    let db_path = layout.db_path.to_string_lossy();
+    let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            if output_format.is_json() {
+                println!(
+                    r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                    e,
+                    wa_core::VERSION
+                );
+            } else {
+                eprintln!("Error: Failed to open storage: {e}");
+                eprintln!("Is the database initialized? Run 'wa watch' first.");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // Map user-friendly type names to policy_decision filter values
+    let policy_filter = decision_type.map(|dt| match dt {
+        "denied" | "deny" => "deny".to_string(),
+        "require_approval" | "approval" => "require_approval".to_string(),
+        "allow" | "allowed" => "allow".to_string(),
+        other => other.to_string(),
+    });
+
+    // If fetching by specific ID, just get that one record
+    if let Some(record_id) = decision_id {
+        let query = AuditQuery {
+            limit: Some(500),
+            pane_id: pane,
+            policy_decision: policy_filter.clone(),
+            ..Default::default()
+        };
+        match storage.get_audit_actions(query).await {
+            Ok(actions) => {
+                if let Some(record) = actions.iter().find(|a| a.id == record_id) {
+                    render_why_decision(record, output_format, verbose);
+                } else {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Decision record {} not found", "version": "{}"}}"#,
+                            record_id,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Decision record {record_id} not found");
+                        eprintln!("Use 'wa why --recent' to see recent decisions.");
+                    }
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                if output_format.is_json() {
+                    println!(
+                        r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
+                        e,
+                        wa_core::VERSION
+                    );
+                } else {
+                    eprintln!("Error: Failed to query audit trail: {e}");
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Default: only show non-allow decisions (denials + require_approval)
+    let effective_filter = policy_filter.or_else(|| Some("deny".to_string()));
+
+    let query = AuditQuery {
+        limit: Some(limit),
+        pane_id: pane,
+        policy_decision: effective_filter.clone(),
+        ..Default::default()
+    };
+
+    match storage.get_audit_actions(query).await {
+        Ok(actions) => {
+            if actions.is_empty() {
+                let filter_desc = effective_filter.as_deref().unwrap_or("any");
+                if output_format.is_json() {
+                    println!(
+                        r#"{{"ok": true, "decisions": [], "count": 0, "filter": "{}", "version": "{}"}}"#,
+                        filter_desc,
+                        wa_core::VERSION
+                    );
+                } else {
+                    println!("No recent {filter_desc} decisions found.");
+                    if pane.is_some() {
+                        println!("Try without --pane to see all decisions.");
+                    }
+                    println!("Use 'wa why --recent allow' to include allowed decisions.");
+                }
+                return;
+            }
+
+            if output_format.is_json() {
+                #[derive(serde::Serialize)]
+                struct WhyRecentResponse {
+                    ok: bool,
+                    decisions: Vec<WhyDecisionJson>,
+                    count: usize,
+                    version: &'static str,
+                }
+                #[derive(serde::Serialize)]
+                struct WhyDecisionJson {
+                    id: i64,
+                    timestamp_ms: i64,
+                    action_kind: String,
+                    policy_decision: String,
+                    decision_reason: Option<String>,
+                    rule_id: Option<String>,
+                    pane_id: Option<u64>,
+                    domain: Option<String>,
+                    actor_kind: String,
+                    result: String,
+                    decision_context: Option<serde_json::Value>,
+                    explanation_template: Option<String>,
+                }
+                let decisions: Vec<WhyDecisionJson> = actions
+                    .iter()
+                    .map(|a| {
+                        let ctx_json = a
+                            .decision_context
+                            .as_ref()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                        let tmpl_id = resolve_template_id(a);
+                        WhyDecisionJson {
+                            id: a.id,
+                            timestamp_ms: a.ts,
+                            action_kind: a.action_kind.clone(),
+                            policy_decision: a.policy_decision.clone(),
+                            decision_reason: a.decision_reason.clone(),
+                            rule_id: a.rule_id.clone(),
+                            pane_id: a.pane_id,
+                            domain: a.domain.clone(),
+                            actor_kind: a.actor_kind.clone(),
+                            result: a.result.clone(),
+                            decision_context: ctx_json,
+                            explanation_template: tmpl_id,
+                        }
+                    })
+                    .collect();
+                let response = WhyRecentResponse {
+                    ok: true,
+                    count: decisions.len(),
+                    decisions,
+                    version: wa_core::VERSION,
+                };
+                println!("{}", serde_json::to_string_pretty(&response).unwrap());
+            } else {
+                println!("Recent decisions ({} found):\n", actions.len());
+                for (i, action) in actions.iter().enumerate() {
+                    if i > 0 {
+                        println!("{}", "-".repeat(60));
+                    }
+                    render_why_decision(action, output_format, verbose);
+                }
+            }
+        }
+        Err(e) => {
+            if output_format.is_json() {
+                println!(
+                    r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
+                    e,
+                    wa_core::VERSION
+                );
+            } else {
+                eprintln!("Error: Failed to query audit trail: {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Render a single audit decision as an explanation with evidence and suggestions.
+fn render_why_decision(
+    record: &wa_core::storage::AuditActionRecord,
+    output_format: wa_core::output::OutputFormat,
+    verbose: u8,
+) {
+    use wa_core::explanations::get_explanation;
+    use wa_core::policy::DecisionContext;
+
+    if output_format.is_json() {
+        let ctx_json = record
+            .decision_context
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let tmpl_id = resolve_template_id(record);
+        let tmpl = tmpl_id.as_deref().and_then(get_explanation);
+
+        #[derive(serde::Serialize)]
+        struct WhyDetailJson<'a> {
+            ok: bool,
+            id: i64,
+            timestamp_ms: i64,
+            action_kind: &'a str,
+            policy_decision: &'a str,
+            decision_reason: Option<&'a str>,
+            rule_id: Option<&'a str>,
+            pane_id: Option<u64>,
+            domain: Option<&'a str>,
+            actor_kind: &'a str,
+            result: &'a str,
+            decision_context: Option<serde_json::Value>,
+            explanation: Option<ExplanationSummary<'a>>,
+            version: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct ExplanationSummary<'a> {
+            template_id: &'a str,
+            scenario: &'a str,
+            brief: &'a str,
+            suggestions: &'a [&'a str],
+            see_also: &'a [&'a str],
+        }
+        let explanation = tmpl.map(|t| ExplanationSummary {
+            template_id: t.id,
+            scenario: t.scenario,
+            brief: t.brief,
+            suggestions: t.suggestions,
+            see_also: t.see_also,
+        });
+        let detail = WhyDetailJson {
+            ok: true,
+            id: record.id,
+            timestamp_ms: record.ts,
+            action_kind: &record.action_kind,
+            policy_decision: &record.policy_decision,
+            decision_reason: record.decision_reason.as_deref(),
+            rule_id: record.rule_id.as_deref(),
+            pane_id: record.pane_id,
+            domain: record.domain.as_deref(),
+            actor_kind: &record.actor_kind,
+            result: &record.result,
+            decision_context: ctx_json,
+            explanation,
+            version: wa_core::VERSION,
+        };
+        println!("{}", serde_json::to_string_pretty(&detail).unwrap());
+        return;
+    }
+
+    // Plain text output
+    let decision_label = match record.policy_decision.as_str() {
+        "deny" => "DENY",
+        "require_approval" => "REQUIRE APPROVAL",
+        "allow" => "ALLOW",
+        other => other,
+    };
+
+    println!("Decision: {decision_label}");
+    println!("Type: {}", record.action_kind);
+    if let Some(pane_id) = record.pane_id {
+        println!("Target: Pane {pane_id}");
+    }
+    if let Some(domain) = &record.domain {
+        println!("Domain: {domain}");
+    }
+    println!("Actor: {}", record.actor_kind);
+    let ts_str = format_epoch_ms(record.ts);
+    println!("Timestamp: {ts_str}");
+    println!("Result: {}", record.result);
+    println!("Record ID: {}", record.id);
+    println!();
+
+    // Reason
+    if let Some(reason) = &record.decision_reason {
+        println!("Reason: {reason}");
+    }
+    if let Some(rule_id) = &record.rule_id {
+        println!("Rule: {rule_id}");
+    }
+
+    // Parse decision context for evidence
+    let ctx: Option<DecisionContext> = record
+        .decision_context
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    if let Some(ref ctx) = ctx {
+        if !ctx.evidence.is_empty() {
+            println!();
+            println!("Evidence:");
+            for ev in &ctx.evidence {
+                println!("  - {}: {}", ev.key, ev.value);
+            }
+        }
+
+        if verbose > 0 && !ctx.rules_evaluated.is_empty() {
+            println!();
+            println!("Rules evaluated:");
+            for rule_eval in &ctx.rules_evaluated {
+                let status = if rule_eval.matched { "MATCH" } else { "skip" };
+                let decision_str = rule_eval
+                    .decision
+                    .as_deref()
+                    .map(|d| format!(" -> {d}"))
+                    .unwrap_or_default();
+                println!("  [{status}] {}{decision_str}", rule_eval.rule_id);
+            }
+        }
+
+        if let Some(ref rate_limit) = ctx.rate_limit {
+            println!();
+            println!(
+                "Rate limit: {}/{} per minute (scope: {}), retry after {}s",
+                rate_limit.current, rate_limit.limit, rate_limit.scope, rate_limit.retry_after_secs
+            );
+        }
+
+        if let Some(ref determining) = ctx.determining_rule {
+            println!("Determining rule: {determining}");
+        }
+    }
+
+    // Explanation template lookup
+    let tmpl_id = resolve_template_id(record);
+    if let Some(ref id) = tmpl_id {
+        if let Some(template) = get_explanation(id) {
+            println!();
+            println!("Rationale:");
+            // Use brief for compact output
+            println!("  {}", template.brief);
+            if verbose > 0 {
+                // Show detailed in verbose mode
+                for line in template.detailed.lines() {
+                    println!("  {line}");
+                }
+            }
+            if !template.suggestions.is_empty() {
+                println!();
+                println!("To proceed:");
+                for (j, suggestion) in template.suggestions.iter().enumerate() {
+                    println!("  {}. {suggestion}", j + 1);
+                }
+            }
+            if !template.see_also.is_empty() {
+                println!();
+                println!("See also: {}", template.see_also.join(", "));
+            }
+        }
+    }
+    println!();
+}
+
+/// Resolve an explanation template ID from an audit record's rule_id.
+///
+/// Maps rule IDs like "safety.alt_screen_block" to template IDs like "deny.alt_screen".
+fn resolve_template_id(record: &wa_core::storage::AuditActionRecord) -> Option<String> {
+    use wa_core::explanations::get_explanation;
+
+    let rule_id = record.rule_id.as_deref()?;
+
+    // Direct match: rule_id might already be a template ID
+    if get_explanation(rule_id).is_some() {
+        return Some(rule_id.to_string());
+    }
+
+    // Map decision type + rule_id patterns to template IDs
+    let prefix = match record.policy_decision.as_str() {
+        "deny" => "deny",
+        "require_approval" => "workflow",
+        _ => return None,
+    };
+
+    // Try prefix + last segment of rule_id
+    // e.g., "safety.alt_screen_block" -> try "deny.alt_screen_block", "deny.alt_screen"
+    let segments: Vec<&str> = rule_id.split('.').collect();
+    if let Some(last) = segments.last() {
+        let candidate = format!("{prefix}.{last}");
+        if get_explanation(&candidate).is_some() {
+            return Some(candidate);
+        }
+        // Strip common suffixes
+        for suffix in ["_block", "_blocked", "_deny", "_check"] {
+            if let Some(stripped) = last.strip_suffix(suffix) {
+                let candidate = format!("{prefix}.{stripped}");
+                if get_explanation(&candidate).is_some() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // Try decision_reason text matching as fallback
+    if let Some(reason) = &record.decision_reason {
+        let lower = reason.to_lowercase();
+        if lower.contains("alt") && lower.contains("screen") {
+            return Some("deny.alt_screen".to_string());
+        }
+        if lower.contains("command") && lower.contains("running") {
+            return Some("deny.command_running".to_string());
+        }
+        if lower.contains("rate") && lower.contains("limit") {
+            return Some("deny.rate_limited".to_string());
+        }
+        if lower.contains("gap") {
+            return Some("deny.recent_gap".to_string());
+        }
+        if lower.contains("unknown") && lower.contains("pane") {
+            return Some("deny.unknown_pane".to_string());
+        }
+        if lower.contains("permission") {
+            return Some("deny.permission".to_string());
+        }
+        if lower.contains("approval") {
+            return Some("workflow.approval_needed".to_string());
+        }
+    }
+
+    None
+}
+
+/// Format epoch milliseconds as ISO 8601 string (basic, no chrono dependency).
+fn format_epoch_ms(ms: i64) -> String {
+    let secs = ms / 1000;
+    let subsec_ms = (ms % 1000).unsigned_abs();
+    // Use the same approach as chrono_stub_now but from epoch
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let hours = day_secs / 3600;
+    let mins = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+
+    // Approximate date from days since epoch (1970-01-01)
+    // This is a simplified calculation sufficient for display
+    let mut y = 1970i64;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days: [i64; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining < md {
+            m = i;
+            break;
+        }
+        remaining -= md;
+    }
+    let d = remaining + 1;
+
+    format!(
+        "{y:04}-{:02}-{d:02}T{hours:02}:{mins:02}:{s:02}.{subsec_ms:03}Z",
+        m + 1
+    )
+}
+
 /// Handle `wa rules` subcommands
 fn handle_rules_command(command: RulesCommands) {
     use wa_core::output::{
@@ -7239,7 +8025,7 @@ fn handle_rules_command(command: RulesCommands) {
                 .collect();
 
             let ctx = RenderContext::new(fmt).verbose(verbose);
-            let output = if verbose {
+            let output = if verbose > 0 {
                 RulesListRenderer::render_verbose(&rules, &ctx)
             } else {
                 RulesListRenderer::render(&rules, &ctx)
@@ -8519,7 +9305,7 @@ fn format_backup_hint(path: &Path) -> String {
     path.with_file_name(backup_name).display().to_string()
 }
 
-fn run_guided_setup(apply: bool, dry_run: bool, verbose: bool) -> anyhow::Result<()> {
+fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Result<()> {
     use wa_core::setup::{self, ShellType};
 
     let apply_changes = apply && !dry_run;
@@ -8544,7 +9330,7 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: bool) -> anyhow::Result
     // Step 2: scrollback configuration
     match check_wezterm_scrollback() {
         Ok((lines, path)) => {
-            if verbose {
+            if verbose > 0 {
                 println!("  WezTerm config: {}", path.display());
             }
             if lines >= RECOMMENDED_SCROLLBACK_LINES {
@@ -8570,7 +9356,7 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: bool) -> anyhow::Result
     // Step 3: WezTerm user-var forwarding + status update block
     match setup::locate_wezterm_config() {
         Ok(path) => {
-            if verbose {
+            if verbose > 0 {
                 println!("  WezTerm config path: {}", path.display());
             }
             match std::fs::read_to_string(&path) {
@@ -8607,7 +9393,7 @@ fn run_guided_setup(apply: bool, dry_run: bool, verbose: bool) -> anyhow::Result
     match ShellType::detect() {
         Some(shell_type) => match setup::locate_shell_rc(shell_type) {
             Ok(rc_path) => {
-                if verbose {
+                if verbose > 0 {
                     println!("  Shell rc path: {}", rc_path.display());
                 }
                 let content = if rc_path.exists() {
@@ -8702,7 +9488,7 @@ struct RemoteSetupOptions<'a> {
     wa_path: Option<&'a Path>,
     wa_version: Option<&'a str>,
     timeout_secs: u64,
-    verbose: bool,
+    verbose: u8,
 }
 
 fn run_remote_command(
@@ -8749,9 +9535,9 @@ fn print_remote_output(
     redactor: &wa_core::policy::Redactor,
     label: &str,
     text: &str,
-    verbose: bool,
+    verbose: u8,
 ) {
-    if !verbose {
+    if verbose == 0 {
         return;
     }
     let trimmed = text.trim();
@@ -8769,13 +9555,13 @@ fn run_remote_step<F>(
     timeout: std::time::Duration,
     runner: &F,
     redactor: &wa_core::policy::Redactor,
-    verbose: bool,
+    verbose: u8,
     require_success: bool,
 ) -> anyhow::Result<RemoteCommandOutput>
 where
     F: Fn(&str, &str, std::time::Duration) -> anyhow::Result<RemoteCommandOutput>,
 {
-    if verbose {
+    if verbose > 0 {
         let redacted_cmd = redactor.redact(command);
         println!("• {name}");
         println!("  cmd: {redacted_cmd}");
@@ -8785,8 +9571,8 @@ where
 
     let output = runner(host, command, timeout)?;
     if require_success && !output.status.success() {
-        print_remote_output(redactor, "stdout", &output.stdout, true);
-        print_remote_output(redactor, "stderr", &output.stderr, true);
+        print_remote_output(redactor, "stdout", &output.stdout, 1);
+        print_remote_output(redactor, "stderr", &output.stderr, 1);
         anyhow::bail!(
             "{} failed (exit {:?})",
             name,
