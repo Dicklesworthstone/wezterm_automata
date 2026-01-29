@@ -641,7 +641,7 @@ SEE ALSO:
     },
 
     /// Browser authentication testing and profile management
-    #[command(subcommand, after_help = r#"EXAMPLES:
+    #[command(after_help = r#"EXAMPLES:
     wa auth test openai --account work      Test OpenAI device auth
     wa auth test openai --headful           Debug mode (visible browser)
     wa auth status openai                   Check profile health
@@ -652,6 +652,66 @@ SEE ALSO:
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+
+    /// Export data to JSONL/NDJSON (segments, events, workflows, etc.)
+    #[command(after_help = r#"EXAMPLES:
+    wa export segments                    Export all output segments
+    wa export events --pane-id 3          Export events for pane 3
+    wa export audit --since 1706000000   Export audit since timestamp
+    wa export workflows --limit 50        Export last 50 workflows
+    wa export sessions --no-redact        Export sessions without redaction (WARNING)
+    wa export reservations --pretty       Pretty-print JSON output
+
+SUPPORTED KINDS:
+    segments      Output capture segments (text + metadata)
+    gaps          Output discontinuities
+    events        Pattern detections
+    workflows     Workflow executions + step logs
+    sessions      Agent session records
+    audit         Audit trail (policy decisions)
+    reservations  Pane reservations (active + historical)
+
+SAFETY:
+    Redaction is ON by default.  All text that matches secret patterns
+    (API keys, tokens, passwords) is replaced with [REDACTED].
+    Use --no-redact to export raw data (a warning is printed to stderr).
+
+SEE ALSO:
+    wa events     Human-readable event listing
+    wa audit      Human-readable audit trail
+    wa search     Full-text search"#)]
+    Export {
+        /// Data kind to export
+        kind: String,
+
+        /// Filter by pane ID
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Filter: only records since this timestamp (epoch ms)
+        #[arg(long)]
+        since: Option<i64>,
+
+        /// Filter: only records until this timestamp (epoch ms)
+        #[arg(long)]
+        until: Option<i64>,
+
+        /// Maximum number of records to export (default: 10000)
+        #[arg(long, short = 'l')]
+        limit: Option<usize>,
+
+        /// Disable secret redaction (WARNING: may expose sensitive data)
+        #[arg(long)]
+        no_redact: bool,
+
+        /// Pretty-print JSON (multi-line, indented)
+        #[arg(long)]
+        pretty: bool,
+
+        /// Write output to file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
 
     /// Show prioritized issues needing attention
@@ -10829,6 +10889,400 @@ fn print_migration_plan(plan: &MigrationPlan) {
             desc = step.description
         );
     }
+}
+
+// =============================================================================
+// Auth command handler
+// =============================================================================
+
+#[cfg(feature = "browser")]
+async fn handle_auth_command(
+    command: AuthCommands,
+    layout: &wa_core::config::WorkspaceLayout,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    use wa_core::browser::{BrowserConfig, BrowserContext, BrowserProfile};
+
+    match command {
+        AuthCommands::Test {
+            service,
+            account,
+            headful,
+            timeout_secs: _,
+            json,
+        } => {
+            let config = BrowserConfig {
+                headless: !headful,
+                ..Default::default()
+            };
+            let mut ctx = BrowserContext::new(config, &layout.wa_dir);
+
+            let outcome = match ctx.ensure_ready() {
+                Ok(()) => {
+                    let profile = ctx.profile(&service, &account);
+                    if profile.has_storage_state() {
+                        let metadata = profile.read_metadata().ok().flatten();
+                        AuthTestOutcome::Success {
+                            service: service.clone(),
+                            account: account.clone(),
+                            elapsed_ms: None,
+                            last_bootstrapped: metadata
+                                .as_ref()
+                                .and_then(|m| m.bootstrapped_at.clone()),
+                        }
+                    } else if profile.exists() {
+                        AuthTestOutcome::NeedsHuman {
+                            service: service.clone(),
+                            account: account.clone(),
+                            reason: "Profile exists but no storage state \
+                                     (session expired or never bootstrapped)"
+                                .into(),
+                            next_step: format!(
+                                "Run: wa auth bootstrap {service} --account {account}"
+                            ),
+                        }
+                    } else {
+                        AuthTestOutcome::NeedsHuman {
+                            service: service.clone(),
+                            account: account.clone(),
+                            reason: "No browser profile found for this service/account".into(),
+                            next_step: format!(
+                                "Run: wa auth bootstrap {service} --account {account}"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => AuthTestOutcome::Fail {
+                    service: service.clone(),
+                    account: account.clone(),
+                    error: format!("Browser initialization failed: {e}"),
+                    next_step: Some(
+                        "Check that Playwright is installed: npx playwright install chromium"
+                            .into(),
+                    ),
+                },
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&outcome)
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                );
+            } else {
+                match &outcome {
+                    AuthTestOutcome::Success {
+                        service,
+                        account,
+                        last_bootstrapped,
+                        ..
+                    } => {
+                        println!("✓ Auth test passed: {service}/{account}");
+                        if let Some(ts) = last_bootstrapped {
+                            println!("  Bootstrapped: {ts}");
+                        }
+                        if verbose {
+                            let profile = ctx.profile(service, account);
+                            println!("  Profile: {}", profile.path().display());
+                        }
+                    }
+                    AuthTestOutcome::NeedsHuman {
+                        service,
+                        account,
+                        reason,
+                        next_step,
+                    } => {
+                        println!("⚠ Auth test: needs human: {service}/{account}");
+                        println!("  Reason: {reason}");
+                        println!("  Next: {next_step}");
+                    }
+                    AuthTestOutcome::Fail {
+                        service,
+                        account,
+                        error,
+                        next_step,
+                    } => {
+                        eprintln!("✗ Auth test failed: {service}/{account}");
+                        eprintln!("  Error: {error}");
+                        if let Some(step) = next_step {
+                            eprintln!("  Next: {step}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
+        AuthCommands::Status {
+            service,
+            account,
+            all,
+            json,
+        } => {
+            let config = BrowserConfig::default();
+            let ctx = BrowserContext::new(config, &layout.wa_dir);
+            let profiles_root = ctx.profiles_root();
+
+            let mut statuses: Vec<AuthProfileStatus> = Vec::new();
+
+            if all {
+                if profiles_root.is_dir() {
+                    if let Ok(services) = std::fs::read_dir(profiles_root) {
+                        for svc_entry in services.flatten() {
+                            if !svc_entry.path().is_dir() {
+                                continue;
+                            }
+                            let svc_name = svc_entry.file_name().to_string_lossy().to_string();
+                            if let Ok(accounts) = std::fs::read_dir(svc_entry.path()) {
+                                for acct_entry in accounts.flatten() {
+                                    if !acct_entry.path().is_dir() {
+                                        continue;
+                                    }
+                                    let acct_name =
+                                        acct_entry.file_name().to_string_lossy().to_string();
+                                    let profile =
+                                        BrowserProfile::new(profiles_root, &svc_name, &acct_name);
+                                    statuses.push(build_profile_status(&profile));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if statuses.is_empty() {
+                    if json {
+                        println!("[]");
+                    } else {
+                        println!("No browser profiles found.");
+                        println!("  Profiles dir: {}", profiles_root.display());
+                        println!("  Hint: Run 'wa auth bootstrap <service>' to create one.");
+                    }
+                    return Ok(());
+                }
+            } else {
+                let svc = service.as_deref().unwrap_or_else(|| {
+                    eprintln!("Error: --service is required unless --all is used.");
+                    std::process::exit(1);
+                });
+                let profile = BrowserProfile::new(profiles_root, svc, &account);
+                statuses.push(build_profile_status(&profile));
+            }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&statuses)
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                );
+            } else {
+                for status in &statuses {
+                    println!("Profile: {}/{}", status.service, status.account);
+                    println!(
+                        "  Exists: {}",
+                        if status.profile_exists { "yes" } else { "no" }
+                    );
+                    println!(
+                        "  Storage state: {}",
+                        if status.has_storage_state {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
+                    if let Some(ts) = &status.bootstrapped_at {
+                        println!("  Bootstrapped: {ts}");
+                    }
+                    if let Some(method) = &status.bootstrap_method {
+                        println!("  Method: {method}");
+                    }
+                    if let Some(ts) = &status.last_used_at {
+                        println!("  Last used: {ts}");
+                    }
+                    if let Some(count) = status.automated_use_count {
+                        println!("  Automated uses: {count}");
+                    }
+                    if verbose {
+                        let profile = BrowserProfile::new(
+                            profiles_root,
+                            &status.service,
+                            &status.account,
+                        );
+                        println!("  Path: {}", profile.path().display());
+                    }
+                    println!();
+                }
+            }
+        }
+
+        AuthCommands::Bootstrap {
+            service,
+            account,
+            login_url,
+            timeout_secs,
+            json,
+        } => {
+            use wa_core::browser::bootstrap::{
+                BootstrapConfig, BootstrapResult, InteractiveBootstrap,
+            };
+
+            let config = BrowserConfig {
+                headless: false, // Bootstrap always visible
+                ..Default::default()
+            };
+            let mut ctx = BrowserContext::new(config, &layout.wa_dir);
+
+            if let Err(e) = ctx.ensure_ready() {
+                if json {
+                    let resp = serde_json::json!({
+                        "ok": false,
+                        "error": format!("Browser initialization failed: {e}"),
+                        "error_code": "E_BROWSER_NOT_READY",
+                        "hint": "Check that Playwright is installed: npx playwright install chromium",
+                    });
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else {
+                    eprintln!("Error: Browser initialization failed: {e}");
+                    eprintln!("Hint: npx playwright install chromium");
+                }
+                std::process::exit(1);
+            }
+
+            let profile = ctx.profile(&service, &account);
+
+            let mut bootstrap_config = BootstrapConfig::default();
+            if let Some(url) = &login_url {
+                bootstrap_config.login_url = url.clone();
+            }
+            bootstrap_config.timeout_ms = timeout_secs * 1000;
+
+            if !json {
+                println!("Starting interactive bootstrap for {service}/{account}");
+                println!("  Login URL: {}", bootstrap_config.login_url);
+                println!("  Timeout: {timeout_secs}s");
+                println!();
+                println!("A browser window will open. Complete login manually.");
+                println!("Press Ctrl+C to cancel.");
+                println!();
+            }
+
+            let bootstrap = InteractiveBootstrap::new(bootstrap_config);
+            let result = bootstrap.execute(&ctx, &profile, login_url.as_deref());
+
+            match &result {
+                BootstrapResult::Success {
+                    elapsed_ms,
+                    profile_dir,
+                } => {
+                    if json {
+                        let resp = serde_json::json!({
+                            "ok": true,
+                            "status": "success",
+                            "service": service,
+                            "account": account,
+                            "elapsed_ms": elapsed_ms,
+                            "profile_dir": profile_dir.display().to_string(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        println!("✓ Bootstrap complete: {service}/{account}");
+                        println!("  Elapsed: {elapsed_ms}ms");
+                        if verbose {
+                            println!("  Profile: {}", profile_dir.display());
+                        }
+                        println!();
+                        println!(
+                            "You can now run: wa auth test {service} --account {account}"
+                        );
+                    }
+                }
+                BootstrapResult::Timeout { waited_ms } => {
+                    if json {
+                        let resp = serde_json::json!({
+                            "ok": false,
+                            "status": "timeout",
+                            "service": service,
+                            "account": account,
+                            "waited_ms": waited_ms,
+                            "error_code": "E_BOOTSTRAP_TIMEOUT",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        eprintln!(
+                            "✗ Bootstrap timed out after {}s: {service}/{account}",
+                            waited_ms / 1000
+                        );
+                        eprintln!(
+                            "  Hint: Use --timeout-secs to increase (current: {timeout_secs}s)"
+                        );
+                    }
+                    std::process::exit(1);
+                }
+                BootstrapResult::Cancelled { reason } => {
+                    if json {
+                        let resp = serde_json::json!({
+                            "ok": false,
+                            "status": "cancelled",
+                            "service": service,
+                            "account": account,
+                            "reason": reason,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        println!("Bootstrap cancelled: {reason}");
+                    }
+                }
+                BootstrapResult::Failed { error } => {
+                    if json {
+                        let resp = serde_json::json!({
+                            "ok": false,
+                            "status": "failed",
+                            "service": service,
+                            "account": account,
+                            "error": error,
+                            "error_code": "E_BOOTSTRAP_FAILED",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        eprintln!("✗ Bootstrap failed: {service}/{account}");
+                        eprintln!("  Error: {error}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "browser")]
+fn build_profile_status(profile: &wa_core::browser::BrowserProfile) -> AuthProfileStatus {
+    let metadata = profile.read_metadata().ok().flatten();
+    AuthProfileStatus {
+        service: profile.service.clone(),
+        account: profile.account.clone(),
+        profile_exists: profile.exists(),
+        has_storage_state: profile.has_storage_state(),
+        bootstrapped_at: metadata.as_ref().and_then(|m| m.bootstrapped_at.clone()),
+        bootstrap_method: metadata.as_ref().and_then(|m| {
+            m.bootstrap_method
+                .as_ref()
+                .map(|b| format!("{b:?}").to_lowercase())
+        }),
+        last_used_at: metadata.as_ref().and_then(|m| m.last_used_at.clone()),
+        automated_use_count: metadata.map(|m| m.automated_use_count),
+    }
+}
+
+#[cfg(not(feature = "browser"))]
+async fn handle_auth_command(
+    _command: AuthCommands,
+    _layout: &wa_core::config::WorkspaceLayout,
+    _verbose: bool,
+) -> anyhow::Result<()> {
+    eprintln!("Error: Browser feature not enabled.");
+    eprintln!("Rebuild with: cargo build -p wa --features browser");
+    std::process::exit(1);
 }
 
 fn prompt_confirm(prompt: &str) -> anyhow::Result<bool> {
