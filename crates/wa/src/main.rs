@@ -7077,7 +7077,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Rules { command }) => {
-            handle_rules_command(command)?;
+            handle_rules_command(command);
         }
 
         #[cfg(feature = "tui")]
@@ -7149,7 +7149,7 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
 }
 
 /// Handle `wa rules` subcommands
-fn handle_rules_command(command: RulesCommands) -> anyhow::Result<()> {
+fn handle_rules_command(command: RulesCommands) {
     use wa_core::output::{
         OutputFormat, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem,
         RuleTestMatch, RulesListRenderer, RulesTestRenderer, detect_format,
@@ -7276,8 +7276,6 @@ fn handle_rules_command(command: RulesCommands) -> anyhow::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 /// Handle `wa config` subcommands
