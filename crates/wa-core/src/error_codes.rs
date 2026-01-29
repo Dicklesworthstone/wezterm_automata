@@ -265,6 +265,46 @@ pub static WA_1020: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-1021: WezTerm parse error
+pub static WA_1021: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-1021",
+    category: ErrorCategory::Wezterm,
+    title: "WezTerm parse error",
+    description: "Failed to parse output or response from WezTerm CLI. The data \
+                  received was not in the expected format.",
+    causes: &[
+        "WezTerm returned unexpected output format",
+        "Corrupted or truncated response",
+        "Version mismatch between wa and WezTerm",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Check WezTerm version", "wezterm --version"),
+        RecoveryStep::with_command("Run diagnostics", "wa doctor"),
+        RecoveryStep::text("Update WezTerm to the latest stable version"),
+    ],
+    doc_link: None,
+};
+
+/// WA-1022: WezTerm command timeout
+pub static WA_1022: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-1022",
+    category: ErrorCategory::Wezterm,
+    title: "WezTerm command timeout",
+    description: "A WezTerm CLI command timed out before completing. The operation \
+                  may still be running in the background.",
+    causes: &[
+        "WezTerm is under heavy load",
+        "System resources are constrained",
+        "Large amount of terminal output being processed",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Check WezTerm responsiveness", "wezterm cli list"),
+        RecoveryStep::text("Retry after a brief wait"),
+        RecoveryStep::text("Restart WezTerm if timeouts persist"),
+    ],
+    doc_link: None,
+};
+
 /// WA-1030: JSON parse error from WezTerm
 pub static WA_1030: ErrorCodeDef = ErrorCodeDef {
     code: "WA-1030",
@@ -412,6 +452,46 @@ pub static WA_2020: ErrorCodeDef = ErrorCodeDef {
     doc_link: Some("https://www.sqlite.org/fts5.html#full_text_query_syntax"),
 };
 
+/// WA-2030: Database corruption detected
+pub static WA_2030: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-2030",
+    category: ErrorCategory::Storage,
+    title: "Database corruption detected",
+    description: "The database integrity check failed or corruption was detected \
+                  during a read/write operation.",
+    causes: &[
+        "Unexpected system shutdown during write",
+        "Disk hardware failure",
+        "Database file modified by external process",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Run diagnostics", "wa doctor"),
+        RecoveryStep::text("Back up the database file immediately"),
+        RecoveryStep::text("Delete and recreate the database if data is not critical"),
+    ],
+    doc_link: None,
+};
+
+/// WA-2040: Storage record not found
+pub static WA_2040: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-2040",
+    category: ErrorCategory::Storage,
+    title: "Storage record not found",
+    description: "The requested record does not exist in the database. It may have \
+                  been deleted by retention cleanup or never existed.",
+    causes: &[
+        "Record was deleted by retention policy",
+        "ID refers to a non-existent record",
+        "Database was recreated since the ID was issued",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("List recent records", "wa robot events --limit 20"),
+        RecoveryStep::text("Verify the record ID is correct"),
+        RecoveryStep::text("The record may have been removed by automatic cleanup"),
+    ],
+    doc_link: None,
+};
+
 // --- Pattern Errors (WA-3xxx) ---
 
 /// WA-3001: Invalid regex
@@ -472,6 +552,29 @@ pub static WA_3010: ErrorCodeDef = ErrorCodeDef {
         RecoveryStep::text("Add anchors or atomic groups to prevent backtracking"),
         RecoveryStep::with_command(
             "Disable problematic pack",
+            "wa config set patterns.disabled '[\"pack-name\"]'",
+        ),
+    ],
+    doc_link: None,
+};
+
+/// WA-3020: Pattern match timeout
+pub static WA_3020: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-3020",
+    category: ErrorCategory::Pattern,
+    title: "Pattern match timeout",
+    description: "A pattern match operation timed out. This usually indicates a \
+                  regex with catastrophic backtracking on the given input.",
+    causes: &[
+        "Complex regex with nested quantifiers",
+        "Very large input text exceeding match budget",
+        "Catastrophic backtracking in pattern",
+    ],
+    recovery_steps: &[
+        RecoveryStep::text("Simplify the pattern regex"),
+        RecoveryStep::text("Add anchors or atomic groups to prevent backtracking"),
+        RecoveryStep::with_command(
+            "Disable the problematic pack",
             "wa config set patterns.disabled '[\"pack-name\"]'",
         ),
     ],
@@ -667,6 +770,26 @@ pub static WA_5020: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-5030: Pane locked by another workflow
+pub static WA_5030: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-5030",
+    category: ErrorCategory::Workflow,
+    title: "Pane locked",
+    description: "The target pane is locked by an active workflow. Only one workflow \
+                  can control a pane at a time to prevent conflicts.",
+    causes: &[
+        "Another workflow is currently executing on this pane",
+        "A workflow is waiting for a pattern or condition",
+        "Stale lock from a crashed workflow",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Check running workflows", "wa workflow status"),
+        RecoveryStep::text("Wait for the current workflow to complete"),
+        RecoveryStep::with_command("Abort stuck workflow", "wa workflow abort <id>"),
+    ],
+    doc_link: None,
+};
+
 // --- Network Errors (WA-6xxx) ---
 
 /// WA-6001: IPC connection failed
@@ -724,6 +847,46 @@ pub static WA_7002: ErrorCodeDef = ErrorCodeDef {
         RecoveryStep::with_command("Validate config", "wa config validate"),
         RecoveryStep::text("Check for syntax errors in wa.toml"),
         RecoveryStep::text("Ensure all values have correct types"),
+    ],
+    doc_link: None,
+};
+
+/// WA-7003: Config parse error (TOML)
+pub static WA_7003: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-7003",
+    category: ErrorCategory::Config,
+    title: "Config parse error",
+    description: "The configuration file could not be parsed. It may contain \
+                  invalid TOML syntax or unexpected value types.",
+    causes: &[
+        "Invalid TOML syntax in wa.toml",
+        "Incorrect value types for configuration keys",
+        "Encoding issues in the configuration file",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Validate config syntax", "wa config validate"),
+        RecoveryStep::text("Check for unmatched quotes, brackets, or invalid characters"),
+        RecoveryStep::text("Compare against a known-good configuration"),
+    ],
+    doc_link: None,
+};
+
+/// WA-7004: Config serialization failed
+pub static WA_7004: ErrorCodeDef = ErrorCodeDef {
+    code: "WA-7004",
+    category: ErrorCategory::Config,
+    title: "Config serialization failed",
+    description: "Failed to serialize configuration to TOML format. This is an \
+                  internal error that should not normally occur.",
+    causes: &[
+        "Internal data structure contains unsupported types",
+        "Bug in configuration serialization code",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Run diagnostics", "wa doctor"),
+        RecoveryStep::text(
+            "Report the issue at https://github.com/Dicklesworthstone/wezterm_automata/issues",
+        ),
     ],
     doc_link: None,
 };
@@ -818,6 +981,8 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("WA-1003", &WA_1003);
         m.insert("WA-1010", &WA_1010);
         m.insert("WA-1020", &WA_1020);
+        m.insert("WA-1021", &WA_1021);
+        m.insert("WA-1022", &WA_1022);
         m.insert("WA-1030", &WA_1030);
         // Storage errors
         m.insert("WA-2001", &WA_2001);
@@ -826,10 +991,13 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("WA-2004", &WA_2004);
         m.insert("WA-2010", &WA_2010);
         m.insert("WA-2020", &WA_2020);
+        m.insert("WA-2030", &WA_2030);
+        m.insert("WA-2040", &WA_2040);
         // Pattern errors
         m.insert("WA-3001", &WA_3001);
         m.insert("WA-3002", &WA_3002);
         m.insert("WA-3010", &WA_3010);
+        m.insert("WA-3020", &WA_3020);
         // Policy errors
         m.insert("WA-4001", &WA_4001);
         m.insert("WA-4002", &WA_4002);
@@ -841,11 +1009,14 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("WA-5002", &WA_5002);
         m.insert("WA-5010", &WA_5010);
         m.insert("WA-5020", &WA_5020);
+        m.insert("WA-5030", &WA_5030);
         // Network errors
         m.insert("WA-6001", &WA_6001);
         // Config errors
         m.insert("WA-7001", &WA_7001);
         m.insert("WA-7002", &WA_7002);
+        m.insert("WA-7003", &WA_7003);
+        m.insert("WA-7004", &WA_7004);
         m.insert("WA-7010", &WA_7010);
         // Internal errors
         m.insert("WA-9001", &WA_9001);
