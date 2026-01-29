@@ -9,8 +9,8 @@ use serde::Serialize;
 
 use crate::policy::Redactor;
 use crate::storage::{
-    AgentSessionRecord, AuditActionRecord, AuditQuery, EventQuery, ExportQuery, Gap,
-    PaneReservation, Segment, StorageHandle, StoredEvent, WorkflowRecord, WorkflowStepLogRecord,
+    AuditQuery, EventQuery, ExportQuery, Segment, StorageHandle, StoredEvent,
+    WorkflowStepLogRecord,
 };
 
 /// Data kinds available for export.
@@ -408,8 +408,10 @@ mod tests {
         write_record(&mut buf, &seg, false).unwrap();
         let line = String::from_utf8(buf).unwrap();
         assert!(line.ends_with('\n'));
-        assert!(!line.contains('\n', ));
-        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        // Should be exactly one line (no embedded newlines)
+        let trimmed = line.trim_end_matches('\n');
+        assert!(!trimmed.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap();
         assert_eq!(parsed["pane_id"], 2);
         assert_eq!(parsed["content"], "hello");
     }
@@ -443,7 +445,7 @@ mod tests {
         };
         storage.upsert_pane(pane).await.unwrap();
         storage
-            .append_segment(1, 1, "test content", 12, None)
+            .append_segment(1, "test content", None)
             .await
             .unwrap();
 
@@ -503,7 +505,7 @@ mod tests {
         };
         storage.upsert_pane(pane).await.unwrap();
         storage
-            .append_segment(1, 1, "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v", 50, None)
+            .append_segment(1, "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v", None)
             .await
             .unwrap();
 
@@ -562,8 +564,8 @@ mod tests {
             storage.upsert_pane(pane).await.unwrap();
         }
 
-        storage.append_segment(1, 1, "pane1 data", 10, None).await.unwrap();
-        storage.append_segment(2, 1, "pane2 data", 10, None).await.unwrap();
+        storage.append_segment(1, "pane1 data", None).await.unwrap();
+        storage.append_segment(2, "pane2 data", None).await.unwrap();
 
         // Export only pane 1
         let opts = ExportOptions {
@@ -614,7 +616,7 @@ mod tests {
             last_decision_at: None,
         };
         storage.upsert_pane(pane).await.unwrap();
-        storage.append_segment(1, 1, "test", 4, None).await.unwrap();
+        storage.append_segment(1, "test", None).await.unwrap();
 
         let opts = ExportOptions {
             kind: ExportKind::Segments,

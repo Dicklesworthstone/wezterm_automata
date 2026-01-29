@@ -1516,6 +1516,7 @@ NOTE: Opens a visible browser window. You must complete login manually."#)]
 }
 
 /// Outcome of a browser auth test, matching the auth realities matrix.
+#[cfg(feature = "browser")]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "outcome")]
 enum AuthTestOutcome {
@@ -1549,6 +1550,7 @@ enum AuthTestOutcome {
 }
 
 /// Profile status for `wa auth status`.
+#[cfg(feature = "browser")]
 #[derive(Debug, Clone, serde::Serialize)]
 struct AuthProfileStatus {
     service: String,
@@ -14611,5 +14613,208 @@ mod tests {
         assert_eq!(info.owner_kind, "agent");
         assert_eq!(info.reason.as_deref(), Some("migration"));
         assert!(r.is_active(30_000));
+    }
+
+    // =========================================================================
+    // Auth command tests (browser feature)
+    // =========================================================================
+
+    #[cfg(feature = "browser")]
+    mod auth_tests {
+        use super::*;
+
+        #[test]
+        fn auth_test_outcome_success_json() {
+            let outcome = AuthTestOutcome::Success {
+                service: "openai".into(),
+                account: "default".into(),
+                elapsed_ms: Some(1234),
+                last_bootstrapped: Some("2025-01-01T00:00:00Z".into()),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""outcome":"success""#));
+            assert!(json.contains(r#""service":"openai""#));
+            assert!(json.contains(r#""elapsed_ms":1234"#));
+        }
+
+        #[test]
+        fn auth_test_outcome_needs_human_json() {
+            let outcome = AuthTestOutcome::NeedsHuman {
+                service: "openai".into(),
+                account: "work".into(),
+                reason: "No profile".into(),
+                next_step: "wa auth bootstrap openai".into(),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""outcome":"needs_human""#));
+            assert!(json.contains(r#""reason":"No profile""#));
+            assert!(json.contains(r#""next_step""#));
+        }
+
+        #[test]
+        fn auth_test_outcome_fail_json() {
+            let outcome = AuthTestOutcome::Fail {
+                service: "openai".into(),
+                account: "default".into(),
+                error: "Browser init failed".into(),
+                next_step: None,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""outcome":"fail""#));
+            assert!(json.contains(r#""error":"Browser init failed""#));
+            // next_step should be absent (skip_serializing_if = None)
+            assert!(!json.contains(r#""next_step""#));
+        }
+
+        #[test]
+        fn auth_test_outcome_fail_with_next_step() {
+            let outcome = AuthTestOutcome::Fail {
+                service: "openai".into(),
+                account: "default".into(),
+                error: "something".into(),
+                next_step: Some("do this".into()),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""next_step":"do this""#));
+        }
+
+        #[test]
+        fn auth_test_outcome_success_omits_none_fields() {
+            let outcome = AuthTestOutcome::Success {
+                service: "openai".into(),
+                account: "default".into(),
+                elapsed_ms: None,
+                last_bootstrapped: None,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(!json.contains("elapsed_ms"));
+            assert!(!json.contains("last_bootstrapped"));
+        }
+
+        #[test]
+        fn auth_profile_status_serialization() {
+            let status = AuthProfileStatus {
+                service: "openai".into(),
+                account: "default".into(),
+                profile_exists: true,
+                has_storage_state: true,
+                bootstrapped_at: Some("2025-06-01T00:00:00Z".into()),
+                bootstrap_method: Some("interactive".into()),
+                last_used_at: Some("2025-06-02T00:00:00Z".into()),
+                automated_use_count: Some(42),
+            };
+            let json = serde_json::to_string_pretty(&status).unwrap();
+            assert!(json.contains(r#""profile_exists": true"#));
+            assert!(json.contains(r#""has_storage_state": true"#));
+            assert!(json.contains(r#""automated_use_count": 42"#));
+        }
+
+        #[test]
+        fn auth_profile_status_omits_none_fields() {
+            let status = AuthProfileStatus {
+                service: "openai".into(),
+                account: "default".into(),
+                profile_exists: false,
+                has_storage_state: false,
+                bootstrapped_at: None,
+                bootstrap_method: None,
+                last_used_at: None,
+                automated_use_count: None,
+            };
+            let json = serde_json::to_string(&status).unwrap();
+            assert!(!json.contains("bootstrapped_at"));
+            assert!(!json.contains("bootstrap_method"));
+            assert!(!json.contains("last_used_at"));
+            assert!(!json.contains("automated_use_count"));
+        }
+
+        #[test]
+        fn build_profile_status_no_profile() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_auth_test_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let profile = wa_core::browser::BrowserProfile::new(
+                &tmp,
+                "nonexistent_service",
+                "nonexistent_account",
+            );
+            let status = build_profile_status(&profile);
+
+            assert_eq!(status.service, "nonexistent_service");
+            assert_eq!(status.account, "nonexistent_account");
+            assert!(!status.profile_exists);
+            assert!(!status.has_storage_state);
+            assert!(status.bootstrapped_at.is_none());
+            assert!(status.bootstrap_method.is_none());
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn build_profile_status_with_profile_dir() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_auth_test_profile_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let profile = wa_core::browser::BrowserProfile::new(&tmp, "testservice", "testaccount");
+            let _ = profile.ensure_dir();
+
+            let status = build_profile_status(&profile);
+            assert!(status.profile_exists);
+            assert!(!status.has_storage_state);
+            assert!(status.bootstrapped_at.is_none());
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn build_profile_status_with_metadata() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_auth_test_meta_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let profile = wa_core::browser::BrowserProfile::new(&tmp, "openai", "default");
+            let _ = profile.ensure_dir();
+
+            let mut metadata = wa_core::browser::ProfileMetadata::new("openai", "default");
+            metadata.record_bootstrap(wa_core::browser::BootstrapMethod::Interactive);
+            metadata.record_use();
+            let _ = profile.write_metadata(&metadata);
+
+            let status = build_profile_status(&profile);
+            assert!(status.profile_exists);
+            assert!(status.bootstrapped_at.is_some());
+            assert_eq!(status.bootstrap_method.as_deref(), Some("interactive"));
+            assert!(status.last_used_at.is_some());
+            assert_eq!(status.automated_use_count, Some(1));
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn build_profile_status_with_storage_state() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_auth_test_storage_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let profile = wa_core::browser::BrowserProfile::new(&tmp, "openai", "default");
+            let _ = profile.ensure_dir();
+            let _ = profile.save_storage_state(b"{\"cookies\": []}");
+
+            let status = build_profile_status(&profile);
+            assert!(status.profile_exists);
+            assert!(status.has_storage_state);
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 }
