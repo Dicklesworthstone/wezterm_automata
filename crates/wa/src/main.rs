@@ -7148,6 +7148,138 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
     }
 }
 
+/// Handle `wa rules` subcommands
+fn handle_rules_command(command: RulesCommands) -> anyhow::Result<()> {
+    use wa_core::output::{
+        OutputFormat, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem,
+        RuleTestMatch, RulesListRenderer, RulesTestRenderer, detect_format,
+    };
+    use wa_core::patterns::{AgentType, PatternEngine};
+
+    let engine = PatternEngine::new();
+
+    match command {
+        RulesCommands::List {
+            agent_type,
+            verbose,
+            format,
+        } => {
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let agent_filter: Option<AgentType> =
+                agent_type.as_ref().and_then(|s| match s.as_str() {
+                    "codex" => Some(AgentType::Codex),
+                    "claude_code" => Some(AgentType::ClaudeCode),
+                    "gemini" => Some(AgentType::Gemini),
+                    "wezterm" => Some(AgentType::Wezterm),
+                    _ => None,
+                });
+
+            let rules: Vec<RuleListItem> = engine
+                .rules()
+                .iter()
+                .filter(|rule| {
+                    if let Some(ref agent) = agent_filter {
+                        rule.agent_type == *agent
+                    } else {
+                        true
+                    }
+                })
+                .map(|rule| RuleListItem {
+                    id: rule.id.clone(),
+                    agent_type: format!("{}", rule.agent_type),
+                    event_type: rule.event_type.clone(),
+                    severity: format!("{:?}", rule.severity).to_lowercase(),
+                    description: rule.description.clone(),
+                    workflow: rule.workflow.clone(),
+                    anchor_count: rule.anchors.len(),
+                    has_regex: rule.regex.is_some(),
+                })
+                .collect();
+
+            let ctx = RenderContext::new(fmt).verbose(verbose);
+            let output = if verbose {
+                RulesListRenderer::render_verbose(&rules, &ctx)
+            } else {
+                RulesListRenderer::render(&rules, &ctx)
+            };
+            print!("{output}");
+        }
+
+        RulesCommands::Test { text, format } => {
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            let detections = engine.detect(&text);
+            let matches: Vec<RuleTestMatch> = detections
+                .iter()
+                .map(|d| RuleTestMatch {
+                    rule_id: d.rule_id.clone(),
+                    agent_type: format!("{}", d.agent_type),
+                    event_type: d.event_type.clone(),
+                    severity: format!("{:?}", d.severity).to_lowercase(),
+                    confidence: d.confidence,
+                    matched_text: d.matched_text.clone(),
+                    extracted: if d.extracted.is_null()
+                        || d.extracted
+                            .as_object()
+                            .is_some_and(serde_json::Map::is_empty)
+                    {
+                        None
+                    } else {
+                        Some(d.extracted.clone())
+                    },
+                })
+                .collect();
+
+            let ctx = RenderContext::new(fmt);
+            let output = RulesTestRenderer::render(&matches, text.len(), &ctx);
+            print!("{output}");
+        }
+
+        RulesCommands::Show { rule_id, format } => {
+            let fmt = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            if let Some(rule) = engine.rules().iter().find(|r| r.id == rule_id) {
+                let detail = RuleDetail {
+                    id: rule.id.clone(),
+                    agent_type: format!("{}", rule.agent_type),
+                    event_type: rule.event_type.clone(),
+                    severity: format!("{:?}", rule.severity).to_lowercase(),
+                    description: rule.description.clone(),
+                    anchors: rule.anchors.clone(),
+                    regex: rule.regex.clone(),
+                    workflow: rule.workflow.clone(),
+                    remediation: rule.remediation.clone(),
+                    manual_fix: rule.manual_fix.clone(),
+                    learn_more_url: rule.learn_more_url.clone(),
+                };
+
+                let ctx = RenderContext::new(fmt);
+                let output = RuleDetailRenderer::render(&detail, &ctx);
+                print!("{output}");
+            } else {
+                eprintln!("Rule '{}' not found.", rule_id);
+                eprintln!("Use 'wa rules list' to see available rules.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle `wa config` subcommands
 async fn handle_config_command(
     command: ConfigCommands,
