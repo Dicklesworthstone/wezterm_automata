@@ -29,9 +29,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain info
+        run: |
+          rustc --version --verbose
+          cargo --version
+          rustup show active-toolchain
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Clippy
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
@@ -48,10 +55,69 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+      - name: Toolchain info
+        run: |
+          rustc --version --verbose
+          cargo --version
       - name: Run tests
-        run: cargo test --workspace --all-features --verbose
+        run: cargo test --workspace --all-features --verbose 2>&1 | tee test-output.log
       - name: Run doc tests
         run: cargo test --workspace --doc
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: test-output.log
+          retention-days: 14
+
+  # Feature matrix: ensure each optional feature compiles and passes tests independently
+  feature-matrix:
+    name: Feature (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [default, mcp, web, tui, browser, metrics, distributed]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-${{ matrix.feature }}
+      - name: Feature matrix info
+        run: |
+          echo "## Feature: ${{ matrix.feature }}" >> $GITHUB_STEP_SUMMARY
+          rustc --version
+          if [ "${{ matrix.feature }}" = "default" ]; then
+            echo "Commands: cargo check --workspace / cargo test --workspace"
+            echo "Commands: cargo check --workspace / cargo test --workspace" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Commands: cargo check --workspace --features ${{ matrix.feature }} / cargo test --workspace --features ${{ matrix.feature }}"
+            echo "Commands: cargo check --workspace --features ${{ matrix.feature }} / cargo test --workspace --features ${{ matrix.feature }}" >> $GITHUB_STEP_SUMMARY
+          fi
+      - name: Check
+        run: |
+          if [ "${{ matrix.feature }}" = "default" ]; then
+            cargo check --workspace
+          else
+            cargo check --workspace --features "${{ matrix.feature }}"
+          fi
+      - name: Test
+        run: |
+          if [ "${{ matrix.feature }}" = "default" ]; then
+            cargo test --workspace 2>&1 | tee feature-test-output.log
+          else
+            cargo test --workspace --features "${{ matrix.feature }}" 2>&1 | tee feature-test-output.log
+          fi
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-test-logs-${{ matrix.feature }}
+          path: feature-test-output.log
+          retention-days: 14
 
   # Security audit for dependency vulnerabilities
   security:
@@ -103,10 +169,157 @@ jobs:
             echo "::warning::Coverage $COVERAGE% is below 50%"
           fi
 
+  # Run benchmarks (compile-only, no regression check yet)
+  bench:
+    name: Bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Compile benchmarks
+        run: cargo bench --workspace --no-run
+      - name: Run benchmarks (short)
+        run: cargo bench --workspace -- --warm-up-time 1 --measurement-time 2 --sample-size 10 2>&1 | tee bench-output.log
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output
+          path: bench-output.log
+          retention-days: 14
+
+  # Setup idempotency E2E (does NOT require WezTerm — uses temp HOME)
+  setup-e2e:
+    name: Setup Idempotency
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: setup-e2e
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      - name: Build wa binary
+        run: cargo build --release -p wa
+      - name: Run setup idempotency E2E
+        env:
+          WA_E2E_KEEP_ARTIFACTS: "1"
+        run: |
+          chmod +x scripts/e2e_test.sh
+          ./scripts/e2e_test.sh --skip-self-check --case setup_idempotency --verbose 2>&1 | tee setup-e2e-output.log
+      - name: Run no-lua-status-hook E2E
+        env:
+          WA_E2E_KEEP_ARTIFACTS: "1"
+        run: |
+          ./scripts/e2e_test.sh --skip-self-check --case no_lua_status_hook --verbose 2>&1 | tee setup-lua-e2e-output.log
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## Setup E2E Results" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f e2e-artifacts/*/summary.txt ]; then
+            cat e2e-artifacts/*/summary.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "See artifacts for details" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload setup E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-e2e-artifacts
+          path: |
+            e2e-artifacts/
+            setup-e2e-output.log
+            setup-lua-e2e-output.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # End-to-end tests (requires WezTerm)
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, test]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+      - name: Install WezTerm
+        id: install-wezterm
+        continue-on-error: true
+        run: |
+          curl -fsSL https://apt.fury.io/wez/gpg.key | sudo gpg --yes --dearmor -o /etc/apt/keyrings/wezterm-fury.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/wezterm-fury.gpg] https://apt.fury.io/wez/ * *' | sudo tee /etc/apt/sources.list.d/wezterm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wezterm-nightly || echo "::warning::WezTerm installation failed"
+          if command -v wezterm &>/dev/null; then
+            echo "wezterm_available=true" >> "$GITHUB_OUTPUT"
+            wezterm --version
+          else
+            echo "wezterm_available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::WezTerm not available; E2E tests will be skipped"
+          fi
+      - name: Build wa binary
+        run: cargo build --release -p wa
+      - name: Start WezTerm mux
+        if: steps.install-wezterm.outputs.wezterm_available == 'true'
+        run: |
+          wezterm start --daemonize --cwd /tmp 2>&1 || true
+          sleep 2
+          wezterm cli list || echo "::warning::WezTerm mux not responsive"
+      - name: Run E2E self-check
+        if: steps.install-wezterm.outputs.wezterm_available == 'true'
+        id: self-check
+        continue-on-error: true
+        run: |
+          chmod +x scripts/e2e_test.sh
+          ./scripts/e2e_test.sh --self-check 2>&1 | tee e2e-self-check.log
+      - name: Run E2E tests
+        if: steps.install-wezterm.outputs.wezterm_available == 'true' && steps.self-check.outcome == 'success'
+        run: |
+          ./scripts/e2e_test.sh --all --verbose --keep-artifacts 2>&1 | tee e2e-output.log
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## E2E Test Results" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.install-wezterm.outputs.wezterm_available }}" != "true" ]; then
+            echo "Skipped: WezTerm not available in CI environment" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.self-check.outcome }}" != "success" ]; then
+            echo "Skipped: prerequisites check failed (see artifacts)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f e2e-artifacts/*/summary.txt ]; then
+            cat e2e-artifacts/*/summary.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No summary available" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            e2e-artifacts/
+            e2e-output.log
+            e2e-self-check.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Build verification across platforms
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test]
+    needs: [lint, test, feature-matrix]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
