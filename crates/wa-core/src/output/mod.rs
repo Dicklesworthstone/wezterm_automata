@@ -35,7 +35,7 @@ mod table;
 pub use error_renderer::{ErrorRenderer, get_code_for_error, render_error};
 pub use format::{OutputFormat, detect_format};
 pub use renderers::{
-    EventListRenderer, PaneTableRenderer, Render, RenderContext, SearchResultRenderer,
-    WorkflowResultRenderer,
+    AuditListRenderer, EventListRenderer, PaneTableRenderer, Render, RenderContext,
+    SearchResultRenderer, WorkflowResultRenderer,
 };
 pub use table::{Alignment, Column, Table};

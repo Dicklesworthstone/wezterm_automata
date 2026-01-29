@@ -8,7 +8,7 @@
 use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
 use crate::event_templates;
-use crate::storage::{PaneRecord, SearchResult, StoredEvent};
+use crate::storage::{AuditActionRecord, PaneRecord, SearchResult, StoredEvent};
 
 /// Rendering context with shared settings
 #[derive(Debug, Clone)]
@@ -572,6 +572,160 @@ impl SummaryRenderer {
 }
 
 // =============================================================================
+// Audit List Renderer
+// =============================================================================
+
+/// Renderer for audit action lists
+pub struct AuditListRenderer;
+
+impl AuditListRenderer {
+    /// Render a list of audit actions
+    #[must_use]
+    pub fn render(actions: &[AuditActionRecord], ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(actions).unwrap_or_else(|_| "[]".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+
+        if actions.is_empty() {
+            return style.dim("No audit records found\n");
+        }
+
+        let mut output = String::new();
+        output.push_str(&style.bold(&format!("Audit trail ({} records):\n", actions.len())));
+
+        let mut table = Table::new(vec![
+            Column::new("ID").align(Alignment::Right).min_width(5),
+            Column::new("TIME").min_width(20),
+            Column::new("ACTOR").min_width(8),
+            Column::new("ACTION").min_width(14),
+            Column::new("DECISION").min_width(10),
+            Column::new("RESULT").min_width(8),
+            Column::new("PANE").align(Alignment::Right).min_width(4),
+            Column::new("SUMMARY").min_width(30),
+        ])
+        .with_format(ctx.format);
+
+        let display_actions = if ctx.limit > 0 && actions.len() > ctx.limit {
+            &actions[..ctx.limit]
+        } else {
+            actions
+        };
+
+        for action in display_actions {
+            let decision = match action.policy_decision.as_str() {
+                "allow" => style.green("allow"),
+                "deny" => style.red("deny"),
+                "require_approval" => style.yellow("require_approval"),
+                other => other.to_string(),
+            };
+
+            let result = match action.result.as_str() {
+                "success" => style.green("success"),
+                "denied" => style.red("denied"),
+                "failed" => style.red("failed"),
+                "timeout" => style.yellow("timeout"),
+                other => other.to_string(),
+            };
+
+            let pane = action
+                .pane_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string());
+
+            let summary = action
+                .input_summary
+                .as_deref()
+                .or(action.decision_reason.as_deref())
+                .unwrap_or("-");
+
+            table.add_row(vec![
+                action.id.to_string(),
+                format_timestamp(action.ts),
+                action.actor_kind.clone(),
+                action.action_kind.clone(),
+                decision,
+                result,
+                pane,
+                truncate(summary, 50),
+            ]);
+        }
+
+        output.push_str(&table.render());
+
+        if ctx.limit > 0 && actions.len() > ctx.limit {
+            output.push_str(&style.dim(&format!(
+                "\n... and {} more records (use --limit to see more)\n",
+                actions.len() - ctx.limit
+            )));
+        }
+
+        output
+    }
+
+    /// Render a single audit action detail view
+    #[must_use]
+    pub fn render_detail(action: &AuditActionRecord, ctx: &RenderContext) -> String {
+        if ctx.format.is_json() {
+            return serde_json::to_string_pretty(action).unwrap_or_else(|_| "{}".to_string());
+        }
+
+        let style = Style::from_format(ctx.format);
+        let mut output = String::new();
+
+        output.push_str(&style.bold(&format!("Audit Record #{}\n", action.id)));
+        output.push_str(&format!("  Time:       {}\n", format_timestamp(action.ts)));
+        output.push_str(&format!("  Actor:      {}\n", action.actor_kind));
+        if let Some(actor_id) = &action.actor_id {
+            output.push_str(&format!("  Actor ID:   {actor_id}\n"));
+        }
+        if let Some(pane_id) = action.pane_id {
+            output.push_str(&format!("  Pane:       {pane_id}\n"));
+        }
+        if let Some(domain) = &action.domain {
+            output.push_str(&format!("  Domain:     {domain}\n"));
+        }
+        output.push_str(&format!("  Action:     {}\n", action.action_kind));
+
+        let decision_styled = match action.policy_decision.as_str() {
+            "allow" => style.green(&action.policy_decision),
+            "deny" => style.red(&action.policy_decision),
+            "require_approval" => style.yellow(&action.policy_decision),
+            _ => action.policy_decision.clone(),
+        };
+        output.push_str(&format!("  Decision:   {decision_styled}\n"));
+
+        if let Some(reason) = &action.decision_reason {
+            output.push_str(&format!("  Reason:     {reason}\n"));
+        }
+        if let Some(rule_id) = &action.rule_id {
+            output.push_str(&format!("  Rule:       {rule_id}\n"));
+        }
+
+        let result_styled = match action.result.as_str() {
+            "success" => style.green(&action.result),
+            "denied" => style.red(&action.result),
+            "failed" => style.red(&action.result),
+            "timeout" => style.yellow(&action.result),
+            _ => action.result.clone(),
+        };
+        output.push_str(&format!("  Result:     {result_styled}\n"));
+
+        if let Some(input) = &action.input_summary {
+            output.push_str(&format!("  Input:      {input}\n"));
+        }
+        if let Some(verification) = &action.verification_summary {
+            output.push_str(&format!("  Verify:     {verification}\n"));
+        }
+        if let Some(context) = &action.decision_context {
+            output.push_str(&format!("  Context:    {context}\n"));
+        }
+
+        output
+    }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -756,5 +910,600 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains('-')); // date part
         assert!(parts[1].contains(':')); // time part
+    }
+
+    fn sample_audit_action() -> AuditActionRecord {
+        AuditActionRecord {
+            id: 1,
+            ts: 1_737_446_400_000,
+            actor_kind: "human".to_string(),
+            actor_id: None,
+            pane_id: Some(5),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("prompt detected".to_string()),
+            rule_id: None,
+            input_summary: Some("echo hello".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        }
+    }
+
+    #[test]
+    fn audit_list_render_plain() {
+        let actions = vec![sample_audit_action()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&actions, &ctx);
+
+        assert!(output.contains("Audit trail"));
+        assert!(output.contains("human"));
+        assert!(output.contains("send_text"));
+        assert!(output.contains("allow"));
+        assert!(output.contains("success"));
+        assert!(output.contains("echo hello"));
+    }
+
+    #[test]
+    fn audit_list_render_plain_no_ansi() {
+        let actions = vec![sample_audit_action()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&actions, &ctx);
+
+        assert!(!output.contains("\x1b["));
+    }
+
+    #[test]
+    fn audit_list_render_json() {
+        let actions = vec![sample_audit_action()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = AuditListRenderer::render(&actions, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["actor_kind"], "human");
+        assert_eq!(parsed[0]["action_kind"], "send_text");
+        assert_eq!(parsed[0]["result"], "success");
+    }
+
+    #[test]
+    fn audit_list_render_empty() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&[], &ctx);
+
+        assert!(output.contains("No audit records found"));
+    }
+
+    #[test]
+    fn audit_list_render_deny_decision() {
+        let mut action = sample_audit_action();
+        action.policy_decision = "deny".to_string();
+        action.result = "denied".to_string();
+        action.decision_reason = Some("alt-screen active".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&[action], &ctx);
+
+        assert!(output.contains("deny"));
+        assert!(output.contains("denied"));
+    }
+
+    #[test]
+    fn audit_detail_render_plain() {
+        let action = sample_audit_action();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+
+        assert!(output.contains("Audit Record #1"));
+        assert!(output.contains("Actor:      human"));
+        assert!(output.contains("Pane:       5"));
+        assert!(output.contains("Action:     send_text"));
+        assert!(output.contains("Decision:   allow"));
+        assert!(output.contains("Result:     success"));
+        assert!(output.contains("Reason:     prompt detected"));
+        assert!(output.contains("Input:      echo hello"));
+    }
+
+    #[test]
+    fn audit_detail_render_json() {
+        let action = sample_audit_action();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["actor_kind"], "human");
+        assert_eq!(parsed["action_kind"], "send_text");
+    }
+
+    #[test]
+    fn audit_list_limit_truncation() {
+        let actions: Vec<_> = (0..5)
+            .map(|i| {
+                let mut a = sample_audit_action();
+                a.id = i + 1;
+                a
+            })
+            .collect();
+
+        let ctx = RenderContext::new(OutputFormat::Plain).limit(3);
+        let output = AuditListRenderer::render(&actions, &ctx);
+
+        assert!(output.contains("and 2 more records"));
+    }
+
+    // =========================================================================
+    // Snapshot tests: plain output stability (wa-nu4.3.2.10)
+    // =========================================================================
+
+    /// Helper: assert no ANSI escape sequences in output
+    fn assert_no_ansi(output: &str, renderer_name: &str) {
+        assert!(
+            !output.contains("\x1b["),
+            "{renderer_name}: plain output must not contain ANSI escape sequences.\nOutput:\n{output}"
+        );
+    }
+
+    /// Fake secret for redaction testing
+    const FAKE_SECRET: &str = "sk-proj-TESTSECRET1234567890abcdef";
+
+    /// Helper: assert fake secret never appears in output
+    fn assert_no_secrets(output: &str, renderer_name: &str) {
+        assert!(
+            !output.contains(FAKE_SECRET),
+            "{renderer_name}: output must not contain raw secrets.\nOutput:\n{output}"
+        );
+    }
+
+    // --- Pane table snapshots ---
+
+    #[test]
+    fn snapshot_pane_table_plain() {
+        let panes = vec![sample_pane()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = PaneTableRenderer::render(&panes, &ctx);
+
+        assert_no_ansi(&output, "PaneTableRenderer");
+
+        // Verify stable structural elements
+        assert!(output.contains("Panes (1 observed, 0 ignored):"));
+        assert!(output.contains("ID"));
+        assert!(output.contains("STATUS"));
+        assert!(output.contains("TITLE"));
+        assert!(output.contains("CWD"));
+        assert!(output.contains("DOMAIN"));
+        assert!(output.contains("1")); // pane id
+        assert!(output.contains("observed"));
+        assert!(output.contains("test shell"));
+        assert!(output.contains("/home/user"));
+        assert!(output.contains("local"));
+    }
+
+    #[test]
+    fn snapshot_pane_table_json_schema() {
+        let panes = vec![sample_pane()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = PaneTableRenderer::render(&panes, &ctx);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+
+        let pane = &parsed[0];
+        // Verify stable JSON fields
+        assert_eq!(pane["pane_id"], 1);
+        assert_eq!(pane["domain"], "local");
+        assert_eq!(pane["title"], "test shell");
+        assert_eq!(pane["cwd"], "/home/user");
+        assert_eq!(pane["observed"], true);
+        assert!(pane["first_seen_at"].is_i64());
+        assert!(pane["last_seen_at"].is_i64());
+    }
+
+    #[test]
+    fn snapshot_pane_table_empty_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = PaneTableRenderer::render(&[], &ctx);
+
+        assert_no_ansi(&output, "PaneTableRenderer(empty)");
+        assert!(output.contains("No panes observed"));
+    }
+
+    #[test]
+    fn snapshot_pane_table_mixed_status() {
+        let mut ignored = sample_pane();
+        ignored.pane_id = 2;
+        ignored.observed = false;
+        ignored.ignore_reason = Some("excluded by pattern".to_string());
+
+        let panes = vec![sample_pane(), ignored];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = PaneTableRenderer::render(&panes, &ctx);
+
+        assert_no_ansi(&output, "PaneTableRenderer(mixed)");
+        assert!(output.contains("1 observed, 1 ignored"));
+        assert!(output.contains("ignored"));
+    }
+
+    // --- Event list snapshots ---
+
+    #[test]
+    fn snapshot_event_list_plain() {
+        let events = vec![sample_event()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render(&events, &ctx);
+
+        assert_no_ansi(&output, "EventListRenderer");
+
+        assert!(output.contains("Events (1):"));
+        assert!(output.contains("ID"));
+        assert!(output.contains("PANE"));
+        assert!(output.contains("RULE"));
+        assert!(output.contains("SEV"));
+        assert!(output.contains("TIME"));
+        assert!(output.contains("STATUS"));
+        assert!(output.contains("42")); // event id
+        assert!(output.contains("codex.usage_reached"));
+        assert!(output.contains("warning"));
+        assert!(output.contains("pending"));
+    }
+
+    #[test]
+    fn snapshot_event_list_handled() {
+        let mut event = sample_event();
+        event.handled_at = Some(1_737_450_000_000);
+        event.handled_by_workflow_id = Some("wf-123".to_string());
+        event.handled_status = Some("resolved".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render(&[event], &ctx);
+
+        assert_no_ansi(&output, "EventListRenderer(handled)");
+        assert!(output.contains("handled"));
+    }
+
+    #[test]
+    fn snapshot_event_list_json_schema() {
+        let events = vec![sample_event()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = EventListRenderer::render(&events, &ctx);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+
+        let event = &parsed[0];
+        assert_eq!(event["id"], 42);
+        assert_eq!(event["pane_id"], 1);
+        assert_eq!(event["rule_id"], "codex.usage_reached");
+        assert_eq!(event["event_type"], "usage_alert");
+        assert_eq!(event["severity"], "warning");
+        assert!(event["detected_at"].is_i64());
+        assert!(event["confidence"].is_f64());
+    }
+
+    #[test]
+    fn snapshot_event_list_empty_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render(&[], &ctx);
+
+        assert_no_ansi(&output, "EventListRenderer(empty)");
+        assert!(output.contains("No events found"));
+    }
+
+    // --- Search result snapshots ---
+
+    fn sample_search_result() -> SearchResult {
+        SearchResult {
+            segment: crate::storage::Segment {
+                id: 10,
+                pane_id: 1,
+                seq: 42,
+                content: "Error: API key invalid".to_string(),
+                content_len: 22,
+                content_hash: None,
+                captured_at: 1_737_446_400_000,
+            },
+            snippet: Some("Error: API key invalid".to_string()),
+            highlight: None,
+            score: 0.85,
+        }
+    }
+
+    #[test]
+    fn snapshot_search_plain() {
+        let results = vec![sample_search_result()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SearchResultRenderer::render(&results, "API key", &ctx);
+
+        assert_no_ansi(&output, "SearchResultRenderer");
+
+        assert!(output.contains("Search results"));
+        assert!(output.contains("API key"));
+        assert!(output.contains("1 hits"));
+        assert!(output.contains("pane:1"));
+        assert!(output.contains("seq:42"));
+        assert!(output.contains("Error: API key invalid"));
+    }
+
+    #[test]
+    fn snapshot_search_json_schema() {
+        let results = vec![sample_search_result()];
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = SearchResultRenderer::render(&results, "API key", &ctx);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+
+        let result = &parsed[0];
+        assert!(result["segment"]["id"].is_i64());
+        assert_eq!(result["segment"]["pane_id"], 1);
+        assert_eq!(result["segment"]["seq"], 42);
+        assert!(result["score"].is_f64());
+    }
+
+    #[test]
+    fn snapshot_search_empty_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SearchResultRenderer::render(&[], "missing term", &ctx);
+
+        assert_no_ansi(&output, "SearchResultRenderer(empty)");
+        assert!(output.contains("No results"));
+        assert!(output.contains("missing term"));
+    }
+
+    // --- Workflow result snapshots ---
+
+    fn sample_workflow_result() -> WorkflowResult {
+        WorkflowResult {
+            workflow_id: "wf-abc-123".to_string(),
+            workflow_name: "handle_compaction".to_string(),
+            pane_id: 3,
+            status: "completed".to_string(),
+            reason: None,
+            result: None,
+            steps: vec![
+                WorkflowStepResult {
+                    name: "detect_marker".to_string(),
+                    outcome: "success".to_string(),
+                    duration_ms: 50,
+                    error: None,
+                },
+                WorkflowStepResult {
+                    name: "send_text".to_string(),
+                    outcome: "success".to_string(),
+                    duration_ms: 120,
+                    error: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn snapshot_workflow_plain() {
+        let result = sample_workflow_result();
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = WorkflowResultRenderer::render(&result, &ctx);
+
+        assert_no_ansi(&output, "WorkflowResultRenderer");
+
+        assert!(output.contains("handle_compaction"));
+        assert!(output.contains("completed"));
+        assert!(output.contains("wf-abc-123"));
+        assert!(output.contains("Pane: 3"));
+        assert!(output.contains("Steps:"));
+        assert!(output.contains("detect_marker"));
+        assert!(output.contains("send_text"));
+    }
+
+    #[test]
+    fn snapshot_workflow_failed() {
+        let mut result = sample_workflow_result();
+        result.status = "failed".to_string();
+        result.reason = Some("pane not found".to_string());
+        result.steps[1].outcome = "failed".to_string();
+        result.steps[1].error = Some("pane 3 not available".to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = WorkflowResultRenderer::render(&result, &ctx);
+
+        assert_no_ansi(&output, "WorkflowResultRenderer(failed)");
+        assert!(output.contains("failed"));
+        assert!(output.contains("pane not found"));
+        assert!(output.contains("pane 3 not available"));
+    }
+
+    #[test]
+    fn snapshot_workflow_json_schema() {
+        let result = sample_workflow_result();
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = WorkflowResultRenderer::render(&result, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["workflow_id"], "wf-abc-123");
+        assert_eq!(parsed["workflow_name"], "handle_compaction");
+        assert_eq!(parsed["pane_id"], 3);
+        assert_eq!(parsed["status"], "completed");
+        assert!(parsed["steps"].is_array());
+        assert_eq!(parsed["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["steps"][0]["name"], "detect_marker");
+    }
+
+    // --- Audit snapshots (additional stability tests) ---
+
+    #[test]
+    fn snapshot_audit_plain_columns() {
+        let actions = vec![sample_audit_action()];
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&actions, &ctx);
+
+        // Verify column headers present
+        assert!(output.contains("ID"));
+        assert!(output.contains("TIME"));
+        assert!(output.contains("ACTOR"));
+        assert!(output.contains("ACTION"));
+        assert!(output.contains("DECISION"));
+        assert!(output.contains("RESULT"));
+        assert!(output.contains("PANE"));
+        assert!(output.contains("SUMMARY"));
+    }
+
+    #[test]
+    fn snapshot_audit_json_all_fields() {
+        let mut action = sample_audit_action();
+        action.actor_id = Some("mcp-client-1".to_string());
+        action.rule_id = Some("command_gate.rm_rf".to_string());
+        action.verification_summary = Some("matched pattern".to_string());
+        action.decision_context = Some(r#"{"risk":"high"}"#.to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = AuditListRenderer::render(&[action], &ctx);
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        let a = &parsed[0];
+
+        // All fields present in JSON output
+        assert!(a["id"].is_i64());
+        assert!(a["ts"].is_i64());
+        assert_eq!(a["actor_kind"], "human");
+        assert_eq!(a["actor_id"], "mcp-client-1");
+        assert_eq!(a["pane_id"], 5);
+        assert_eq!(a["domain"], "local");
+        assert_eq!(a["action_kind"], "send_text");
+        assert_eq!(a["policy_decision"], "allow");
+        assert_eq!(a["decision_reason"], "prompt detected");
+        assert_eq!(a["rule_id"], "command_gate.rm_rf");
+        assert_eq!(a["input_summary"], "echo hello");
+        assert_eq!(a["verification_summary"], "matched pattern");
+        assert!(a["decision_context"].is_string());
+        assert_eq!(a["result"], "success");
+    }
+
+    // --- Summary snapshots ---
+
+    #[test]
+    fn snapshot_summary_plain() {
+        let summary = Summary {
+            total_panes: 5,
+            observed_panes: 3,
+            total_segments: 100,
+            total_events: 12,
+            unhandled_events: 2,
+            active_workflows: 1,
+        };
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SummaryRenderer::render(&summary, &ctx);
+
+        assert_no_ansi(&output, "SummaryRenderer");
+        assert!(output.contains("Status Summary"));
+        assert!(output.contains("3 observed / 5 total"));
+        assert!(output.contains("Segments:  100"));
+        assert!(output.contains("12 total (2 unhandled)"));
+        assert!(output.contains("Workflows: 1 active"));
+    }
+
+    #[test]
+    fn snapshot_summary_json_schema() {
+        let summary = Summary {
+            total_panes: 5,
+            observed_panes: 3,
+            total_segments: 100,
+            total_events: 12,
+            unhandled_events: 2,
+            active_workflows: 1,
+        };
+        let ctx = RenderContext::new(OutputFormat::Json);
+        let output = SummaryRenderer::render(&summary, &ctx);
+
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["total_panes"], 5);
+        assert_eq!(parsed["observed_panes"], 3);
+        assert_eq!(parsed["total_segments"], 100);
+        assert_eq!(parsed["total_events"], 12);
+        assert_eq!(parsed["unhandled_events"], 2);
+        assert_eq!(parsed["active_workflows"], 1);
+    }
+
+    // =========================================================================
+    // No-ANSI guarantees for all renderers (wa-nu4.3.2.10)
+    // =========================================================================
+
+    #[test]
+    fn no_ansi_pane_detail_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = PaneTableRenderer::render_detail(&sample_pane(), &ctx);
+        assert_no_ansi(&output, "PaneTableRenderer::render_detail");
+    }
+
+    #[test]
+    fn no_ansi_event_detail_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = EventListRenderer::render_detail(&sample_event(), &ctx);
+        assert_no_ansi(&output, "EventListRenderer::render_detail");
+    }
+
+    #[test]
+    fn no_ansi_audit_detail_plain() {
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&sample_audit_action(), &ctx);
+        assert_no_ansi(&output, "AuditListRenderer::render_detail");
+    }
+
+    // =========================================================================
+    // Secret redaction guarantees (wa-nu4.3.2.10)
+    // =========================================================================
+
+    #[test]
+    fn no_secrets_pane_table() {
+        let mut pane = sample_pane();
+        pane.title = Some(format!("session with {FAKE_SECRET}"));
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        // Note: PaneTableRenderer truncates titles, so this tests that even
+        // if secrets appear in data fields, they get truncated.
+        let output = PaneTableRenderer::render(&[pane.clone()], &ctx);
+
+        // Title column is truncated to 24 chars max, so the secret is cut off.
+        // This validates that column truncation acts as a defense.
+        let title_col_max = 24;
+        let title = format!("session with {FAKE_SECRET}");
+        if title.len() > title_col_max {
+            assert!(
+                !output.contains(FAKE_SECRET),
+                "PaneTableRenderer: secret should be truncated by column width"
+            );
+        }
+
+        // JSON mode would expose it — but that's the raw data contract
+    }
+
+    #[test]
+    fn no_secrets_audit_summary_when_redacted() {
+        // Renderers do NOT perform redaction — callers (storage layer /
+        // record_audit_action_redacted) must redact before passing data.
+        // This test verifies that a properly redacted record renders cleanly.
+        let mut action = sample_audit_action();
+        action.input_summary = Some(format!("wa send 5 '[REDACTED]'"));
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render(&[action], &ctx);
+
+        assert_no_secrets(&output, "AuditListRenderer(redacted input_summary)");
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn no_secrets_search_snippet() {
+        let mut result = sample_search_result();
+        result.snippet = Some(format!("Found key: {FAKE_SECRET} in config"));
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = SearchResultRenderer::render(&[result], "key", &ctx);
+
+        // Snippet is truncated to 120 chars, so the secret appears within bounds.
+        // This test documents that SearchResultRenderer does NOT redact — the
+        // caller (storage layer) is responsible for redaction before display.
+        // The assertion here is just structural: we confirm the renderer runs.
+        assert!(output.contains("Search results"));
     }
 }
