@@ -15,10 +15,47 @@ use clap::{Parser, Subcommand, ValueEnum};
 use wa_core::logging::{LogConfig, LogError, init_logging};
 use wa_core::storage::{MigrationPlan, MigrationStatusReport};
 
+/// Build metadata captured at compile time.
+mod build_meta {
+    pub const GIT_HASH: &str = env!("WA_GIT_HASH");
+    pub const GIT_DIRTY: &str = env!("WA_GIT_DIRTY");
+    pub const BUILD_TS: &str = env!("WA_BUILD_TS");
+    pub const RUSTC_VERSION: &str = env!("WA_RUSTC_VERSION");
+    pub const TARGET: &str = env!("WA_TARGET");
+    pub const FEATURES: &str = env!("WA_FEATURES");
+
+    /// Short version line: `0.1.0 (abc123def)`
+    pub fn short_version() -> String {
+        format!("{} ({}{})", wa_core::VERSION, GIT_HASH, GIT_DIRTY)
+    }
+
+    /// Verbose multi-line version block.
+    pub fn verbose_version() -> String {
+        format!(
+            "\
+wa {}
+commit:   {}{}
+built:    {}
+rustc:    {}
+target:   {}
+features: {}",
+            wa_core::VERSION,
+            GIT_HASH,
+            GIT_DIRTY,
+            BUILD_TS,
+            RUSTC_VERSION,
+            TARGET,
+            FEATURES,
+        )
+    }
+}
+
+static CLAP_VERSION: LazyLock<String> = LazyLock::new(build_meta::short_version);
+
 /// WezTerm Automata - Terminal hypervisor for AI agents
 #[derive(Parser)]
 #[command(name = "wa")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = CLAP_VERSION.as_str(), about, long_about = None)]
 struct Cli {
     /// Increase verbosity (-v for verbose, -vv for debug)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -71,6 +108,19 @@ SEE ALSO:
         dangerous_disable_lock: bool,
     },
 
+    /// Show version and build metadata
+    #[command(after_help = r#"EXAMPLES:
+    wa version                        Short version line
+    wa version --verbose              Detailed build metadata
+
+SEE ALSO:
+    wa doctor     Check environment prerequisites"#)]
+    Version {
+        /// Show detailed build metadata (commit, rustc, target, features)
+        #[arg(long)]
+        full: bool,
+    },
+
     /// Robot mode commands (machine-readable I/O)
     #[command(after_help = r#"EXAMPLES:
     wa robot state                    Get all panes as JSON
@@ -96,7 +146,9 @@ SEE ALSO:
     },
 
     /// Search captured output (FTS query)
-    #[command(alias = "query", after_help = r#"EXAMPLES:
+    #[command(
+        alias = "query",
+        after_help = r#"EXAMPLES:
     wa search "error"                 Find lines containing "error"
     wa search "error" --pane 3        Search in specific pane
     wa search "error OR warning"      FTS5 boolean query
@@ -104,7 +156,8 @@ SEE ALSO:
 
 SEE ALSO:
     wa list       List available panes
-    wa events     View detected events"#)]
+    wa events     View detected events"#
+    )]
     Search {
         /// Search query (FTS5 syntax)
         query: String,
@@ -3981,7 +4034,9 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleSessionEnd::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleAuthRequired::new()));
-        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required");
+        tracing::info!(
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required"
+        );
 
         // Spawn workflow runner event loop
         let event_bus_clone = Arc::clone(&event_bus);
@@ -4217,6 +4272,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     emit_permission_warnings(&permission_warnings);
 
     match command {
+        Some(Commands::Version { full }) => {
+            if full {
+                println!("{}", build_meta::verbose_version());
+            } else {
+                println!("wa {}", build_meta::short_version());
+            }
+            return Ok(());
+        }
+
         Some(Commands::Watch {
             auto_handle,
             foreground,
@@ -6138,9 +6202,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         RobotResponse::<RobotAccountsListData>::error_with_code(
                                             ROBOT_ERR_CONFIG,
                                             format!("Failed to get workspace layout: {e}"),
-                                            Some(
-                                                "Check --workspace or WA_WORKSPACE".to_string(),
-                                            ),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -6152,13 +6214,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotAccountsCommands::List { service, pick } => {
                                     // Open storage handle
                                     let db_path = layout.db_path.to_string_lossy();
-                                    let storage =
-                                        match wa_core::storage::StorageHandle::new(&db_path)
-                                            .await
-                                        {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                let response =
+                                    let storage = match wa_core::storage::StorageHandle::new(
+                                        &db_path,
+                                    )
+                                    .await
+                                    {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let response =
                                                     RobotResponse::<RobotAccountsListData>::error_with_code(
                                                         ROBOT_ERR_STORAGE,
                                                         format!("Failed to open storage: {e}"),
@@ -6168,12 +6231,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         ),
                                                         elapsed_ms(start),
                                                     );
-                                                print_robot_response(
-                                                    &response, format, stats,
-                                                )?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     // Fetch accounts
                                     let accounts = match storage
@@ -6189,9 +6250,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -6201,7 +6260,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let sel_config =
                                             wa_core::accounts::AccountSelectionConfig::default();
                                         let result = wa_core::accounts::select_account(
-                                            &accounts, &sel_config,
+                                            &accounts,
+                                            &sel_config,
                                         );
                                         Some(RobotAccountPickPreview {
                                             selected_account_id: result
@@ -6212,18 +6272,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 .selected
                                                 .as_ref()
                                                 .and_then(|a| a.name.clone()),
-                                            selection_reason: result
-                                                .explanation
-                                                .selection_reason,
+                                            selection_reason: result.explanation.selection_reason,
                                             threshold_percent: sel_config.threshold_percent,
-                                            candidates_count: result
-                                                .explanation
-                                                .candidates
-                                                .len(),
-                                            filtered_count: result
-                                                .explanation
-                                                .filtered_out
-                                                .len(),
+                                            candidates_count: result.explanation.candidates.len(),
+                                            filtered_count: result.explanation.filtered_out.len(),
                                         })
                                     } else {
                                         None
@@ -6252,15 +6304,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         service,
                                         pick_preview,
                                     };
-                                    let response =
-                                        RobotResponse::success(data, elapsed_ms(start));
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
 
                                     // Clean shutdown
                                     if let Err(e) = storage.shutdown().await {
-                                        tracing::warn!(
-                                            "Failed to shutdown storage cleanly: {e}"
-                                        );
+                                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
                                     }
                                 }
                                 RobotAccountsCommands::Refresh { service } => {
@@ -6277,9 +6326,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -6311,21 +6358,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         ROBOT_REFRESH_COOLDOWN_MS,
                                                     )
                                                 {
-                                                    let response =
-                                                        RobotResponse::<RobotAccountsRefreshData>::error_with_code(
-                                                            "robot.rate_limited",
-                                                            format!(
-                                                                "Refresh rate limited: last refresh was {secs_ago}s ago (cooldown: {}s)",
-                                                                ROBOT_REFRESH_COOLDOWN_MS / 1000
-                                                            ),
-                                                            Some(format!(
-                                                                "Wait {wait_secs}s before refreshing again, or use 'wa robot accounts list' to see cached data."
-                                                            )),
-                                                            elapsed_ms(start),
-                                                        );
-                                                    print_robot_response(
-                                                        &response, format, stats,
-                                                    )?;
+                                                    let response = RobotResponse::<
+                                                        RobotAccountsRefreshData,
+                                                    >::error_with_code(
+                                                        "robot.rate_limited",
+                                                        format!(
+                                                            "Refresh rate limited: last refresh was {secs_ago}s ago (cooldown: {}s)",
+                                                            ROBOT_REFRESH_COOLDOWN_MS / 1000
+                                                        ),
+                                                        Some(format!(
+                                                            "Wait {wait_secs}s before refreshing again, or use 'wa robot accounts list' to see cached data."
+                                                        )),
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
                                                     let _ = storage_check.shutdown().await;
                                                     return Ok(());
                                                 }
@@ -6336,10 +6382,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Call caut refresh
                                     let caut = wa_core::caut::CautClient::new();
-                                    let refresh_result = match caut
-                                        .refresh(caut_service)
-                                        .await
-                                    {
+                                    let refresh_result = match caut.refresh(caut_service).await {
                                         Ok(r) => r,
                                         Err(e) => {
                                             let response =
@@ -6351,22 +6394,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
 
                                     // Open storage to persist refreshed data
                                     let db_path = layout.db_path.to_string_lossy();
-                                    let storage =
-                                        match wa_core::storage::StorageHandle::new(&db_path)
-                                            .await
-                                        {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                let response =
+                                    let storage = match wa_core::storage::StorageHandle::new(
+                                        &db_path,
+                                    )
+                                    .await
+                                    {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let response =
                                                     RobotResponse::<RobotAccountsRefreshData>::error_with_code(
                                                         ROBOT_ERR_STORAGE,
                                                         format!("Failed to open storage: {e}"),
@@ -6376,12 +6418,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         ),
                                                         elapsed_ms(start),
                                                     );
-                                                print_robot_response(
-                                                    &response, format, stats,
-                                                )?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     // Convert and upsert each account
                                     let now_ms = std::time::SystemTime::now()
@@ -6392,14 +6432,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     let mut account_infos = Vec::new();
                                     for usage in &refresh_result.accounts {
-                                        let record =
-                                            wa_core::accounts::AccountRecord::from_caut(
-                                                usage,
-                                                caut_service,
-                                                now_ms,
-                                            );
-                                        if let Err(e) =
-                                            storage.upsert_account(record.clone()).await
+                                        let record = wa_core::accounts::AccountRecord::from_caut(
+                                            usage,
+                                            caut_service,
+                                            now_ms,
+                                        );
+                                        if let Err(e) = storage.upsert_account(record.clone()).await
                                         {
                                             tracing::warn!(
                                                 "Failed to upsert account {}: {e}",
@@ -6426,15 +6464,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         refreshed_at: refresh_result.refreshed_at,
                                         accounts: account_infos,
                                     };
-                                    let response =
-                                        RobotResponse::success(data, elapsed_ms(start));
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
 
                                     // Clean shutdown
                                     if let Err(e) = storage.shutdown().await {
-                                        tracing::warn!(
-                                            "Failed to shutdown storage cleanly: {e}"
-                                        );
+                                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
                                     }
                                 }
                             }
@@ -6448,9 +6483,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         RobotResponse::<RobotReservationsListData>::error_with_code(
                                             ROBOT_ERR_CONFIG,
                                             format!("Failed to get workspace layout: {e}"),
-                                            Some(
-                                                "Check --workspace or WA_WORKSPACE".to_string(),
-                                            ),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -6459,11 +6492,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             let db_path = layout.db_path.to_string_lossy();
-                            let storage =
-                                match wa_core::storage::StorageHandle::new(&db_path).await {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let response =
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response =
                                             RobotResponse::<RobotReservationsListData>::error_with_code(
                                                 ROBOT_ERR_STORAGE,
                                                 format!("Failed to open storage: {e}"),
@@ -6473,10 +6506,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 ),
                                                 elapsed_ms(start),
                                             );
-                                        print_robot_response(&response, format, stats)?;
-                                        return Ok(());
-                                    }
-                                };
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
 
                             match command {
                                 RobotReservationCommands::Reserve {
@@ -6511,13 +6544,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     status: r.status,
                                                 },
                                             };
-                                            let response = RobotResponse::success(
-                                                data,
-                                                elapsed_ms(start),
-                                            );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            let response =
+                                                RobotResponse::success(data, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                         Err(e) => {
                                             let response =
@@ -6532,85 +6561,63 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                     }
                                 }
                                 RobotReservationCommands::Release { reservation_id } => {
-                                    match storage
-                                        .release_reservation(reservation_id)
-                                        .await
-                                    {
+                                    match storage.release_reservation(reservation_id).await {
                                         Ok(released) => {
                                             let data = RobotReleaseData {
                                                 reservation_id,
                                                 released,
                                             };
-                                            let response = RobotResponse::success(
-                                                data,
-                                                elapsed_ms(start),
-                                            );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            let response =
+                                                RobotResponse::success(data, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                         Err(e) => {
                                             let response =
                                                 RobotResponse::<RobotReleaseData>::error_with_code(
                                                     ROBOT_ERR_STORAGE,
-                                                    format!(
-                                                        "Failed to release reservation: {e}"
-                                                    ),
+                                                    format!("Failed to release reservation: {e}"),
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                     }
                                 }
                                 RobotReservationCommands::List => {
                                     // Expire stale reservations first
-                                    if let Err(e) =
-                                        storage.expire_stale_reservations().await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to expire stale reservations: {e}"
-                                        );
+                                    if let Err(e) = storage.expire_stale_reservations().await {
+                                        tracing::warn!("Failed to expire stale reservations: {e}");
                                     }
 
                                     match storage.list_active_reservations().await {
                                         Ok(reservations) => {
                                             let total = reservations.len();
-                                            let infos: Vec<RobotReservationInfo> =
-                                                reservations
-                                                    .into_iter()
-                                                    .map(|r| RobotReservationInfo {
-                                                        id: r.id,
-                                                        pane_id: r.pane_id,
-                                                        owner_kind: r.owner_kind,
-                                                        owner_id: r.owner_id,
-                                                        reason: r.reason,
-                                                        created_at: r.created_at,
-                                                        expires_at: r.expires_at,
-                                                        released_at: r.released_at,
-                                                        status: r.status,
-                                                    })
-                                                    .collect();
+                                            let infos: Vec<RobotReservationInfo> = reservations
+                                                .into_iter()
+                                                .map(|r| RobotReservationInfo {
+                                                    id: r.id,
+                                                    pane_id: r.pane_id,
+                                                    owner_kind: r.owner_kind,
+                                                    owner_id: r.owner_id,
+                                                    reason: r.reason,
+                                                    created_at: r.created_at,
+                                                    expires_at: r.expires_at,
+                                                    released_at: r.released_at,
+                                                    status: r.status,
+                                                })
+                                                .collect();
                                             let data = RobotReservationsListData {
                                                 reservations: infos,
                                                 total,
                                             };
-                                            let response = RobotResponse::success(
-                                                data,
-                                                elapsed_ms(start),
-                                            );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            let response =
+                                                RobotResponse::success(data, elapsed_ms(start));
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                         Err(e) => {
                                             let response =
@@ -6622,9 +6629,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(
-                                                &response, format, stats,
-                                            )?;
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                     }
                                 }
@@ -6632,9 +6637,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             // Clean shutdown
                             if let Err(e) = storage.shutdown().await {
-                                tracing::warn!(
-                                    "Failed to shutdown storage cleanly: {e}"
-                                );
+                                tracing::warn!("Failed to shutdown storage cleanly: {e}");
                             }
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {
@@ -7277,24 +7280,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "wezterm_circuit": wezterm.circuit_status(),
                 });
                 if let Some(snap) = snapshot {
-                    payload["health"] = serde_json::to_value(&snap)
-                        .unwrap_or(serde_json::Value::Null);
+                    payload["health"] =
+                        serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null);
                 }
-                if let Some(crash) =
-                    wa_core::crash::latest_crash_bundle(&layout.crash_dir)
-                {
+                if let Some(crash) = wa_core::crash::latest_crash_bundle(&layout.crash_dir) {
                     let mut crash_info = serde_json::json!({
                         "bundle_path": crash.path.display().to_string(),
                     });
                     if let Some(ref report) = crash.report {
                         crash_info["message"] = serde_json::Value::String(report.message.clone());
-                        crash_info["timestamp"] = serde_json::Value::Number(report.timestamp.into());
+                        crash_info["timestamp"] =
+                            serde_json::Value::Number(report.timestamp.into());
                         if let Some(ref loc) = report.location {
                             crash_info["location"] = serde_json::Value::String(loc.clone());
                         }
                     }
                     if let Some(ref manifest) = crash.manifest {
-                        crash_info["created_at"] = serde_json::Value::String(manifest.created_at.clone());
+                        crash_info["created_at"] =
+                            serde_json::Value::String(manifest.created_at.clone());
                     }
                     payload["latest_crash"] = crash_info;
                 }
@@ -7381,13 +7384,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{output}");
 
                         // Append health snapshot if daemon is running
-                        if let Some(snapshot) =
-                            wa_core::crash::HealthSnapshot::get_global()
-                        {
+                        if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
                             if output_format.is_json() {
                                 // In JSON mode, print as separate object
-                                let health_json =
-                                    HealthSnapshotRenderer::render(&snapshot, &ctx);
+                                let health_json = HealthSnapshotRenderer::render(&snapshot, &ctx);
                                 print!("{health_json}");
                             } else {
                                 // In text mode, append compact health line
@@ -7399,8 +7399,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
 
                         // Show latest crash bundle if any
-                        if let Some(crash) =
-                            wa_core::crash::latest_crash_bundle(&layout.crash_dir)
+                        if let Some(crash) = wa_core::crash::latest_crash_bundle(&layout.crash_dir)
                         {
                             if !output_format.is_json() {
                                 println!();
@@ -8144,8 +8143,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
                 // Plain text output
@@ -8211,11 +8209,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     format_retry(snapshot.status.cooldown_remaining_ms)
                                 ),
                             };
-                            println!(
-                                "  {:width$}: {status}",
-                                snapshot.name,
-                                width = name_width
-                            );
+                            println!("  {:width$}: {status}", snapshot.name, width = name_width);
                         }
                         println!();
                     }
@@ -8257,10 +8251,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     // If output path exists and --force not set, refuse
                     if let Some(ref path) = output_path {
                         if path.exists() && !force {
-                            eprintln!(
-                                "Error: Output directory already exists: {}",
-                                path.display()
-                            );
+                            eprintln!("Error: Output directory already exists: {}", path.display());
                             eprintln!("Use --force to overwrite.");
                             std::process::exit(1);
                         }
@@ -8300,9 +8291,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             eprintln!("  Files:      {}", result.file_count);
                             eprintln!("  Total size: {} bytes", result.total_size_bytes);
                             eprintln!();
-                            eprintln!(
-                                "All data is redacted. Safe to attach to bug reports."
-                            );
+                            eprintln!("All data is redacted. Safe to attach to bug reports.");
                             // Print path on stdout for easy piping
                             println!("{}", result.output_path);
                         }
@@ -9026,9 +9015,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             // 2. Recent crash bundles
             if show_all || section == "crashes" {
-                if let Some(bundle) =
-                    wa_core::crash::latest_crash_bundle(&layout.crash_dir)
-                {
+                if let Some(bundle) = wa_core::crash::latest_crash_bundle(&layout.crash_dir) {
                     let detail = if let Some(ref report) = bundle.report {
                         let msg = if report.message.len() > 100 {
                             format!("{}...", &report.message[..97])
@@ -9064,12 +9051,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
 
             // 3. Unhandled events + 4. Incomplete workflows (both need DB)
-            let needs_db =
-                show_all || section == "events" || section == "workflows";
+            let needs_db = show_all || section == "events" || section == "workflows";
             if needs_db {
                 let db_path = layout.db_path.to_string_lossy();
-                let storage_result =
-                    wa_core::storage::StorageHandle::new(&db_path).await;
+                let storage_result = wa_core::storage::StorageHandle::new(&db_path).await;
 
                 match storage_result {
                     Ok(storage) => {
@@ -9084,9 +9069,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 since: None,
                                 until: None,
                             };
-                            if let Ok(events) =
-                                storage.get_events(query).await
-                            {
+                            if let Ok(events) = storage.get_events(query).await {
                                 for event in &events {
                                     items.push(serde_json::json!({
                                         "section": "events",
@@ -9144,9 +9127,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         // Incomplete workflows
                         if show_all || section == "workflows" {
-                            if let Ok(workflows) =
-                                storage.find_incomplete_workflows().await
-                            {
+                            if let Ok(workflows) = storage.find_incomplete_workflows().await {
                                 for wf in &workflows {
                                     items.push(serde_json::json!({
                                         "section": "workflows",
@@ -9230,20 +9211,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if let Some(ref min_sev) = severity {
                 let min_rank = severity_rank(min_sev);
                 items.retain(|item| {
-                    let sev =
-                        item["severity"].as_str().unwrap_or("info");
+                    let sev = item["severity"].as_str().unwrap_or("info");
                     severity_rank(sev) >= min_rank
                 });
             }
 
             // Sort: errors first, then warnings, then info
             items.sort_by(|a, b| {
-                let sa = severity_rank(
-                    a["severity"].as_str().unwrap_or("info"),
-                );
-                let sb = severity_rank(
-                    b["severity"].as_str().unwrap_or("info"),
-                );
+                let sa = severity_rank(a["severity"].as_str().unwrap_or("info"));
+                let sb = severity_rank(b["severity"].as_str().unwrap_or("info"));
                 sb.cmp(&sa)
             });
 
@@ -9257,24 +9233,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
                 );
             } else if items.is_empty() {
                 println!("wa triage - Nothing needs attention\n");
-                println!(
-                    "All clear. No unhandled events, crashes, or health issues."
-                );
+                println!("All clear. No unhandled events, crashes, or health issues.");
             } else {
-                println!(
-                    "wa triage - {} item(s) need attention\n",
-                    items.len()
-                );
+                println!("wa triage - {} item(s) need attention\n", items.len());
 
                 let mut current_section = "";
                 for item in &items {
-                    let sec =
-                        item["section"].as_str().unwrap_or("unknown");
+                    let sec = item["section"].as_str().unwrap_or("unknown");
                     if sec != current_section {
                         if !current_section.is_empty() {
                             println!();
@@ -9290,8 +9259,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         current_section = sec;
                     }
 
-                    let sev =
-                        item["severity"].as_str().unwrap_or("info");
+                    let sev = item["severity"].as_str().unwrap_or("info");
                     let icon = match sev {
                         "error" => "[ERROR]",
                         "warning" => "[WARN] ",
@@ -9320,34 +9288,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         if let Some(actions) = item["actions"].as_array() {
                             // Skip first action (already shown as primary)
                             for extra in actions.iter().skip(1) {
-                                if let (Some(cmd), Some(label)) = (
-                                    extra["command"].as_str(),
-                                    extra["label"].as_str(),
-                                ) {
-                                    println!(
-                                        "            {label}: {cmd}"
-                                    );
+                                if let (Some(cmd), Some(label)) =
+                                    (extra["command"].as_str(), extra["label"].as_str())
+                                {
+                                    println!("            {label}: {cmd}");
                                 }
                             }
                         }
-                        if let Some(explain) = item["explain"].as_str()
-                        {
-                            println!(
-                                "         ?? {explain}"
-                            );
+                        if let Some(explain) = item["explain"].as_str() {
+                            println!("         ?? {explain}");
                         }
                     }
                 }
 
                 println!();
-                let errors = items
-                    .iter()
-                    .filter(|i| i["severity"] == "error")
-                    .count();
-                let warnings = items
-                    .iter()
-                    .filter(|i| i["severity"] == "warning")
-                    .count();
+                let errors = items.iter().filter(|i| i["severity"] == "error").count();
+                let warnings = items.iter().filter(|i| i["severity"] == "warning").count();
                 let infos = items.len() - errors - warnings;
                 let mut parts = Vec::new();
                 if errors > 0 {
@@ -10815,7 +10771,10 @@ async fn handle_backup_command(
                         println!("    Segments:   {}", result.manifest.stats.segments);
                         println!("    Events:     {}", result.manifest.stats.events);
                         println!("    Audit:      {}", result.manifest.stats.audit_actions);
-                        println!("    Workflows:  {}", result.manifest.stats.workflow_executions);
+                        println!(
+                            "    Workflows:  {}",
+                            result.manifest.stats.workflow_executions
+                        );
                         if !no_verify {
                             println!();
                             println!("  Verified: OK");
@@ -10859,7 +10818,9 @@ async fn handle_backup_command(
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
                     eprintln!("Error: Backup directory not found: {path}");
-                    eprintln!("Hint: Provide the path to a backup directory created by 'wa backup export'.");
+                    eprintln!(
+                        "Hint: Provide the path to a backup directory created by 'wa backup export'."
+                    );
                 }
                 std::process::exit(1);
             }
@@ -10928,12 +10889,16 @@ async fn handle_backup_command(
                 println!("  Version: {}", manifest.wa_version);
                 println!("  Schema:  {}", manifest.schema_version);
                 println!("  Created: {}", manifest.created_at);
-                println!("  Data:    {} segments, {} events",
-                    manifest.stats.segments, manifest.stats.events);
+                println!(
+                    "  Data:    {} segments, {} events",
+                    manifest.stats.segments, manifest.stats.events
+                );
                 println!();
                 if db_path.exists() {
-                    println!("WARNING: This will replace the current database at {}",
-                        db_path.display());
+                    println!(
+                        "WARNING: This will replace the current database at {}",
+                        db_path.display()
+                    );
                     if !no_safety_backup {
                         println!("  A safety backup will be created first.");
                     }
@@ -10972,8 +10937,10 @@ async fn handle_backup_command(
                         if let Some(ref safety) = result.safety_backup_path {
                             println!("  Safety backup: {safety}");
                         }
-                        println!("  Restored {} segments, {} events",
-                            result.manifest.stats.segments, result.manifest.stats.events);
+                        println!(
+                            "  Restored {} segments, {} events",
+                            result.manifest.stats.segments, result.manifest.stats.events
+                        );
                     }
                 }
                 Err(e) => {
@@ -11254,11 +11221,8 @@ async fn handle_auth_command(
                         println!("  Automated uses: {count}");
                     }
                     if verbose {
-                        let profile = BrowserProfile::new(
-                            profiles_root,
-                            &status.service,
-                            &status.account,
-                        );
+                        let profile =
+                            BrowserProfile::new(profiles_root, &status.service, &status.account);
                         println!("  Path: {}", profile.path().display());
                     }
                     println!();
@@ -11342,9 +11306,7 @@ async fn handle_auth_command(
                             println!("  Profile: {}", profile_dir.display());
                         }
                         println!();
-                        println!(
-                            "You can now run: wa auth test {service} --account {account}"
-                        );
+                        println!("You can now run: wa auth test {service} --account {account}");
                     }
                 }
                 BootstrapResult::Timeout { waited_ms } => {
@@ -11884,12 +11846,7 @@ fn run_remote_command(
     })
 }
 
-fn print_remote_output(
-    redactor: &wa_core::policy::Redactor,
-    label: &str,
-    text: &str,
-    verbose: u8,
-) {
+fn print_remote_output(redactor: &wa_core::policy::Redactor, label: &str, text: &str, verbose: u8) {
     if verbose == 0 {
         return;
     }
@@ -13657,10 +13614,7 @@ mod tests {
         ];
         for item in &items {
             let sev = item["severity"].as_str().unwrap();
-            assert!(
-                valid_severities.contains(&sev),
-                "Invalid severity: {sev}"
-            );
+            assert!(valid_severities.contains(&sev), "Invalid severity: {sev}");
         }
     }
 
@@ -13698,9 +13652,7 @@ mod tests {
     ) -> serde_json::Value {
         let actions_json: Vec<serde_json::Value> = actions
             .into_iter()
-            .map(|(cmd, label)| {
-                serde_json::json!({"command": cmd, "label": label})
-            })
+            .map(|(cmd, label)| serde_json::json!({"command": cmd, "label": label}))
             .collect();
         let mut item = serde_json::json!({
             "section": section,
@@ -13966,7 +13918,12 @@ mod tests {
 
         assert_eq!(json["selected_account_id"].as_str().unwrap(), "acc-best");
         assert_eq!(json["selected_name"].as_str().unwrap(), "Best Account");
-        assert!(json["selection_reason"].as_str().unwrap().contains("Highest"));
+        assert!(
+            json["selection_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Highest")
+        );
         assert!((json["threshold_percent"].as_f64().unwrap() - 5.0).abs() < 0.001);
         assert_eq!(json["candidates_count"].as_u64().unwrap(), 2);
         assert_eq!(json["filtered_count"].as_u64().unwrap(), 1);
@@ -14136,23 +14093,25 @@ mod tests {
         assert_eq!(preview.selected_name.as_deref(), Some("Best"));
         assert_eq!(preview.candidates_count, 2); // best + mid
         assert_eq!(preview.filtered_count, 1); // depleted below 5%
-        assert!(preview.selection_reason.contains("Highest percent_remaining"));
+        assert!(
+            preview
+                .selection_reason
+                .contains("Highest percent_remaining")
+        );
     }
 
     #[test]
     fn robot_accounts_list_ordering_deterministic() {
         // Same input data produces same JSON output every time
-        let build_data = || {
-            RobotAccountsListData {
-                accounts: vec![
-                    make_robot_account_info("c", 30.0, Some(100)),
-                    make_robot_account_info("a", 90.0, None),
-                    make_robot_account_info("b", 50.0, Some(200)),
-                ],
-                total: 3,
-                service: "openai".to_string(),
-                pick_preview: None,
-            }
+        let build_data = || RobotAccountsListData {
+            accounts: vec![
+                make_robot_account_info("c", 30.0, Some(100)),
+                make_robot_account_info("a", 90.0, None),
+                make_robot_account_info("b", 50.0, Some(200)),
+            ],
+            total: 3,
+            service: "openai".to_string(),
+            pick_preview: None,
         };
 
         let json1 = serde_json::to_string(&build_data()).unwrap();
@@ -14178,7 +14137,10 @@ mod tests {
 
         assert_eq!(json["service"].as_str().unwrap(), "openai");
         assert_eq!(json["refreshed_count"].as_u64().unwrap(), 2);
-        assert_eq!(json["refreshed_at"].as_str().unwrap(), "2026-01-28T12:00:00Z");
+        assert_eq!(
+            json["refreshed_at"].as_str().unwrap(),
+            "2026-01-28T12:00:00Z"
+        );
         assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
     }
 
@@ -14880,10 +14842,7 @@ mod tests {
 
         #[test]
         fn build_profile_status_no_profile() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_auth_test_{}",
-                std::process::id()
-            ));
+            let tmp = std::env::temp_dir().join(format!("wa_auth_test_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let profile = wa_core::browser::BrowserProfile::new(
@@ -14905,10 +14864,8 @@ mod tests {
 
         #[test]
         fn build_profile_status_with_profile_dir() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_auth_test_profile_{}",
-                std::process::id()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_auth_test_profile_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let profile = wa_core::browser::BrowserProfile::new(&tmp, "testservice", "testaccount");
@@ -14924,10 +14881,8 @@ mod tests {
 
         #[test]
         fn build_profile_status_with_metadata() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_auth_test_meta_{}",
-                std::process::id()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_auth_test_meta_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let profile = wa_core::browser::BrowserProfile::new(&tmp, "openai", "default");
@@ -14950,10 +14905,8 @@ mod tests {
 
         #[test]
         fn build_profile_status_with_storage_state() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_auth_test_storage_{}",
-                std::process::id()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_auth_test_storage_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let profile = wa_core::browser::BrowserProfile::new(&tmp, "openai", "default");
@@ -14965,6 +14918,73 @@ mod tests {
             assert!(status.has_storage_state);
 
             let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    // --- Version metadata tests ---
+
+    #[test]
+    fn version_short_is_non_empty_and_contains_semver() {
+        let v = build_meta::short_version();
+        assert!(!v.is_empty());
+        // Must contain a semver-like pattern (X.Y.Z)
+        assert!(
+            v.contains('.'),
+            "short version should contain semver dots: {v}"
+        );
+        // Must contain a commit hash in parens
+        assert!(v.contains('(') && v.contains(')'), "short version should contain commit hash in parens: {v}");
+    }
+
+    #[test]
+    fn version_short_has_no_ansi_escapes() {
+        let v = build_meta::short_version();
+        assert!(
+            !v.contains('\x1b'),
+            "short version must not contain ANSI escapes: {v}"
+        );
+    }
+
+    #[test]
+    fn version_verbose_includes_all_fields() {
+        let v = build_meta::verbose_version();
+        assert!(v.contains("wa "), "verbose version should start with 'wa ': {v}");
+        assert!(v.contains("commit:"), "verbose version should contain commit field: {v}");
+        assert!(v.contains("built:"), "verbose version should contain built field: {v}");
+        assert!(v.contains("rustc:"), "verbose version should contain rustc field: {v}");
+        assert!(v.contains("target:"), "verbose version should contain target field: {v}");
+        assert!(v.contains("features:"), "verbose version should contain features field: {v}");
+    }
+
+    #[test]
+    fn version_verbose_has_no_ansi_escapes() {
+        let v = build_meta::verbose_version();
+        assert!(
+            !v.contains('\x1b'),
+            "verbose version must not contain ANSI escapes: {v}"
+        );
+    }
+
+    #[test]
+    fn version_verbose_field_ordering_is_stable() {
+        let v = build_meta::verbose_version();
+        let lines: Vec<&str> = v.lines().collect();
+        // First line is the version header
+        assert!(lines[0].starts_with("wa "), "first line should be version header");
+        // Fields must appear in a stable order
+        let field_positions: Vec<_> = ["commit:", "built:", "rustc:", "target:", "features:"]
+            .iter()
+            .map(|field| {
+                v.find(field)
+                    .unwrap_or_else(|| panic!("missing field: {field}"))
+            })
+            .collect();
+        // Each field must appear after the previous one
+        for window in field_positions.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "fields must appear in stable order"
+            );
         }
     }
 }
