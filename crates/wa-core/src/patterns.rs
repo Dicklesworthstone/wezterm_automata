@@ -1105,7 +1105,7 @@ fn builtin_gemini_pack() -> PatternPack {
                     "usage limit approaching".to_string(),
                 ],
                 regex: Some(
-                    r"Usage limit (?:warning|approaching)[^\n]*?(?P<remaining>\d+)%\s+of\s+your\s+Pro\s+models?\s+quota\s+remaining"
+                    r"(?:Usage limit (?:warning|approaching)|approaching your usage limit|usage limit approaching)[^\n]*?(?P<remaining>\d+)%\s+of\s+your\s+Pro\s+models?\s+quota\s+remaining"
                         .to_string(),
                 ),
                 description: "Gemini usage limit approaching".to_string(),
