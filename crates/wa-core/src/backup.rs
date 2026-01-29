@@ -229,6 +229,153 @@ pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()>
     Ok(())
 }
 
+/// Result of an import operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportResult {
+    /// Path of the backup that was imported
+    pub source_path: String,
+    /// Manifest from the imported backup
+    pub manifest: BackupManifest,
+    /// Path to the pre-import safety backup (if created)
+    pub safety_backup_path: Option<String>,
+    /// Whether this was a dry-run
+    pub dry_run: bool,
+}
+
+/// Options for import.
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    /// If true, only verify and show what would happen
+    pub dry_run: bool,
+    /// If true, skip interactive confirmation
+    pub yes: bool,
+    /// If true, skip creating a safety backup of current data
+    pub no_safety_backup: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            yes: false,
+            no_safety_backup: false,
+        }
+    }
+}
+
+/// Load and verify a backup manifest from a backup directory.
+pub fn load_backup_manifest(backup_dir: &Path) -> Result<BackupManifest> {
+    let manifest_path = backup_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(Error::Storage(crate::StorageError::Database(format!(
+            "No manifest.json found in backup directory: {}",
+            backup_dir.display()
+        ))));
+    }
+
+    let data = fs::read_to_string(&manifest_path).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to read manifest: {e}"
+        )))
+    })?;
+
+    let manifest: BackupManifest = serde_json::from_str(&data).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to parse manifest: {e}"
+        )))
+    })?;
+
+    Ok(manifest)
+}
+
+/// Import (restore) a backup into the target database location.
+///
+/// Safety:
+/// - Verifies backup integrity before importing
+/// - Creates a safety backup of the current database (unless opted out)
+/// - Refuses to import if schema version is incompatible
+/// - Dry-run mode shows what would happen without modifying anything
+pub fn import_backup(
+    backup_dir: &Path,
+    target_db_path: &Path,
+    workspace_root: &Path,
+    opts: &ImportOptions,
+) -> Result<ImportResult> {
+    // Step 1: Load and validate manifest
+    let manifest = load_backup_manifest(backup_dir)?;
+
+    // Step 2: Check schema compatibility
+    if manifest.schema_version > SCHEMA_VERSION {
+        return Err(Error::Storage(crate::StorageError::Database(format!(
+            "Backup schema version {} is newer than supported version {}. \
+             Upgrade wa before importing this backup.",
+            manifest.schema_version, SCHEMA_VERSION
+        ))));
+    }
+
+    // Step 3: Verify backup integrity
+    let backup_db = backup_dir.join("database.db");
+    if !backup_db.exists() {
+        return Err(Error::Storage(crate::StorageError::Database(
+            "Backup database.db not found".to_string(),
+        )));
+    }
+    verify_backup(backup_dir, &manifest)?;
+
+    // Dry-run: report what would happen and return
+    if opts.dry_run {
+        let safety_backup_path = if target_db_path.exists() && !opts.no_safety_backup {
+            let path = default_backup_path(workspace_root)?;
+            Some(path.display().to_string())
+        } else {
+            None
+        };
+
+        return Ok(ImportResult {
+            source_path: backup_dir.display().to_string(),
+            manifest,
+            safety_backup_path,
+            dry_run: true,
+        });
+    }
+
+    // Step 4: Create safety backup of current database
+    let safety_backup_path = if target_db_path.exists() && !opts.no_safety_backup {
+        let safety_opts = ExportOptions {
+            output: None, // default timestamped path
+            include_sql_dump: false,
+            verify: true,
+        };
+        let safety_result = export_backup(target_db_path, workspace_root, &safety_opts)?;
+        Some(safety_result.output_path)
+    } else {
+        None
+    };
+
+    // Step 5: Replace current database with backup copy
+    // Use rusqlite backup API to restore (consistent, handles WAL mode)
+    if target_db_path.exists() {
+        // Remove WAL and journal files if they exist
+        let wal_path = target_db_path.with_extension("db-wal");
+        let shm_path = target_db_path.with_extension("db-shm");
+        let journal_path = target_db_path.with_extension("db-journal");
+        for p in [&wal_path, &shm_path, &journal_path] {
+            if p.exists() {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+
+    backup_database(&backup_db, target_db_path)?;
+
+    Ok(ImportResult {
+        source_path: backup_dir.display().to_string(),
+        manifest,
+        safety_backup_path,
+        dry_run: false,
+    })
+}
+
 // --- Internal helpers ---
 
 /// Use rusqlite's online backup API for a consistent snapshot.
@@ -629,5 +776,137 @@ mod tests {
         let path = default_backup_path(tmp.path()).unwrap();
         let name = path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("wa_backup_"));
+    }
+
+    #[test]
+    fn import_roundtrip_preserves_data() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("source.db");
+        let _conn = create_test_db(&db_path);
+        drop(_conn);
+
+        // Export
+        let backup_dir = tmp.path().join("backup");
+        let export_opts = ExportOptions {
+            output: Some(backup_dir.clone()),
+            verify: true,
+            ..Default::default()
+        };
+        let _export = export_backup(&db_path, tmp.path(), &export_opts).unwrap();
+
+        // Import into a new location
+        let target_db = tmp.path().join("restored.db");
+        let import_opts = ImportOptions {
+            dry_run: false,
+            yes: true,
+            no_safety_backup: true,
+        };
+        let result = import_backup(&backup_dir, &target_db, tmp.path(), &import_opts).unwrap();
+
+        assert!(!result.dry_run);
+        assert!(target_db.exists());
+
+        // Verify imported data
+        let conn = Connection::open(&target_db).unwrap();
+        let pane_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pane_count, 2);
+
+        let seg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seg_count, 3);
+    }
+
+    #[test]
+    fn import_dry_run_does_not_modify() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("source.db");
+        let _conn = create_test_db(&db_path);
+        drop(_conn);
+
+        // Export
+        let backup_dir = tmp.path().join("backup");
+        let export_opts = ExportOptions {
+            output: Some(backup_dir.clone()),
+            verify: true,
+            ..Default::default()
+        };
+        let _export = export_backup(&db_path, tmp.path(), &export_opts).unwrap();
+
+        // Dry-run import
+        let target_db = tmp.path().join("target.db");
+        let import_opts = ImportOptions {
+            dry_run: true,
+            yes: true,
+            no_safety_backup: true,
+        };
+        let result = import_backup(&backup_dir, &target_db, tmp.path(), &import_opts).unwrap();
+
+        assert!(result.dry_run);
+        assert!(!target_db.exists(), "Dry-run should not create target database");
+    }
+
+    #[test]
+    fn import_creates_safety_backup() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("existing.db");
+        let _conn = create_test_db(&db_path);
+        drop(_conn);
+
+        // Export to create a backup archive
+        let backup_dir = tmp.path().join("backup");
+        let export_opts = ExportOptions {
+            output: Some(backup_dir.clone()),
+            verify: true,
+            ..Default::default()
+        };
+        let _export = export_backup(&db_path, tmp.path(), &export_opts).unwrap();
+
+        // Import over the existing database (with safety backup)
+        let import_opts = ImportOptions {
+            dry_run: false,
+            yes: true,
+            no_safety_backup: false,
+        };
+        let result = import_backup(&backup_dir, &db_path, tmp.path(), &import_opts).unwrap();
+
+        assert!(result.safety_backup_path.is_some());
+        let safety_path = PathBuf::from(result.safety_backup_path.unwrap());
+        assert!(safety_path.join("database.db").exists());
+        assert!(safety_path.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn import_rejects_nonexistent_backup() {
+        let tmp = TempDir::new().unwrap();
+        let fake_backup = tmp.path().join("nonexistent");
+        let target = tmp.path().join("target.db");
+        let opts = ImportOptions::default();
+
+        let result = import_backup(&fake_backup, &target, tmp.path(), &opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_manifest_parses_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let _conn = create_test_db(&db_path);
+        drop(_conn);
+
+        let backup_dir = tmp.path().join("backup");
+        let export_opts = ExportOptions {
+            output: Some(backup_dir.clone()),
+            verify: true,
+            ..Default::default()
+        };
+        let _export = export_backup(&db_path, tmp.path(), &export_opts).unwrap();
+
+        let manifest = load_backup_manifest(&backup_dir).unwrap();
+        assert_eq!(manifest.schema_version, SCHEMA_VERSION);
+        assert_eq!(manifest.stats.panes, 2);
+        assert!(!manifest.db_checksum.is_empty());
     }
 }

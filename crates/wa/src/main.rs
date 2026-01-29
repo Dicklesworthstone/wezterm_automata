@@ -866,6 +866,32 @@ enum BackupCommands {
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+
+    /// Import (restore) from a backup archive
+    Import {
+        /// Path to the backup directory to import
+        path: String,
+
+        /// Only verify and show what would happen (no modifications)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip interactive confirmation
+        #[arg(long)]
+        yes: bool,
+
+        /// Skip creating a safety backup of current data before import
+        #[arg(long)]
+        no_safety_backup: bool,
+
+        /// Only verify the backup integrity without importing
+        #[arg(long)]
+        verify: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
 }
 
 const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
@@ -7494,7 +7520,11 @@ async fn handle_db_command(
                     println!();
                 }
 
-                let label = if dry_run { "Would perform" } else { "Repairing" };
+                let label = if dry_run {
+                    "Would perform"
+                } else {
+                    "Repairing"
+                };
                 println!("{label}:");
                 for (i, repair) in report.repairs.iter().enumerate() {
                     let status = if repair.success { "done" } else { "FAILED" };
@@ -7604,6 +7634,160 @@ async fn handle_backup_command(
                         println!("{}", serde_json::to_string_pretty(&resp)?);
                     } else {
                         eprintln!("Backup failed: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        BackupCommands::Import {
+            path,
+            dry_run,
+            yes,
+            no_safety_backup,
+            verify,
+            format,
+        } => {
+            let backup_dir = PathBuf::from(&path);
+
+            if !backup_dir.exists() || !backup_dir.is_dir() {
+                if format == "json" {
+                    let resp = serde_json::json!({
+                        "ok": false,
+                        "error": format!("Backup directory not found: {path}"),
+                        "error_code": "E_BACKUP_NOT_FOUND",
+                        "hint": "Provide the path to a backup directory created by 'wa backup export'.",
+                    });
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else {
+                    eprintln!("Error: Backup directory not found: {path}");
+                    eprintln!("Hint: Provide the path to a backup directory created by 'wa backup export'.");
+                }
+                std::process::exit(1);
+            }
+
+            // Verify-only mode
+            if verify {
+                let manifest = wa_core::backup::load_backup_manifest(&backup_dir)?;
+                match wa_core::backup::verify_backup(&backup_dir, &manifest) {
+                    Ok(()) => {
+                        if format == "json" {
+                            let resp = serde_json::json!({
+                                "ok": true,
+                                "data": {
+                                    "verified": true,
+                                    "manifest": manifest,
+                                }
+                            });
+                            println!("{}", serde_json::to_string_pretty(&resp)?);
+                        } else {
+                            println!("Backup verified: OK");
+                            println!("  Version:  {}", manifest.wa_version);
+                            println!("  Schema:   {}", manifest.schema_version);
+                            println!("  Created:  {}", manifest.created_at);
+                            println!("  Checksum: {}", manifest.db_checksum);
+                            println!("  Size:     {} bytes", manifest.db_size_bytes);
+                            println!();
+                            println!("  Stats:");
+                            println!("    Panes:     {}", manifest.stats.panes);
+                            println!("    Segments:  {}", manifest.stats.segments);
+                            println!("    Events:    {}", manifest.stats.events);
+                            println!("    Audit:     {}", manifest.stats.audit_actions);
+                            println!("    Workflows: {}", manifest.stats.workflow_executions);
+                        }
+                    }
+                    Err(e) => {
+                        if format == "json" {
+                            let resp = serde_json::json!({
+                                "ok": false,
+                                "error": format!("{e}"),
+                                "error_code": "E_VERIFICATION_FAILED",
+                            });
+                            println!("{}", serde_json::to_string_pretty(&resp)?);
+                        } else {
+                            eprintln!("Backup verification failed: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+
+            let db_path = &layout.db_path;
+            let opts = wa_core::backup::ImportOptions {
+                dry_run,
+                yes,
+                no_safety_backup,
+            };
+
+            if dry_run {
+                if format != "json" {
+                    println!("Dry-run: showing what would happen...");
+                }
+            } else if !yes {
+                let manifest = wa_core::backup::load_backup_manifest(&backup_dir)?;
+                println!("Import backup from: {path}");
+                println!("  Version: {}", manifest.wa_version);
+                println!("  Schema:  {}", manifest.schema_version);
+                println!("  Created: {}", manifest.created_at);
+                println!("  Data:    {} segments, {} events",
+                    manifest.stats.segments, manifest.stats.events);
+                println!();
+                if db_path.exists() {
+                    println!("WARNING: This will replace the current database at {}",
+                        db_path.display());
+                    if !no_safety_backup {
+                        println!("  A safety backup will be created first.");
+                    }
+                }
+                if !prompt_confirm("Proceed? [y/N]: ")? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            match wa_core::backup::import_backup(&backup_dir, db_path, workspace_root, &opts) {
+                Ok(result) => {
+                    if format == "json" {
+                        let resp = serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "source_path": result.source_path,
+                                "manifest": result.manifest,
+                                "safety_backup_path": result.safety_backup_path,
+                                "dry_run": result.dry_run,
+                            }
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else if result.dry_run {
+                        println!("Would import from: {}", result.source_path);
+                        println!("  Schema: {}", result.manifest.schema_version);
+                        println!("  Segments: {}", result.manifest.stats.segments);
+                        println!("  Events: {}", result.manifest.stats.events);
+                        if let Some(ref safety) = result.safety_backup_path {
+                            println!("  Safety backup would be created at: {safety}");
+                        }
+                        println!();
+                        println!("No changes made (dry-run).");
+                    } else {
+                        println!("Import complete.");
+                        if let Some(ref safety) = result.safety_backup_path {
+                            println!("  Safety backup: {safety}");
+                        }
+                        println!("  Restored {} segments, {} events",
+                            result.manifest.stats.segments, result.manifest.stats.events);
+                    }
+                }
+                Err(e) => {
+                    if format == "json" {
+                        let resp = serde_json::json!({
+                            "ok": false,
+                            "error": format!("{e}"),
+                            "error_code": "E_IMPORT_FAILED",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        eprintln!("Import failed: {e}");
                     }
                     std::process::exit(1);
                 }
