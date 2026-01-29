@@ -118,9 +118,7 @@ pub fn export_backup(
 
     // Step 2: Compute checksum of the backed-up database
     let db_checksum = sha256_file(&dest_db_path)?;
-    let db_size = fs::metadata(&dest_db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = fs::metadata(&dest_db_path).map_or(0, |m| m.len());
 
     // Step 3: Gather stats from the backup copy
     let stats = gather_stats(&dest_db_path)?;
@@ -614,10 +612,10 @@ fn format_iso8601(epoch_secs: u64) -> String {
 /// Convert days since epoch to (year, month, day).
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Civil calendar algorithm
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -629,14 +627,12 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Compute total size of a directory.
 fn dir_size(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-                .sum()
-        })
-        .unwrap_or(0)
+    fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().map_or(0, |m| m.len()))
+            .sum()
+    })
 }
 
 #[cfg(test)]

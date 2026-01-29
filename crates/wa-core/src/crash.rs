@@ -263,7 +263,7 @@ pub fn write_crash_bundle(
             thread_name: report.thread_name.clone(),
         };
         let json = serde_json::to_string_pretty(&redacted_report)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::other(e))?;
         let bytes = json.as_bytes();
         total_size += bytes.len() as u64;
         if total_size <= MAX_BUNDLE_SIZE as u64 {
@@ -275,7 +275,7 @@ pub fn write_crash_bundle(
     // 2. Write health_snapshot.json (if available)
     let has_health = if let Some(snap) = health {
         let json = serde_json::to_string_pretty(snap)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::other(e))?;
         let bytes = json.as_bytes();
         total_size += bytes.len() as u64;
         if total_size <= MAX_BUNDLE_SIZE as u64 {
@@ -299,7 +299,7 @@ pub fn write_crash_bundle(
             bundle_size_bytes: total_size,
         };
         let json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::other(e))?;
         write_file_sync(&tmp_dir.join("manifest.json"), json.as_bytes())?;
         // manifest doesn't count toward the privacy budget
     }
@@ -406,16 +406,16 @@ pub struct CrashBundleSummary {
 /// Scans for directories matching `wa_crash_*`, parses their manifests
 /// and crash reports, and returns up to `limit` results.  Invalid or
 /// unreadable bundles are silently skipped.
+#[must_use]
 pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSummary> {
-    let entries = match fs::read_dir(crash_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+    let Ok(entries) = fs::read_dir(crash_dir) else {
+        return Vec::new();
     };
 
     let mut bundles: Vec<CrashBundleSummary> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| {
-            e.file_type().map_or(false, |ft| ft.is_dir())
+            e.file_type().is_ok_and(|ft| ft.is_dir())
                 && e.file_name()
                     .to_str()
                     .is_some_and(|n| n.starts_with("wa_crash_"))
@@ -454,6 +454,7 @@ pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSumm
 }
 
 /// Get the most recent crash bundle, if any.
+#[must_use]
 pub fn latest_crash_bundle(crash_dir: &Path) -> Option<CrashBundleSummary> {
     list_crash_bundles(crash_dir, 1).into_iter().next()
 }
@@ -525,7 +526,7 @@ pub fn export_incident_bundle(
             // Copy crash report
             if let Some(ref report) = crash.report {
                 let json = serde_json::to_string_pretty(report)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(|e| std::io::Error::other(e))?;
                 let redacted = redactor.redact(&json);
                 let bytes = redacted.as_bytes();
                 total_size += bytes.len() as u64;
@@ -536,7 +537,7 @@ pub fn export_incident_bundle(
             // Copy crash manifest
             if let Some(ref manifest) = crash.manifest {
                 let json = serde_json::to_string_pretty(manifest)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(|e| std::io::Error::other(e))?;
                 let bytes = json.as_bytes();
                 total_size += bytes.len() as u64;
                 write_file_sync(&bundle_dir.join("crash_manifest.json"), bytes)?;
@@ -587,7 +588,7 @@ pub fn export_incident_bundle(
     };
 
     let manifest_json = serde_json::to_string_pretty(&result)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| std::io::Error::other(e))?;
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),

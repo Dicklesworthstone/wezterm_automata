@@ -10194,7 +10194,7 @@ Try again at 3:00 PM UTC.
             event_type: "session.summary".to_string(),
             severity: Severity::Info,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "Token usage: total=100".to_string(),
             span: (0, 20),
         };
@@ -10210,7 +10210,7 @@ Try again at 3:00 PM UTC.
             event_type: "session.end".to_string(),
             severity: Severity::Info,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "Session ended".to_string(),
             span: (0, 13),
         };
@@ -10226,7 +10226,7 @@ Try again at 3:00 PM UTC.
             event_type: "usage.warning".to_string(),
             severity: Severity::Warning,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "usage warning".to_string(),
             span: (0, 13),
         };
@@ -10450,7 +10450,7 @@ Try again at 3:00 PM UTC.
             event_type: "auth.device_code".to_string(),
             severity: Severity::Info,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "Enter code".to_string(),
             span: (0, 10),
         };
@@ -10466,7 +10466,7 @@ Try again at 3:00 PM UTC.
             event_type: "auth.error".to_string(),
             severity: Severity::Critical,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "API key invalid".to_string(),
             span: (0, 15),
         };
@@ -10482,7 +10482,7 @@ Try again at 3:00 PM UTC.
             event_type: "session.summary".to_string(),
             severity: Severity::Info,
             confidence: 1.0,
-            extracted: Default::default(),
+            extracted: serde_json::Value::default(),
             matched_text: "Token usage".to_string(),
             span: (0, 11),
         };

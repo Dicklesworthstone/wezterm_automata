@@ -394,8 +394,8 @@ impl FaultInjector {
                     .unwrap_or(0);
 
                 // Simple hash to get a value in [0, 1)
-                let hash = ((counter.wrapping_mul(6364136223846793005))
-                    .wrapping_add(1442695040888963407))
+                let hash = ((counter.wrapping_mul(6_364_136_223_846_793_005))
+                    .wrapping_add(1_442_695_040_888_963_407))
                     >> 32;
                 let rand_val = (hash as f64) / (u32::MAX as f64);
 
