@@ -5556,7 +5556,10 @@ impl Workflow for HandleSessionEnd {
 
     fn steps(&self) -> Vec<WorkflowStep> {
         vec![
-            WorkflowStep::new("extract_summary", "Extract structured session data from detection"),
+            WorkflowStep::new(
+                "extract_summary",
+                "Extract structured session data from detection",
+            ),
             WorkflowStep::new("persist_record", "Persist session record to database"),
         ]
     }
@@ -5660,14 +5663,9 @@ pub enum AuthRecoveryStrategy {
         url: Option<String>,
     },
     /// API key error: environment variable needs fixing.
-    ApiKeyError {
-        key_hint: Option<String>,
-    },
+    ApiKeyError { key_hint: Option<String> },
     /// Generic auth prompt requiring manual intervention.
-    ManualIntervention {
-        agent_type: String,
-        hint: String,
-    },
+    ManualIntervention { agent_type: String, hint: String },
 }
 
 impl AuthRecoveryStrategy {
@@ -5788,9 +5786,15 @@ impl Workflow for HandleAuthRequired {
 
     fn steps(&self) -> Vec<WorkflowStep> {
         vec![
-            WorkflowStep::new("check_cooldown", "Skip if auth was recently handled for this pane"),
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if auth was recently handled for this pane",
+            ),
             WorkflowStep::new("classify_auth", "Determine auth type and recovery strategy"),
-            WorkflowStep::new("record_and_plan", "Record auth event and produce recovery plan"),
+            WorkflowStep::new(
+                "record_and_plan",
+                "Record auth event and produce recovery plan",
+            ),
         ]
     }
 
@@ -6028,8 +6032,8 @@ pub fn execute_device_auth_step(
     artifacts_dir: Option<&std::path::Path>,
     headless: bool,
 ) -> DeviceAuthStepOutcome {
-    use crate::browser::{BrowserConfig, BrowserContext};
     use crate::browser::openai_device::{AuthFlowResult, OpenAiDeviceAuthFlow};
+    use crate::browser::{BrowserConfig, BrowserContext};
 
     // Step 1: Validate device code format before touching the browser
     if !validate_device_code(device_code) {
@@ -6128,9 +6132,7 @@ pub fn device_auth_outcome_to_step_result(outcome: &DeviceAuthStepOutcome) -> St
         DeviceAuthStepOutcome::BootstrapRequired {
             reason, account, ..
         } => StepResult::Abort {
-            reason: format!(
-                "Interactive bootstrap required for account '{account}': {reason}"
-            ),
+            reason: format!("Interactive bootstrap required for account '{account}': {reason}"),
         },
         DeviceAuthStepOutcome::Failed { error, .. } => StepResult::Abort {
             reason: format!("Device auth failed: {error}"),
@@ -6237,9 +6239,7 @@ pub fn validate_session_id(session_id: &str) -> bool {
         return false;
     }
     // Must contain only hex chars and hyphens
-    trimmed
-        .chars()
-        .all(|c| c.is_ascii_hexdigit() || c == '-')
+    trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// Build the resume StepResult (sends resume command, waits for stable tail).
@@ -6247,10 +6247,7 @@ pub fn validate_session_id(session_id: &str) -> bool {
 /// This returns a `StepResult::SendText` with a `StableTail` wait condition
 /// so the workflow runner handles the policy-gated injection and wait.
 #[must_use]
-pub fn build_resume_step_result(
-    session_id: &str,
-    config: &ResumeSessionConfig,
-) -> StepResult {
+pub fn build_resume_step_result(session_id: &str, config: &ResumeSessionConfig) -> StepResult {
     let command = format_resume_command(session_id, config);
     StepResult::send_text_and_wait(
         command,
@@ -6294,6 +6291,320 @@ pub fn resume_outcome_to_step_result(outcome: &ResumeSessionOutcome) -> StepResu
         ResumeSessionOutcome::Failed { error } => StepResult::Abort {
             reason: format!("Resume session failed: {error}"),
         },
+    }
+}
+
+// ============================================================================
+// Safe Fallback Path (wa-nu4.1.3.8)
+// ============================================================================
+
+/// Why the safe fallback path was entered.
+///
+/// Captures the blocking condition that prevents full automated failover.
+/// All variants carry enough context to build a structured next-step plan
+/// without exposing secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum FallbackReason {
+    /// Browser auth returned NeedsHuman (password, MFA, SSO).
+    #[serde(rename = "needs_human_auth")]
+    NeedsHumanAuth {
+        /// Which account triggered the interactive requirement.
+        account: String,
+        /// Human-readable explanation (already redacted by caller).
+        detail: String,
+    },
+    /// Failover is disabled in configuration.
+    #[serde(rename = "failover_disabled")]
+    FailoverDisabled,
+    /// A required external tool is missing (caut, Playwright, etc.).
+    #[serde(rename = "tool_missing")]
+    ToolMissing {
+        /// Name of the missing tool.
+        tool: String,
+    },
+    /// Policy denied the injection (alt-screen, recent gap, unknown state).
+    #[serde(rename = "policy_denied")]
+    PolicyDenied {
+        /// Policy rule that denied.
+        rule: String,
+    },
+    /// All configured accounts have reached usage limits.
+    #[serde(rename = "all_accounts_exhausted")]
+    AllAccountsExhausted {
+        /// Number of accounts checked.
+        accounts_checked: u32,
+    },
+    /// A catch-all for unexpected blocking conditions.
+    #[serde(rename = "other")]
+    Other {
+        /// Human-readable description.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for FallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsHumanAuth { account, detail } => {
+                write!(
+                    f,
+                    "Interactive auth required for account {account}: {detail}"
+                )
+            }
+            Self::FailoverDisabled => write!(f, "Account failover is disabled in configuration"),
+            Self::ToolMissing { tool } => write!(f, "Required tool not found: {tool}"),
+            Self::PolicyDenied { rule } => write!(f, "Policy denied injection: {rule}"),
+            Self::AllAccountsExhausted { accounts_checked } => {
+                write!(
+                    f,
+                    "All {accounts_checked} configured account(s) at usage limit"
+                )
+            }
+            Self::Other { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// A structured next-step plan persisted when the safe fallback path activates.
+///
+/// This plan enables both human operators and downstream agents to understand
+/// what happened and how to recover, without leaking secrets.
+///
+/// # Redaction
+///
+/// The caller is responsible for passing already-redacted values for any field
+/// that might contain sensitive data (session IDs are opaque hashes, not tokens).
+/// Use [`crate::policy::Redactor`] before constructing this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackNextStepPlan {
+    /// Schema version for forward compatibility.
+    pub version: u32,
+
+    /// Why the fallback was entered.
+    pub reason: FallbackReason,
+
+    /// Pane ID where the usage-limit event was detected.
+    pub pane_id: u64,
+
+    /// Explicit steps the operator must take to recover.
+    ///
+    /// Each entry is a human-readable instruction, e.g.:
+    /// - "Run `wa auth bootstrap --account openai-team` in a terminal"
+    /// - "Wait for usage-limit reset (estimated 2024-03-15T12:00:00Z)"
+    pub operator_steps: Vec<String>,
+
+    /// When it is safe to retry automated failover (epoch ms), if known.
+    ///
+    /// Derived from the reset time parsed from the usage-limit transcript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<i64>,
+
+    /// Resume session ID, if available (opaque identifier, not a secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+
+    /// Non-secret account identifier that was in use when the limit was hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+
+    /// Suggested CLI commands the operator can run to resume or inspect.
+    ///
+    /// e.g., `["wa auth bootstrap --account openai-team", "wa events --pane 42"]`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_commands: Vec<String>,
+
+    /// Timestamp when the plan was created (epoch ms).
+    pub created_at_ms: i64,
+}
+
+impl FallbackNextStepPlan {
+    /// Current schema version.
+    pub const CURRENT_VERSION: u32 = 1;
+}
+
+/// Build a [`FallbackNextStepPlan`] for the "needs human auth" scenario.
+///
+/// This is the most common fallback: device auth returned `BootstrapRequired`
+/// because password/MFA/SSO is needed.
+#[must_use]
+pub fn build_needs_human_auth_plan(
+    pane_id: u64,
+    account: &str,
+    detail: &str,
+    resume_session_id: Option<&str>,
+    retry_after_ms: Option<i64>,
+    now_ms: i64,
+) -> FallbackNextStepPlan {
+    let mut operator_steps = vec![format!(
+        "Run `wa auth bootstrap --account {account}` to complete interactive login"
+    )];
+
+    if let Some(session_id) = resume_session_id {
+        operator_steps.push(format!("After auth, resume with: cod resume {session_id}"));
+    }
+
+    if retry_after_ms.is_some() {
+        operator_steps.push(
+            "Alternatively, wait for the usage-limit reset and retry automatically".to_string(),
+        );
+    }
+
+    let mut suggested_commands = vec![format!("wa auth bootstrap --account {account}")];
+    suggested_commands.push(format!("wa events --pane {pane_id}"));
+
+    FallbackNextStepPlan {
+        version: FallbackNextStepPlan::CURRENT_VERSION,
+        reason: FallbackReason::NeedsHumanAuth {
+            account: account.to_string(),
+            detail: detail.to_string(),
+        },
+        pane_id,
+        operator_steps,
+        retry_after_ms,
+        resume_session_id: resume_session_id.map(ToString::to_string),
+        account_id: Some(account.to_string()),
+        suggested_commands,
+        created_at_ms: now_ms,
+    }
+}
+
+/// Build a [`FallbackNextStepPlan`] for the "failover disabled" scenario.
+#[must_use]
+pub fn build_failover_disabled_plan(
+    pane_id: u64,
+    resume_session_id: Option<&str>,
+    retry_after_ms: Option<i64>,
+    now_ms: i64,
+) -> FallbackNextStepPlan {
+    let mut operator_steps = vec![
+        "Account failover is disabled. Enable it in wa config or handle manually.".to_string(),
+    ];
+
+    if let Some(session_id) = resume_session_id {
+        operator_steps.push(format!("Resume manually with: cod resume {session_id}"));
+    }
+
+    if retry_after_ms.is_some() {
+        operator_steps
+            .push("Wait for the usage-limit reset time, then the session can retry.".to_string());
+    }
+
+    let mut suggested_commands = vec![format!("wa events --pane {pane_id}")];
+    suggested_commands.push("wa config show".to_string());
+
+    FallbackNextStepPlan {
+        version: FallbackNextStepPlan::CURRENT_VERSION,
+        reason: FallbackReason::FailoverDisabled,
+        pane_id,
+        operator_steps,
+        retry_after_ms,
+        resume_session_id: resume_session_id.map(ToString::to_string),
+        account_id: None,
+        suggested_commands,
+        created_at_ms: now_ms,
+    }
+}
+
+/// Build a [`FallbackNextStepPlan`] for the "tool missing" scenario.
+#[must_use]
+pub fn build_tool_missing_plan(pane_id: u64, tool: &str, now_ms: i64) -> FallbackNextStepPlan {
+    FallbackNextStepPlan {
+        version: FallbackNextStepPlan::CURRENT_VERSION,
+        reason: FallbackReason::ToolMissing {
+            tool: tool.to_string(),
+        },
+        pane_id,
+        operator_steps: vec![
+            format!("Install the required tool: {tool}"),
+            "Re-run the workflow after installation.".to_string(),
+        ],
+        retry_after_ms: None,
+        resume_session_id: None,
+        account_id: None,
+        suggested_commands: vec![format!("wa events --pane {pane_id}")],
+        created_at_ms: now_ms,
+    }
+}
+
+/// Build a [`FallbackNextStepPlan`] for the "all accounts exhausted" scenario.
+#[must_use]
+pub fn build_all_accounts_exhausted_plan(
+    pane_id: u64,
+    accounts_checked: u32,
+    resume_session_id: Option<&str>,
+    retry_after_ms: Option<i64>,
+    now_ms: i64,
+) -> FallbackNextStepPlan {
+    let mut operator_steps = vec![format!(
+        "All {accounts_checked} configured account(s) are at their usage limit."
+    )];
+
+    if retry_after_ms.is_some() {
+        operator_steps.push(
+            "Wait for usage-limit reset, then failover will retry automatically.".to_string(),
+        );
+    } else {
+        operator_steps.push(
+            "Check account limits with `wa accounts status` and add or rotate accounts."
+                .to_string(),
+        );
+    }
+
+    let mut suggested_commands = vec![
+        "wa accounts status".to_string(),
+        format!("wa events --pane {pane_id}"),
+    ];
+
+    if let Some(session_id) = resume_session_id {
+        suggested_commands.push(format!("cod resume {session_id}"));
+    }
+
+    FallbackNextStepPlan {
+        version: FallbackNextStepPlan::CURRENT_VERSION,
+        reason: FallbackReason::AllAccountsExhausted { accounts_checked },
+        pane_id,
+        operator_steps,
+        retry_after_ms,
+        resume_session_id: resume_session_id.map(ToString::to_string),
+        account_id: None,
+        suggested_commands,
+        created_at_ms: now_ms,
+    }
+}
+
+/// Convert a [`FallbackNextStepPlan`] to a [`StepResult`] for workflow integration.
+///
+/// The plan is serialized into the `Done` result so it persists in step logs.
+/// The workflow marks the originating event as **paused** (not failed), signalling
+/// that automation stopped intentionally and recovery is documented.
+#[must_use]
+pub fn fallback_plan_to_step_result(plan: &FallbackNextStepPlan) -> StepResult {
+    let mut result = serde_json::to_value(plan).unwrap_or_default();
+    // Tag the result so downstream consumers can distinguish fallback from success.
+    if let serde_json::Value::Object(ref mut map) = result {
+        map.insert("fallback".to_string(), serde_json::Value::Bool(true));
+    }
+    StepResult::Done { result }
+}
+
+/// The handled-status string used when an event enters the safe fallback path.
+///
+/// Events marked with this status are excluded from `--unhandled` queries
+/// (because `handled_at` is set) but carry distinct semantics from "completed".
+pub const FALLBACK_HANDLED_STATUS: &str = "paused";
+
+/// Check whether a [`StepResult::Done`] result represents a fallback plan
+/// (as opposed to a normal successful completion).
+#[must_use]
+pub fn is_fallback_result(result: &StepResult) -> bool {
+    match result {
+        StepResult::Done { result } => result
+            .as_object()
+            .and_then(|m| m.get("fallback"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -10250,8 +10561,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn parse_device_code_v2_format() {
-        let tail =
-            "Please open https://auth.openai.com/codex/device and enter this one-time code: WXYZ-98765";
+        let tail = "Please open https://auth.openai.com/codex/device and enter this one-time code: WXYZ-98765";
         let result = parse_device_code(tail).expect("should parse");
         assert_eq!(result.code, "WXYZ-98765");
         assert!(result.url.is_some());
@@ -10532,10 +10842,8 @@ Try again at 3:00 PM UTC.
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_session_end_{}_{n}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("wa_test_session_end_{}_{n}.db", std::process::id()));
         let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("temp DB");
@@ -10744,10 +11052,8 @@ Try again at 3:00 PM UTC.
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_auth_req_{}_{n}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("wa_test_auth_req_{}_{n}.db", std::process::id()));
         let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("temp DB");
@@ -10901,7 +11207,10 @@ Try again at 3:00 PM UTC.
             "session.summary",
             serde_json::json!({"total": "5000"}),
         );
-        assert!(wf.handles(&det), "HandleSessionEnd should match codex session.summary");
+        assert!(
+            wf.handles(&det),
+            "HandleSessionEnd should match codex session.summary"
+        );
     }
 
     #[test]
@@ -10913,7 +11222,10 @@ Try again at 3:00 PM UTC.
             "session.summary",
             serde_json::json!({"cost": "3.50"}),
         );
-        assert!(wf.handles(&det), "HandleSessionEnd should match claude_code session.summary");
+        assert!(
+            wf.handles(&det),
+            "HandleSessionEnd should match claude_code session.summary"
+        );
     }
 
     #[test]
@@ -10925,7 +11237,10 @@ Try again at 3:00 PM UTC.
             "session.summary",
             serde_json::json!({"session_id": "abc-123"}),
         );
-        assert!(wf.handles(&det), "HandleSessionEnd should match gemini session.summary");
+        assert!(
+            wf.handles(&det),
+            "HandleSessionEnd should match gemini session.summary"
+        );
     }
 
     #[test]
@@ -10937,7 +11252,10 @@ Try again at 3:00 PM UTC.
             "session.end",
             serde_json::Value::Null,
         );
-        assert!(wf.handles(&det), "HandleSessionEnd should match session.end event");
+        assert!(
+            wf.handles(&det),
+            "HandleSessionEnd should match session.end event"
+        );
     }
 
     #[test]
@@ -10949,7 +11267,10 @@ Try again at 3:00 PM UTC.
             "auth.device_code",
             serde_json::json!({"code": "ABCD-12345"}),
         );
-        assert!(wf.handles(&det), "HandleAuthRequired should match auth.device_code");
+        assert!(
+            wf.handles(&det),
+            "HandleAuthRequired should match auth.device_code"
+        );
     }
 
     #[test]
@@ -10961,7 +11282,10 @@ Try again at 3:00 PM UTC.
             "auth.error",
             serde_json::Value::Null,
         );
-        assert!(wf.handles(&det), "HandleAuthRequired should match auth.error");
+        assert!(
+            wf.handles(&det),
+            "HandleAuthRequired should match auth.error"
+        );
     }
 
     #[test]
@@ -10976,8 +11300,14 @@ Try again at 3:00 PM UTC.
             "session.summary",
             serde_json::json!({}),
         );
-        assert!(!auth_wf.handles(&session_det), "Auth workflow should NOT match session.summary");
-        assert!(session_wf.handles(&session_det), "Session workflow should match session.summary");
+        assert!(
+            !auth_wf.handles(&session_det),
+            "Auth workflow should NOT match session.summary"
+        );
+        assert!(
+            session_wf.handles(&session_det),
+            "Session workflow should match session.summary"
+        );
 
         // auth.device_code should NOT trigger session workflow
         let auth_det = make_session_detection(
@@ -10986,17 +11316,21 @@ Try again at 3:00 PM UTC.
             "auth.device_code",
             serde_json::json!({}),
         );
-        assert!(!session_wf.handles(&auth_det), "Session workflow should NOT match auth.device_code");
-        assert!(auth_wf.handles(&auth_det), "Auth workflow should match auth.device_code");
+        assert!(
+            !session_wf.handles(&auth_det),
+            "Session workflow should NOT match auth.device_code"
+        );
+        assert!(
+            auth_wf.handles(&auth_det),
+            "Auth workflow should match auth.device_code"
+        );
     }
 
     #[test]
     fn regression_runner_selects_session_end_workflow() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_reg_sel_{}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("wa_test_reg_sel_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
 
         rt.block_on(async {
@@ -11012,7 +11346,10 @@ Try again at 3:00 PM UTC.
                 serde_json::json!({"total": "1000"}),
             );
             let wf = runner.find_matching_workflow(&det);
-            assert!(wf.is_some(), "Should find matching workflow for session.summary");
+            assert!(
+                wf.is_some(),
+                "Should find matching workflow for session.summary"
+            );
             assert_eq!(wf.unwrap().name(), "handle_session_end");
 
             // Auth device code → auth required workflow
@@ -11023,7 +11360,10 @@ Try again at 3:00 PM UTC.
                 serde_json::json!({"code": "TEST-12345"}),
             );
             let wf = runner.find_matching_workflow(&det);
-            assert!(wf.is_some(), "Should find matching workflow for auth.device_code");
+            assert!(
+                wf.is_some(),
+                "Should find matching workflow for auth.device_code"
+            );
             assert_eq!(wf.unwrap().name(), "handle_auth_required");
 
             // Unrelated detection → no workflow
@@ -11070,13 +11410,19 @@ Try again at 3:00 PM UTC.
 
         // Start the workflow
         let start = runner.handle_detection(pane_id, &det, None).await;
-        assert!(start.is_started(), "Workflow should start for session.summary");
+        assert!(
+            start.is_started(),
+            "Workflow should start for session.summary"
+        );
         let execution_id = start.execution_id().unwrap().to_string();
 
         // Run the workflow
         let wf = runner.find_workflow_by_name("handle_session_end").unwrap();
         let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
-        assert!(result.is_completed(), "Session end workflow should complete: {result:?}");
+        assert!(
+            result.is_completed(),
+            "Session end workflow should complete: {result:?}"
+        );
 
         // Verify step logs recorded
         let logs = storage.get_step_logs(&execution_id).await.unwrap();
@@ -11119,17 +11465,29 @@ Try again at 3:00 PM UTC.
 
         // Start the workflow
         let start = runner.handle_detection(pane_id, &det, None).await;
-        assert!(start.is_started(), "Workflow should start for auth.device_code");
+        assert!(
+            start.is_started(),
+            "Workflow should start for auth.device_code"
+        );
         let execution_id = start.execution_id().unwrap().to_string();
 
         // Run the workflow
-        let wf = runner.find_workflow_by_name("handle_auth_required").unwrap();
+        let wf = runner
+            .find_workflow_by_name("handle_auth_required")
+            .unwrap();
         let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
-        assert!(result.is_completed(), "Auth required workflow should complete: {result:?}");
+        assert!(
+            result.is_completed(),
+            "Auth required workflow should complete: {result:?}"
+        );
 
         // Verify step logs
         let logs = storage.get_step_logs(&execution_id).await.unwrap();
-        assert_eq!(logs.len(), 3, "Should have 3 step logs (cooldown + classify + record)");
+        assert_eq!(
+            logs.len(),
+            3,
+            "Should have 3 step logs (cooldown + classify + record)"
+        );
         assert_eq!(logs[0].step_name, "check_cooldown");
         assert_eq!(logs[1].step_name, "classify_auth");
         assert_eq!(logs[2].step_name, "record_and_plan");
@@ -11179,7 +11537,9 @@ Try again at 3:00 PM UTC.
         let start1 = runner.handle_detection(pane_id, &det, None).await;
         assert!(start1.is_started());
         let exec_id1 = start1.execution_id().unwrap().to_string();
-        let wf = runner.find_workflow_by_name("handle_auth_required").unwrap();
+        let wf = runner
+            .find_workflow_by_name("handle_auth_required")
+            .unwrap();
         let result1 = runner.run_workflow(pane_id, wf.clone(), &exec_id1, 0).await;
         assert!(result1.is_completed(), "First auth run should complete");
 
@@ -11188,7 +11548,10 @@ Try again at 3:00 PM UTC.
         assert!(start2.is_started());
         let exec_id2 = start2.execution_id().unwrap().to_string();
         let result2 = runner.run_workflow(pane_id, wf, &exec_id2, 0).await;
-        assert!(result2.is_completed(), "Second auth run should complete (via cooldown skip)");
+        assert!(
+            result2.is_completed(),
+            "Second auth run should complete (via cooldown skip)"
+        );
 
         // Verify second run has fewer step logs (only 1 step: cooldown check → Done)
         let logs2 = storage.get_step_logs(&exec_id2).await.unwrap();
@@ -11242,7 +11605,11 @@ Try again at 3:00 PM UTC.
         );
 
         let logs = storage.get_step_logs(&exec_id).await.unwrap();
-        assert_eq!(logs.len(), 2, "Should have 2 step logs even with sparse data");
+        assert_eq!(
+            logs.len(),
+            2,
+            "Should have 2 step logs even with sparse data"
+        );
     }
 
     #[test]
@@ -11269,13 +11636,21 @@ Try again at 3:00 PM UTC.
         assert_eq!(record.input_tokens, Some(8000), "input_tokens drift");
         assert_eq!(record.output_tokens, Some(4345), "output_tokens drift");
         assert_eq!(record.cached_tokens, Some(2000), "cached_tokens drift");
-        assert_eq!(record.reasoning_tokens, Some(1500), "reasoning_tokens drift");
+        assert_eq!(
+            record.reasoning_tokens,
+            Some(1500),
+            "reasoning_tokens drift"
+        );
         assert_eq!(
             record.session_id.as_deref(),
             Some("abc-def-123-456"),
             "session_id drift"
         );
-        assert_eq!(record.end_reason.as_deref(), Some("completed"), "end_reason drift");
+        assert_eq!(
+            record.end_reason.as_deref(),
+            Some("completed"),
+            "end_reason drift"
+        );
     }
 
     #[test]
@@ -11291,8 +11666,15 @@ Try again at 3:00 PM UTC.
 
         assert_eq!(record.agent_type, "claude_code", "agent_type drift");
         assert_eq!(record.estimated_cost_usd, Some(7.25), "cost drift");
-        assert!(record.total_tokens.is_none(), "Claude Code should not have tokens");
-        assert_eq!(record.end_reason.as_deref(), Some("completed"), "end_reason drift");
+        assert!(
+            record.total_tokens.is_none(),
+            "Claude Code should not have tokens"
+        );
+        assert_eq!(
+            record.end_reason.as_deref(),
+            Some("completed"),
+            "end_reason drift"
+        );
     }
 
     #[test]
@@ -11313,9 +11695,19 @@ Try again at 3:00 PM UTC.
             Some("aaaa-bbbb-cccc-dddd"),
             "session_id drift"
         );
-        assert!(record.total_tokens.is_none(), "Gemini fixture should not have tokens");
-        assert!(record.estimated_cost_usd.is_none(), "Gemini fixture should not have cost");
-        assert_eq!(record.end_reason.as_deref(), Some("completed"), "end_reason drift");
+        assert!(
+            record.total_tokens.is_none(),
+            "Gemini fixture should not have tokens"
+        );
+        assert!(
+            record.estimated_cost_usd.is_none(),
+            "Gemini fixture should not have cost"
+        );
+        assert_eq!(
+            record.end_reason.as_deref(),
+            Some("completed"),
+            "end_reason drift"
+        );
     }
 
     #[test]
@@ -11379,8 +11771,14 @@ Try again at 3:00 PM UTC.
         });
         let record = HandleSessionEnd::record_from_detection(999, &trigger);
         // Fields should gracefully be None, not crash
-        assert!(record.total_tokens.is_none(), "Wrong field name should not parse as total");
-        assert!(record.input_tokens.is_none(), "Wrong field name should not parse as input");
+        assert!(
+            record.total_tokens.is_none(),
+            "Wrong field name should not parse as total"
+        );
+        assert!(
+            record.input_tokens.is_none(),
+            "Wrong field name should not parse as input"
+        );
         // Agent type still correctly extracted from top-level
         assert_eq!(record.agent_type, "codex");
     }
@@ -11408,7 +11806,10 @@ Try again at 3:00 PM UTC.
 
             let parsed: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
             match parsed {
-                DeviceAuthStepOutcome::Authenticated { elapsed_ms, account } => {
+                DeviceAuthStepOutcome::Authenticated {
+                    elapsed_ms,
+                    account,
+                } => {
                     assert_eq!(elapsed_ms, 5432);
                     assert_eq!(account, "work");
                 }
@@ -11430,7 +11831,11 @@ Try again at 3:00 PM UTC.
 
             let parsed: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
             match parsed {
-                DeviceAuthStepOutcome::BootstrapRequired { reason, account, artifacts_dir } => {
+                DeviceAuthStepOutcome::BootstrapRequired {
+                    reason,
+                    account,
+                    artifacts_dir,
+                } => {
                     assert_eq!(reason, "MFA required");
                     assert_eq!(account, "default");
                     assert!(artifacts_dir.is_some());
@@ -11479,15 +11884,15 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn step_rejects_invalid_device_code() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_device_auth_test_{}",
-                std::process::id()
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_device_auth_test_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let outcome = execute_device_auth_step("not-valid", "default", &tmp, None, true);
             match outcome {
-                DeviceAuthStepOutcome::Failed { error, error_kind, .. } => {
+                DeviceAuthStepOutcome::Failed {
+                    error, error_kind, ..
+                } => {
                     assert!(error.contains("Invalid device code"));
                     assert_eq!(error_kind.as_deref(), Some("invalid_code"));
                 }
@@ -11499,10 +11904,8 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn step_rejects_empty_device_code() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_device_auth_test_empty_{}",
-                std::process::id()
-            ));
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_device_auth_test_empty_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let outcome = execute_device_auth_step("", "default", &tmp, None, true);
@@ -11518,10 +11921,8 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn step_rejects_short_parts() {
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_device_auth_test_short_{}",
-                std::process::id()
-            ));
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_device_auth_test_short_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
             let outcome = execute_device_auth_step("AB-CD", "default", &tmp, None, true);
@@ -11540,21 +11941,22 @@ Try again at 3:00 PM UTC.
             // A valid code format will pass validation but fail at browser init
             // (Playwright not installed in test env). This verifies the step
             // progresses past validation to the browser phase.
-            let tmp = std::env::temp_dir().join(format!(
-                "wa_device_auth_test_valid_{}",
-                std::process::id()
-            ));
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_device_auth_test_valid_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&tmp);
 
-            let outcome =
-                execute_device_auth_step("ABCD-EFGH", "default", &tmp, None, true);
+            let outcome = execute_device_auth_step("ABCD-EFGH", "default", &tmp, None, true);
             match outcome {
-                DeviceAuthStepOutcome::Failed { error, error_kind, .. } => {
+                DeviceAuthStepOutcome::Failed {
+                    error, error_kind, ..
+                } => {
                     // Should fail at browser init, not code validation
                     assert_ne!(error_kind.as_deref(), Some("invalid_code"));
                     assert!(
-                        error.contains("Browser") || error.contains("browser")
-                            || error.contains("Playwright") || error.contains("playwright")
+                        error.contains("Browser")
+                            || error.contains("browser")
+                            || error.contains("Playwright")
+                            || error.contains("playwright")
                             || error_kind.as_deref() == Some("browser_not_ready"),
                         "Expected browser-related error, got: {error}"
                     );
@@ -11576,8 +11978,7 @@ Try again at 3:00 PM UTC.
             let _ = std::fs::create_dir_all(&tmp);
 
             // Alphanumeric codes (including digits) should pass validation
-            let outcome =
-                execute_device_auth_step("AB12-CD34", "default", &tmp, None, true);
+            let outcome = execute_device_auth_step("AB12-CD34", "default", &tmp, None, true);
             // Should NOT fail with invalid_code
             match &outcome {
                 DeviceAuthStepOutcome::Failed { error_kind, .. } => {
@@ -11685,7 +12086,10 @@ Try again at 3:00 PM UTC.
             let config = ResumeSessionConfig::default();
             let json = serde_json::to_string(&config).unwrap();
             let parsed: ResumeSessionConfig = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed.resume_command_template, config.resume_command_template);
+            assert_eq!(
+                parsed.resume_command_template,
+                config.resume_command_template
+            );
             assert_eq!(parsed.proceed_text, config.proceed_text);
             assert_eq!(parsed.post_resume_stable_ms, config.post_resume_stable_ms);
         }
@@ -11848,9 +12252,7 @@ Try again at 3:00 PM UTC.
                 assert_eq!(text, "proceed.\n");
                 assert!(wait_for.is_some());
                 match wait_for.unwrap() {
-                    WaitCondition::StableTail {
-                        stable_for_ms, ..
-                    } => {
+                    WaitCondition::StableTail { stable_for_ms, .. } => {
                         assert_eq!(stable_for_ms, 5_000);
                     }
                     other => panic!("Expected StableTail, got {other:?}"),
@@ -11870,10 +12272,7 @@ Try again at 3:00 PM UTC.
             assert!(step.is_done());
 
             if let StepResult::Done { result } = step {
-                assert_eq!(
-                    result.get("status").and_then(|v| v.as_str()),
-                    Some("ready")
-                );
+                assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("ready"));
             }
         }
 
@@ -11947,5 +12346,623 @@ Try again at 3:00 PM UTC.
                 assert_eq!(wait_timeout_ms, Some(15_000));
             }
         }
+    }
+
+    // ========================================================================
+    // Safe Fallback Path Tests (wa-nu4.1.3.8)
+    // ========================================================================
+    mod fallback_path_tests {
+        use super::*;
+
+        // -- FallbackReason --
+
+        #[test]
+        fn fallback_reason_needs_human_auth_display() {
+            let reason = FallbackReason::NeedsHumanAuth {
+                account: "openai-team".into(),
+                detail: "MFA required".into(),
+            };
+            let s = reason.to_string();
+            assert!(s.contains("openai-team"), "should contain account: {s}");
+            assert!(s.contains("MFA required"), "should contain detail: {s}");
+        }
+
+        #[test]
+        fn fallback_reason_failover_disabled_display() {
+            let reason = FallbackReason::FailoverDisabled;
+            assert!(reason.to_string().contains("disabled"));
+        }
+
+        #[test]
+        fn fallback_reason_tool_missing_display() {
+            let reason = FallbackReason::ToolMissing {
+                tool: "playwright".into(),
+            };
+            assert!(reason.to_string().contains("playwright"));
+        }
+
+        #[test]
+        fn fallback_reason_policy_denied_display() {
+            let reason = FallbackReason::PolicyDenied {
+                rule: "alt_screen_active".into(),
+            };
+            assert!(reason.to_string().contains("alt_screen_active"));
+        }
+
+        #[test]
+        fn fallback_reason_all_accounts_exhausted_display() {
+            let reason = FallbackReason::AllAccountsExhausted {
+                accounts_checked: 3,
+            };
+            let s = reason.to_string();
+            assert!(s.contains("3"), "should contain count: {s}");
+        }
+
+        #[test]
+        fn fallback_reason_other_display() {
+            let reason = FallbackReason::Other {
+                detail: "unexpected error".into(),
+            };
+            assert!(reason.to_string().contains("unexpected error"));
+        }
+
+        #[test]
+        fn fallback_reason_serde_round_trip() {
+            let reasons = vec![
+                FallbackReason::NeedsHumanAuth {
+                    account: "acct-1".into(),
+                    detail: "password required".into(),
+                },
+                FallbackReason::FailoverDisabled,
+                FallbackReason::ToolMissing {
+                    tool: "caut".into(),
+                },
+                FallbackReason::PolicyDenied {
+                    rule: "recent_gap".into(),
+                },
+                FallbackReason::AllAccountsExhausted {
+                    accounts_checked: 5,
+                },
+                FallbackReason::Other {
+                    detail: "test".into(),
+                },
+            ];
+
+            for reason in &reasons {
+                let json = serde_json::to_string(reason).unwrap();
+                let parsed: FallbackReason = serde_json::from_str(&json).unwrap();
+                // Verify the kind tag survived round-trip
+                let json2 = serde_json::to_string(&parsed).unwrap();
+                assert_eq!(json, json2, "Round-trip mismatch for {reason:?}");
+            }
+        }
+
+        // -- FallbackNextStepPlan --
+
+        #[test]
+        fn plan_version_is_current() {
+            assert_eq!(FallbackNextStepPlan::CURRENT_VERSION, 1);
+        }
+
+        #[test]
+        fn needs_human_auth_plan_structure() {
+            let plan = build_needs_human_auth_plan(
+                42,
+                "openai-team",
+                "MFA required",
+                Some("sess-abc123"),
+                Some(1_700_000_000_000),
+                1_699_999_000_000,
+            );
+
+            assert_eq!(plan.version, 1);
+            assert_eq!(plan.pane_id, 42);
+            assert!(matches!(plan.reason, FallbackReason::NeedsHumanAuth { .. }));
+            assert_eq!(plan.resume_session_id.as_deref(), Some("sess-abc123"));
+            assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
+            assert_eq!(plan.retry_after_ms, Some(1_700_000_000_000));
+            assert!(!plan.operator_steps.is_empty());
+            assert!(!plan.suggested_commands.is_empty());
+            assert_eq!(plan.created_at_ms, 1_699_999_000_000);
+
+            // Operator steps should mention bootstrap and resume
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                steps_text.contains("bootstrap"),
+                "steps should mention bootstrap: {steps_text}"
+            );
+            assert!(
+                steps_text.contains("sess-abc123"),
+                "steps should mention session ID: {steps_text}"
+            );
+        }
+
+        #[test]
+        fn needs_human_auth_plan_without_session_id() {
+            let plan =
+                build_needs_human_auth_plan(10, "acct", "SSO needed", None, None, 1_000_000);
+
+            assert!(plan.resume_session_id.is_none());
+            assert!(plan.retry_after_ms.is_none());
+            // Should not mention resume in steps
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                !steps_text.contains("resume"),
+                "should not mention resume without session ID: {steps_text}"
+            );
+        }
+
+        #[test]
+        fn failover_disabled_plan_structure() {
+            let plan = build_failover_disabled_plan(
+                99,
+                Some("sess-xyz"),
+                Some(1_700_000_000_000),
+                1_699_999_000_000,
+            );
+
+            assert!(matches!(plan.reason, FallbackReason::FailoverDisabled));
+            assert_eq!(plan.pane_id, 99);
+            assert_eq!(plan.resume_session_id.as_deref(), Some("sess-xyz"));
+
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                steps_text.contains("disabled"),
+                "should mention disabled: {steps_text}"
+            );
+        }
+
+        #[test]
+        fn tool_missing_plan_structure() {
+            let plan = build_tool_missing_plan(7, "playwright", 1_000_000);
+
+            assert!(matches!(plan.reason, FallbackReason::ToolMissing { .. }));
+            assert_eq!(plan.pane_id, 7);
+            assert!(plan.resume_session_id.is_none());
+            assert!(plan.retry_after_ms.is_none());
+
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                steps_text.contains("playwright"),
+                "should mention missing tool: {steps_text}"
+            );
+        }
+
+        #[test]
+        fn all_accounts_exhausted_plan_with_retry() {
+            let plan = build_all_accounts_exhausted_plan(
+                55,
+                4,
+                Some("sess-111"),
+                Some(1_700_000_000_000),
+                1_699_999_000_000,
+            );
+
+            assert!(matches!(
+                plan.reason,
+                FallbackReason::AllAccountsExhausted {
+                    accounts_checked: 4
+                }
+            ));
+            assert_eq!(plan.pane_id, 55);
+
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                steps_text.contains("4"),
+                "should mention account count: {steps_text}"
+            );
+            assert!(
+                steps_text.contains("reset"),
+                "should mention reset when retry_after is set: {steps_text}"
+            );
+        }
+
+        #[test]
+        fn all_accounts_exhausted_plan_without_retry() {
+            let plan = build_all_accounts_exhausted_plan(55, 2, None, None, 1_000_000);
+
+            let steps_text = plan.operator_steps.join(" ");
+            assert!(
+                steps_text.contains("wa accounts status"),
+                "should suggest checking accounts: {steps_text}"
+            );
+        }
+
+        // -- Step result conversion --
+
+        #[test]
+        fn fallback_plan_to_step_result_is_done() {
+            let plan = build_needs_human_auth_plan(
+                1,
+                "acct",
+                "MFA",
+                None,
+                None,
+                1_000_000,
+            );
+            let result = fallback_plan_to_step_result(&plan);
+            assert!(result.is_done(), "fallback should produce Done, not Abort");
+            assert!(result.is_terminal());
+        }
+
+        #[test]
+        fn fallback_plan_to_step_result_has_fallback_flag() {
+            let plan = build_failover_disabled_plan(1, None, None, 1_000_000);
+            let result = fallback_plan_to_step_result(&plan);
+            assert!(
+                is_fallback_result(&result),
+                "should be tagged as fallback"
+            );
+        }
+
+        #[test]
+        fn is_fallback_result_false_for_normal_done() {
+            let result = StepResult::done(serde_json::json!({"status": "ok"}));
+            assert!(
+                !is_fallback_result(&result),
+                "normal Done should not be fallback"
+            );
+        }
+
+        #[test]
+        fn is_fallback_result_false_for_abort() {
+            let result = StepResult::abort("test");
+            assert!(
+                !is_fallback_result(&result),
+                "Abort should not be fallback"
+            );
+        }
+
+        #[test]
+        fn fallback_handled_status_is_paused() {
+            assert_eq!(FALLBACK_HANDLED_STATUS, "paused");
+        }
+
+        // -- Serde round-trip for full plan --
+
+        #[test]
+        fn plan_serde_round_trip() {
+            let plan = build_needs_human_auth_plan(
+                42,
+                "openai-team",
+                "MFA required",
+                Some("sess-abc123"),
+                Some(1_700_000_000_000),
+                1_699_999_000_000,
+            );
+
+            let json = serde_json::to_string(&plan).unwrap();
+            let parsed: FallbackNextStepPlan = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(parsed.version, plan.version);
+            assert_eq!(parsed.pane_id, plan.pane_id);
+            assert_eq!(parsed.resume_session_id, plan.resume_session_id);
+            assert_eq!(parsed.account_id, plan.account_id);
+            assert_eq!(parsed.retry_after_ms, plan.retry_after_ms);
+            assert_eq!(parsed.operator_steps.len(), plan.operator_steps.len());
+            assert_eq!(
+                parsed.suggested_commands.len(),
+                plan.suggested_commands.len()
+            );
+            assert_eq!(parsed.created_at_ms, plan.created_at_ms);
+        }
+
+        #[test]
+        fn plan_skips_none_fields_in_json() {
+            let plan = build_tool_missing_plan(1, "caut", 1_000_000);
+            let json = serde_json::to_string(&plan).unwrap();
+
+            // Optional None fields should be absent
+            assert!(
+                !json.contains("retry_after_ms"),
+                "None fields should be skipped: {json}"
+            );
+            assert!(
+                !json.contains("resume_session_id"),
+                "None fields should be skipped: {json}"
+            );
+            assert!(
+                !json.contains("account_id"),
+                "None fields should be skipped: {json}"
+            );
+        }
+
+        #[test]
+        fn fallback_step_result_preserves_plan_fields() {
+            let plan = build_needs_human_auth_plan(
+                42,
+                "acct",
+                "MFA",
+                Some("sess-1"),
+                None,
+                1_000_000,
+            );
+            let result = fallback_plan_to_step_result(&plan);
+
+            if let StepResult::Done { result } = result {
+                // The plan fields plus the "fallback" flag should all be present
+                let map = result.as_object().unwrap();
+                assert!(map.contains_key("version"));
+                assert!(map.contains_key("reason"));
+                assert!(map.contains_key("pane_id"));
+                assert!(map.contains_key("operator_steps"));
+                assert!(map.contains_key("fallback"));
+                assert_eq!(map["fallback"], true);
+                assert_eq!(map["pane_id"], 42);
+            } else {
+                panic!("Expected Done variant");
+            }
+        }
+    }
+
+    // ========================================================================
+    // Usage-limit Workflow Tests (wa-nu4.1.3.9)
+    // ========================================================================
+
+    #[test]
+    fn usage_limit_workflow_has_correct_name_and_steps() {
+        let wf = HandleUsageLimits::new();
+        assert_eq!(wf.name(), "handle_usage_limits");
+        assert_eq!(
+            wf.description(),
+            "Exit agent, persist session summary, and select new account for failover"
+        );
+
+        let steps = wf.steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "exit_and_persist");
+        assert_eq!(steps[2].name, "select_account");
+    }
+
+    #[test]
+    fn usage_limit_workflow_handles_codex_usage_events() {
+        let wf = HandleUsageLimits::new();
+
+        let detection = Detection {
+            rule_id: "codex.usage_limit".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "You've hit your usage limit".to_string(),
+            span: (0, 0),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn usage_limit_workflow_ignores_non_codex_agents() {
+        let wf = HandleUsageLimits::new();
+
+        let detection = Detection {
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "rate limit".to_string(),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn usage_limit_workflow_ignores_non_usage_events() {
+        let wf = HandleUsageLimits::new();
+
+        let detection = Detection {
+            rule_id: "codex.session.end".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.summary".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "Session ended normally".to_string(),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    // -- Fixture: Real-world usage limit transcript --
+
+    const FIXTURE_FULL_USAGE_LIMIT: &str = r"
+$ cod start
+Starting Codex session...
+Working directory: /data/projects/my-app
+
+You've hit your usage limit. Try again at 3:00 PM UTC.
+
+Token usage: total=1,234,567 input=500,000 (+ 200,000 cached) output=534,567 (reasoning 100,000)
+To continue this session, run: codex resume 123e4567-e89b-12d3-a456-426614174000
+$";
+
+    const FIXTURE_MINIMAL_USAGE_LIMIT: &str =
+        "Token usage: total=42\ncodex resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    const FIXTURE_NO_RESET_TIME: &str = r"
+You've hit your usage limit.
+Token usage: total=100 input=50 output=50
+codex resume 11111111-2222-3333-4444-555555555555";
+
+    const FIXTURE_MISSING_SESSION_ID: &str = r"
+Token usage: total=100 input=50
+You've hit your usage limit. Try again at 5:00 PM.";
+
+    const FIXTURE_MISSING_TOKEN_USAGE: &str =
+        "codex resume 11111111-2222-3333-4444-555555555555\nSome other output";
+
+    const FIXTURE_EMPTY: &str = "";
+
+    const FIXTURE_GARBAGE: &str = "random noise\n123\nno markers here";
+
+    #[test]
+    fn fixture_full_usage_limit_parses_all_fields() {
+        let result =
+            parse_codex_session_summary(FIXTURE_FULL_USAGE_LIMIT).expect("should parse");
+        assert_eq!(result.session_id, "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(result.token_usage.total, Some(1_234_567));
+        assert_eq!(result.token_usage.input, Some(500_000));
+        assert_eq!(result.token_usage.cached, Some(200_000));
+        assert_eq!(result.token_usage.output, Some(534_567));
+        assert_eq!(result.token_usage.reasoning, Some(100_000));
+        assert_eq!(result.reset_time.as_deref(), Some("3:00 PM UTC"));
+    }
+
+    #[test]
+    fn fixture_minimal_parses_required_fields() {
+        let result =
+            parse_codex_session_summary(FIXTURE_MINIMAL_USAGE_LIMIT).expect("should parse");
+        assert_eq!(result.session_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(result.token_usage.total, Some(42));
+        assert!(result.token_usage.input.is_none());
+        assert!(result.reset_time.is_none());
+    }
+
+    #[test]
+    fn fixture_no_reset_time_parses_without_reset() {
+        let result =
+            parse_codex_session_summary(FIXTURE_NO_RESET_TIME).expect("should parse");
+        assert_eq!(result.session_id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(result.token_usage.total, Some(100));
+        assert!(result.reset_time.is_none());
+    }
+
+    #[test]
+    fn fixture_missing_session_id_fails_gracefully() {
+        let err = parse_codex_session_summary(FIXTURE_MISSING_SESSION_ID)
+            .expect_err("should fail");
+        assert!(err.missing.contains(&"session_id"));
+        assert!(!err.missing.contains(&"token_usage"));
+        assert!(err.tail_len > 0);
+        assert!(err.tail_hash != 0);
+    }
+
+    #[test]
+    fn fixture_missing_token_usage_fails_gracefully() {
+        let err = parse_codex_session_summary(FIXTURE_MISSING_TOKEN_USAGE)
+            .expect_err("should fail");
+        assert!(err.missing.contains(&"token_usage"));
+        assert!(!err.missing.contains(&"session_id"));
+    }
+
+    #[test]
+    fn fixture_empty_fails_with_both_missing() {
+        let err =
+            parse_codex_session_summary(FIXTURE_EMPTY).expect_err("should fail");
+        assert!(err.missing.contains(&"session_id"));
+        assert!(err.missing.contains(&"token_usage"));
+    }
+
+    #[test]
+    fn fixture_garbage_fails_with_both_missing() {
+        let err =
+            parse_codex_session_summary(FIXTURE_GARBAGE).expect_err("should fail");
+        assert!(err.missing.contains(&"session_id"));
+        assert!(err.missing.contains(&"token_usage"));
+    }
+
+    #[test]
+    fn token_usage_extraction_handles_partial_line() {
+        let line = "Token usage: total=500 output=300";
+        let usage = extract_token_usage(line);
+        assert_eq!(usage.total, Some(500));
+        assert_eq!(usage.output, Some(300));
+        assert!(usage.input.is_none());
+        assert!(usage.cached.is_none());
+        assert!(usage.reasoning.is_none());
+    }
+
+    #[test]
+    fn token_usage_extraction_handles_empty_line() {
+        let usage = extract_token_usage("");
+        assert!(usage.total.is_none());
+        assert!(!usage.has_any());
+    }
+
+    #[test]
+    fn session_record_from_summary_maps_all_fields() {
+        let summary = CodexSessionSummary {
+            session_id: "test-session-1234".to_string(),
+            token_usage: CodexTokenUsage {
+                total: Some(1000),
+                input: Some(400),
+                output: Some(500),
+                cached: Some(100),
+                reasoning: Some(50),
+            },
+            reset_time: Some("5:00 PM".to_string()),
+        };
+
+        let record = codex_session_record_from_summary(42, &summary);
+        assert_eq!(record.pane_id, 42);
+        assert_eq!(record.agent_type, "codex");
+        assert_eq!(record.session_id.as_deref(), Some("test-session-1234"));
+        assert_eq!(record.total_tokens, Some(1000));
+        assert_eq!(record.input_tokens, Some(400));
+        assert_eq!(record.output_tokens, Some(500));
+        assert_eq!(record.cached_tokens, Some(100));
+        assert_eq!(record.reasoning_tokens, Some(50));
+    }
+
+    #[test]
+    fn usage_limit_default_impl() {
+        let wf = HandleUsageLimits::default();
+        assert_eq!(wf.name(), "handle_usage_limits");
+    }
+
+    #[test]
+    fn parse_error_display_is_actionable() {
+        let err = CodexSessionParseError {
+            missing: vec!["session_id", "token_usage"],
+            tail_hash: 0xdeadbeef,
+            tail_len: 42,
+        };
+        let display = err.to_string();
+        assert!(display.contains("session_id"));
+        assert!(display.contains("token_usage"));
+        assert!(display.contains("tail_hash="));
+        assert!(display.contains("tail_len=42"));
+    }
+
+    #[test]
+    fn find_session_id_prefers_last_occurrence() {
+        let tail = "codex resume aaaa1234\nsome text\ncodex resume bbbb5678";
+        let id = find_session_id(tail).unwrap();
+        assert_eq!(id, "bbbb5678");
+    }
+
+    #[test]
+    fn find_session_id_returns_none_on_no_match() {
+        assert!(find_session_id("no resume hint here").is_none());
+    }
+
+    #[test]
+    fn find_reset_time_extracts_from_try_again_at() {
+        let tail = "Try again at 10:30 AM EST.";
+        let time = find_reset_time(tail).unwrap();
+        assert_eq!(time, "10:30 AM EST");
+    }
+
+    #[test]
+    fn find_reset_time_returns_none_when_absent() {
+        assert!(find_reset_time("no reset time here").is_none());
+    }
+
+    #[test]
+    fn find_token_usage_line_finds_last_occurrence() {
+        let tail = "Token usage: first\nsome middle\nToken usage: second";
+        let line = find_token_usage_line(tail).unwrap();
+        assert!(line.contains("second"));
+    }
+
+    #[test]
+    fn parse_number_handles_commas_and_edge_cases() {
+        assert_eq!(parse_number("1,234,567"), Some(1_234_567));
+        assert_eq!(parse_number("42"), Some(42));
+        assert_eq!(parse_number(""), None);
+        assert_eq!(parse_number("abc"), None);
     }
 }
