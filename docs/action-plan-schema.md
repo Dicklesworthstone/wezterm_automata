@@ -65,6 +65,100 @@ Each StepPlan has its own canonical string that includes the action, preconditio
 
 Approvals should bind to the plan hash (or the derived `plan_id`) so the approved plan cannot be swapped without invalidating the approval.
 
+## Prepare/Commit UX + Plan-Hash Binding (Design)
+
+This section specifies the **prepare/commit** flow for plan-hash-bound approvals. The goal is to prevent TOCTOU and confused-deputy mistakes while keeping the UX understandable for humans and structured for robots/MCP.
+
+### Human CLI Flow
+
+**Prepare**
+
+```
+wa prepare send --pane-id 3 "text"
+wa prepare workflow run handle_compaction --pane-id 3
+```
+
+Output requirements:
+- Show a **plan preview** (steps, preconditions, verification).
+- Print `plan_id` and `plan_hash`.
+- Print approval command: `wa approve <code>` (if approval required).
+- Print commit command: `wa commit <plan_id>`.
+- If approval not required, still require commit (to ensure the plan preview is the exact plan executed).
+
+**Commit**
+
+```
+wa commit <plan_id>
+```
+
+Commit checks:
+- Plan exists and is not expired.
+- Approval exists and is **bound** to this plan hash (if required).
+- Workspace matches.
+- Target pane identity (pane_uuid) matches the plan (if applicable).
+- TTL not expired.
+
+### Robot Mode Flow
+
+**Prepare**
+
+```
+wa robot prepare send --pane-id 3 "text"
+```
+
+Returns structured JSON:
+- `plan_id`, `plan_hash`
+- `plan` (full plan JSON)
+- `requires_approval`
+- `approval` (if required): `code`, `expires_at`, `command`
+- `commit_command` (canonical)
+
+**Commit**
+
+```
+wa robot commit <plan_id>
+```
+
+Returns:
+- `status` (success/failed/denied)
+- `execution_id` (if executed)
+- `error_code` + `remediation` (if refused)
+
+### MCP Flow
+
+MCP mirrors Robot Mode:
+- `wa.prepare` → same fields as `wa robot prepare`
+- `wa.commit` → same fields as `wa robot commit`
+
+### Binding Semantics (Required)
+
+Approvals MUST bind to:
+- `workspace_id`
+- `plan_hash` (or derived `plan_id`)
+- `action_kind(s)` present in the plan
+- `pane_uuid` for any pane-scoped steps
+- `ttl` (expires_at)
+
+Commit MUST refuse execution if **any** binding check fails:
+- Plan hash mismatch
+- Approval expired or already consumed
+- Workspace mismatch
+- Pane identity mismatch (pane UUID changed)
+- Plan no longer valid (preconditions fail)
+
+### Error Codes + Remediation (Proposed)
+
+| Error Code | Meaning | Remediation |
+| --- | --- | --- |
+| `E_PLAN_NOT_FOUND` | Plan ID missing | Re-run `wa prepare ...` |
+| `E_PLAN_EXPIRED` | Plan TTL expired | Re-run prepare + approve |
+| `E_PLAN_HASH_MISMATCH` | Approval bound to different plan hash | Re-run prepare + approve |
+| `E_PLAN_APPROVAL_MISSING` | Approval required but missing | Run `wa approve <code>` |
+| `E_PLAN_PANE_MISMATCH` | Pane identity changed | Re-run prepare for current pane |
+| `E_PLAN_PRECONDITION_FAILED` | Plan preconditions no longer true | Re-run prepare |
+
+This design ensures **explicit user intent**: the plan preview is exactly what gets executed, and approvals cannot be replayed against different actions.
+
 ## Extension Guidance (Adding New Step Kinds Safely)
 
 When introducing a new StepAction, Precondition, or Verification strategy:
