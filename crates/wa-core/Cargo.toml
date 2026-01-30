@@ -27,6 +27,7 @@ aho-corasick.workspace = true
 memchr.workspace = true
 fancy-regex.workspace = true
 regex.workspace = true
+bloomfilter.workspace = true
 
 # Approval tokens and plan hashing
 rand.workspace = true

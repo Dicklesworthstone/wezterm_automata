@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
+use bloomfilter::Bloom;
 use fancy_regex::Regex;
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
@@ -546,13 +547,36 @@ struct CompiledRule {
     regex: Option<Regex>,
 }
 
-#[derive(Debug)]
+/// Target false positive rate for the Bloom filter (1%).
+/// This keeps the filter small (~10KB for 1000 patterns) while providing
+/// effective rejection of non-matching text.
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
 struct EngineIndex {
     compiled_rules: Vec<CompiledRule>,
     anchor_list: Vec<String>,
     anchor_to_rules: HashMap<String, Vec<usize>>,
     anchor_matcher: Option<AhoCorasick>,
     quick_bytes: Vec<u8>,
+    /// Bloom filter for quick rejection of non-matching text.
+    /// Contains all anchor strings for O(1) "definitely not present" checks.
+    bloom: Option<Bloom<str>>,
+    /// Unique anchor lengths (sorted, ascending) for efficient substring checking.
+    anchor_lengths: Vec<usize>,
+}
+
+impl std::fmt::Debug for EngineIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineIndex")
+            .field("compiled_rules", &self.compiled_rules.len())
+            .field("anchor_list", &self.anchor_list.len())
+            .field("anchor_to_rules", &self.anchor_to_rules.len())
+            .field("anchor_matcher", &self.anchor_matcher.is_some())
+            .field("quick_bytes", &self.quick_bytes.len())
+            .field("bloom", &self.bloom.is_some())
+            .field("anchor_lengths", &self.anchor_lengths)
+            .finish()
+    }
 }
 
 fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
@@ -601,12 +625,39 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     let mut quick_bytes: Vec<u8> = quick_byte_set.into_iter().collect();
     quick_bytes.sort_unstable();
 
+    // Build Bloom filter from anchor strings for fast pre-filtering.
+    // Uses 1% false positive rate which keeps the filter small (~10KB)
+    // while providing effective rejection of non-matching text.
+    let bloom = if anchor_list.is_empty() {
+        None
+    } else {
+        // Size the filter for the actual number of anchors, minimum 100 to avoid edge cases
+        let num_items = anchor_list.len().max(100);
+        let mut bloom = Bloom::new_for_fp_rate(num_items, BLOOM_FALSE_POSITIVE_RATE);
+        for anchor in &anchor_list {
+            bloom.set(anchor.as_str());
+        }
+        Some(bloom)
+    };
+
+    // Collect unique anchor lengths for efficient sliding window checks.
+    // Sorted ascending to allow early exit on short texts.
+    let mut anchor_lengths: Vec<usize> = anchor_list
+        .iter()
+        .map(String::len)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    anchor_lengths.sort_unstable();
+
     Ok(EngineIndex {
         compiled_rules,
         anchor_list,
         anchor_to_rules,
         anchor_matcher,
         quick_bytes,
+        bloom,
+        anchor_lengths,
     })
 }
 
@@ -1550,10 +1601,50 @@ impl PatternEngine {
         }
 
         let bytes = text.as_bytes();
-        index
-            .quick_bytes
-            .iter()
-            .any(|byte| memchr(*byte, bytes).is_some())
+        let text_len = text.len();
+
+        // Collect positions where anchor first-bytes appear.
+        // This is O(n) but very fast with memchr's SIMD implementation.
+        let mut byte_match_positions: Vec<usize> = Vec::new();
+        for &byte in &index.quick_bytes {
+            let mut pos = 0;
+            while let Some(offset) = memchr(byte, &bytes[pos..]) {
+                byte_match_positions.push(pos + offset);
+                pos += offset + 1;
+            }
+        }
+
+        if byte_match_positions.is_empty() {
+            return false;
+        }
+
+        // If we have a Bloom filter, check substrings only at positions where
+        // a first-byte matched. This is O(m*k) where m = match count, k = anchor lengths.
+        if let Some(ref bloom) = index.bloom {
+            for &start in &byte_match_positions {
+                for &anchor_len in &index.anchor_lengths {
+                    let end = start + anchor_len;
+                    // Skip if this substring extends past the text
+                    if end > text_len {
+                        continue;
+                    }
+                    // Ensure we're at valid UTF-8 boundaries
+                    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                        continue;
+                    }
+                    let window = &text[start..end];
+                    if bloom.check(window) {
+                        // Bloom says "possibly present" - need full matching
+                        return true;
+                    }
+                }
+            }
+            // Bloom filter rejected all candidate substrings - definitely no match
+            return false;
+        }
+
+        // No Bloom filter available, but we found matching bytes
+        true
     }
 
     /// Access the merged rule library
@@ -1628,8 +1719,75 @@ mod tests {
     #[test]
     fn quick_reject_respects_anchor_bytes() {
         let engine = engine_with_rules(vec![rule_with_anchor("codex.quick", "XYZ", None)]);
+        // Text without matching first byte is rejected
         assert!(!engine.quick_reject("abc"));
-        assert!(engine.quick_reject("look: X-ray"));
+        // Text with matching first byte but no anchor match is now correctly rejected
+        // thanks to the Bloom filter (previously this would return true)
+        assert!(!engine.quick_reject("look: X-ray"));
+        // Text containing the actual anchor passes
+        assert!(engine.quick_reject("check XYZ value"));
+    }
+
+    #[test]
+    fn bloom_filter_rejects_non_matching_text() {
+        // Test that the Bloom filter correctly rejects text that has
+        // matching first bytes but no matching anchors
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_a", "alpha", None),
+            rule_with_anchor("codex.bloom_b", "beta", None),
+            rule_with_anchor("codex.bloom_g", "gamma", None),
+        ]);
+
+        // These have matching first bytes but don't contain the anchors
+        assert!(!engine.quick_reject("arbitrary text"));
+        assert!(!engine.quick_reject("ax")); // 'a' matches but "ax" is shorter than "alpha"
+        assert!(!engine.quick_reject("bx")); // 'b' matches but "bx" is shorter than "beta"
+        assert!(!engine.quick_reject("gx")); // 'g' matches but "gx" is shorter than "gamma"
+        assert!(!engine.quick_reject("alphx")); // close to "alpha" but different
+        assert!(!engine.quick_reject("betx")); // close to "beta" but different
+    }
+
+    #[test]
+    fn bloom_filter_accepts_matching_text() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_hello", "hello", None),
+            rule_with_anchor("codex.bloom_world", "world", None),
+        ]);
+
+        // These contain the actual anchors
+        assert!(engine.quick_reject("say hello to everyone"));
+        assert!(engine.quick_reject("hello world"));
+        assert!(engine.quick_reject("the world is vast"));
+
+        // This has no matching anchors at all
+        assert!(!engine.quick_reject("greetings and salutations"));
+    }
+
+    #[test]
+    fn bloom_filter_handles_multiple_anchor_lengths() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.bloom_short", "ab", None),
+            rule_with_anchor("codex.bloom_medium", "foobar", None),
+            rule_with_anchor("codex.bloom_long", "this_is_a_long_anchor", None),
+        ]);
+
+        // Short anchor match
+        assert!(engine.quick_reject("ab"));
+        assert!(engine.quick_reject("xab"));
+        assert!(engine.quick_reject("abx"));
+
+        // Medium anchor match
+        assert!(engine.quick_reject("foobar"));
+        assert!(engine.quick_reject("xfoobar"));
+        assert!(engine.quick_reject("foobarx"));
+
+        // Long anchor match
+        assert!(engine.quick_reject("this_is_a_long_anchor"));
+
+        // No match (has matching first bytes 'a', 'f', 't' but not the full anchors)
+        assert!(!engine.quick_reject("aX")); // starts with 'a' but "aX" != "ab"
+        assert!(!engine.quick_reject("fooXXX")); // starts with 'f' but "fooXXX" != "foobar"
+        assert!(!engine.quick_reject("this_is_not")); // starts with 't' but doesn't match long anchor
     }
 
     #[test]

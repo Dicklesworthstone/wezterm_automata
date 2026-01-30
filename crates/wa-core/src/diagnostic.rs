@@ -237,6 +237,94 @@ fn redact_events(
 }
 
 // =============================================================================
+// Rule match traces for incident bundles
+// =============================================================================
+
+/// Evidence item for a rule match trace.
+#[derive(Debug, Serialize)]
+struct TraceEvidence {
+    /// Evidence kind (e.g., "anchor_match", "regex_capture", "extracted_field").
+    kind: String,
+    /// Label for the evidence (anchor text, capture name, field name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// Redacted value excerpt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+/// Rule match trace for diagnosing detection behavior.
+#[derive(Debug, Serialize)]
+struct EventRuleTrace {
+    /// Event ID this trace belongs to.
+    event_id: i64,
+    /// Rule ID that matched.
+    rule_id: String,
+    /// Agent type the rule is for.
+    agent_type: String,
+    /// Detection confidence score.
+    confidence: f64,
+    /// Severity of the detection.
+    severity: String,
+    /// Redacted matched text (the input that triggered the rule).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_text: Option<String>,
+    /// Extracted fields from regex captures or structured data.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extracted_fields: Vec<TraceEvidence>,
+    /// Whether the event was handled.
+    handled: bool,
+    /// Timestamp when detected (epoch ms).
+    detected_at: i64,
+}
+
+/// Generate rule traces from stored events.
+///
+/// Creates trace files for events with pattern/detection data that may help
+/// diagnose rule behavior issues.
+fn generate_rule_traces(
+    events: &[crate::storage::StoredEvent],
+    redactor: &Redactor,
+) -> Vec<EventRuleTrace> {
+    events
+        .iter()
+        .filter(|e| {
+            // Include events with rule IDs (detection-related)
+            !e.rule_id.is_empty()
+        })
+        .map(|e| {
+            // Extract fields from the extracted JSON if present
+            let extracted_fields = e
+                .extracted
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .map(|(key, value)| TraceEvidence {
+                            kind: "extracted_field".to_string(),
+                            label: Some(key.clone()),
+                            value: Some(redactor.redact(&value.to_string())),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            EventRuleTrace {
+                event_id: e.id,
+                rule_id: e.rule_id.clone(),
+                agent_type: e.agent_type.clone(),
+                confidence: e.confidence,
+                severity: e.severity.clone(),
+                matched_text: e.matched_text.as_ref().map(|t| redactor.redact(t)),
+                extracted_fields,
+                handled: e.handled_at.is_some(),
+                detected_at: e.detected_at,
+            }
+        })
+        .collect()
+}
+
+// =============================================================================
 // Workflow summary (redacted)
 // =============================================================================
 
@@ -401,13 +489,26 @@ pub async fn generate_bundle(
         }
     }
 
-    // 4. Recent events (redacted)
+    // 4. Recent events (redacted) and rule traces
     let event_query = EventQuery {
         limit: Some(opts.event_limit),
         ..Default::default()
     };
     match storage.get_events(event_query).await {
         Ok(events) => {
+            // Generate rule traces for detection-related events
+            let traces = generate_rule_traces(&events, &redactor);
+            if !traces.is_empty() {
+                let traces_dir = output_dir.join("traces");
+                fs::create_dir_all(&traces_dir).map_err(|e| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Failed to create traces directory: {e}"
+                    )))
+                })?;
+                write_json_file(&traces_dir, "rule_traces.json", &traces)?;
+                file_count += 1;
+            }
+
             let redacted = redact_events(events, &redactor);
             write_json_file(&output_dir, "recent_events.json", &redacted)?;
             file_count += 1;
@@ -526,20 +627,29 @@ pub async fn generate_bundle(
     }
 
     // 9. Write bundle manifest
+    // Build dynamic file list based on what was actually written
+    let mut files = vec![
+        "environment.json".to_string(),
+        "config_summary.json".to_string(),
+        "db_health.json".to_string(),
+        "recent_events.json".to_string(),
+        "recent_workflows.json".to_string(),
+        "active_reservations.json".to_string(),
+        "reservation_history.json".to_string(),
+        "recent_audit.json".to_string(),
+    ];
+
+    // Add traces directory if it exists and has content
+    let traces_dir = output_dir.join("traces");
+    if traces_dir.exists() && traces_dir.join("rule_traces.json").exists() {
+        files.push("traces/rule_traces.json".to_string());
+    }
+
     let manifest = BundleManifest {
         wa_version: crate::VERSION.to_string(),
         generated_at_ms: now_ms,
         file_count,
-        files: vec![
-            "environment.json".to_string(),
-            "config_summary.json".to_string(),
-            "db_health.json".to_string(),
-            "recent_events.json".to_string(),
-            "recent_workflows.json".to_string(),
-            "active_reservations.json".to_string(),
-            "reservation_history.json".to_string(),
-            "recent_audit.json".to_string(),
-        ],
+        files,
         redacted: true,
     };
     write_json_file(&output_dir, "manifest.json", &manifest)?;
@@ -723,6 +833,114 @@ mod tests {
         let reason = redacted.decision_reason.unwrap();
         assert!(reason.contains("[REDACTED]"));
         assert!(!reason.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn generate_rule_traces_extracts_detection_data() {
+        let redactor = Redactor::new();
+        let events = vec![
+            // Event with rule match and extracted data
+            crate::storage::StoredEvent {
+                id: 1,
+                pane_id: 1,
+                rule_id: "codex.usage_limit".to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "usage".to_string(),
+                severity: "warning".to_string(),
+                confidence: 0.95,
+                extracted: Some(serde_json::json!({"percentage": "25%", "limit": "20h"})),
+                matched_text: Some("25% of your 20h limit remaining".to_string()),
+                segment_id: Some(100),
+                detected_at: 1000,
+                handled_at: Some(1500),
+                handled_by_workflow_id: Some("wf-123".to_string()),
+                handled_status: Some("completed".to_string()),
+            },
+            // Event without extracted data
+            crate::storage::StoredEvent {
+                id: 2,
+                pane_id: 2,
+                rule_id: "claude_code.compaction".to_string(),
+                agent_type: "claude_code".to_string(),
+                event_type: "compaction".to_string(),
+                severity: "info".to_string(),
+                confidence: 1.0,
+                extracted: None,
+                matched_text: Some("context compacted".to_string()),
+                segment_id: None,
+                detected_at: 2000,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            },
+            // Event without rule_id (should be filtered out)
+            crate::storage::StoredEvent {
+                id: 3,
+                pane_id: 3,
+                rule_id: String::new(),
+                agent_type: "unknown".to_string(),
+                event_type: "manual".to_string(),
+                severity: "info".to_string(),
+                confidence: 0.0,
+                extracted: None,
+                matched_text: None,
+                segment_id: None,
+                detected_at: 3000,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            },
+        ];
+
+        let traces = generate_rule_traces(&events, &redactor);
+
+        // Should only have 2 traces (event 3 filtered out due to empty rule_id)
+        assert_eq!(traces.len(), 2);
+
+        // First trace should have extracted fields
+        assert_eq!(traces[0].event_id, 1);
+        assert_eq!(traces[0].rule_id, "codex.usage_limit");
+        assert!((traces[0].confidence - 0.95).abs() < f64::EPSILON);
+        assert!(traces[0].handled);
+        assert_eq!(traces[0].extracted_fields.len(), 2);
+
+        // Second trace should have no extracted fields
+        assert_eq!(traces[1].event_id, 2);
+        assert_eq!(traces[1].rule_id, "claude_code.compaction");
+        assert!(!traces[1].handled);
+        assert!(traces[1].extracted_fields.is_empty());
+    }
+
+    #[test]
+    fn rule_traces_redact_secrets_in_matched_text() {
+        let redactor = Redactor::new();
+        let events = vec![crate::storage::StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: "codex.auth_error".to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "auth".to_string(),
+            severity: "critical".to_string(),
+            confidence: 1.0,
+            extracted: Some(serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"})),
+            matched_text: Some("Error: Invalid API key sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            segment_id: None,
+            detected_at: 1000,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }];
+
+        let traces = generate_rule_traces(&events, &redactor);
+
+        assert_eq!(traces.len(), 1);
+        // Matched text should be redacted
+        assert!(traces[0].matched_text.as_ref().unwrap().contains("[REDACTED]"));
+        assert!(!traces[0].matched_text.as_ref().unwrap().contains("sk-abc123"));
+        // Extracted fields should also be redacted
+        assert!(!traces[0].extracted_fields.is_empty());
+        let key_field = &traces[0].extracted_fields[0];
+        assert!(key_field.value.as_ref().unwrap().contains("[REDACTED]"));
     }
 
     #[test]
