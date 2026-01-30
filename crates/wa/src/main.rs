@@ -621,6 +621,43 @@ SEE ALSO:
         command: ConfigCommands,
     },
 
+    /// Interactive tutorial and learning system
+    #[command(after_help = r#"EXAMPLES:
+    wa learn                          Show track selection / resume
+    wa learn basics                   Start or resume the Basics track
+    wa learn basics --complete        Mark current exercise as done
+    wa learn basics --skip            Skip current exercise
+    wa learn --status                 Show completion summary
+    wa learn --reset                  Clear all progress
+
+SEE ALSO:
+    wa doctor     Check environment prerequisites
+    wa status     View system status"#)]
+    Learn {
+        /// Track to start or resume (basics, events, workflows)
+        track: Option<String>,
+
+        /// Show completion summary
+        #[arg(long)]
+        status: bool,
+
+        /// Clear all progress
+        #[arg(long)]
+        reset: bool,
+
+        /// Mark current exercise as completed
+        #[arg(long)]
+        complete: bool,
+
+        /// Skip current exercise
+        #[arg(long)]
+        skip: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Database maintenance commands
     #[command(after_help = r#"EXAMPLES:
     wa db stats                       Show database size and record counts
@@ -8812,6 +8849,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_config_command(command, cli_config_arg.as_deref(), workspace.as_deref()).await?;
         }
 
+        Some(Commands::Learn {
+            track,
+            status,
+            reset,
+            complete,
+            skip,
+            json,
+        }) => {
+            handle_learn_command(track, status, reset, complete, skip, json)?;
+        }
+
         Some(Commands::Db { command }) => {
             handle_db_command(command, &layout).await?;
         }
@@ -10590,6 +10638,183 @@ fn compute_config_diff(existing: &str, incoming: &str) -> Vec<String> {
     }
 
     diffs
+}
+
+/// Handle `wa learn` command for interactive tutorials
+#[allow(clippy::fn_params_excessive_bools)]
+fn handle_learn_command(
+    track: Option<String>,
+    status: bool,
+    reset: bool,
+    complete: bool,
+    skip: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    use wa_core::learn::{TutorialEngine, TutorialEvent, TutorialStatus};
+
+    let mut engine = TutorialEngine::load_or_create()?;
+
+    // Handle reset
+    if reset {
+        engine.handle_event(TutorialEvent::Reset)?;
+        engine.save()?;
+        if json {
+            println!(r#"{{"reset": true}}"#);
+        } else {
+            println!("Tutorial progress has been reset.");
+        }
+        return Ok(());
+    }
+
+    // Handle status
+    if status {
+        let status: TutorialStatus = (&engine).into();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            println!("wa learn --status\n");
+            println!("Overall Progress: {}/{} exercises", status.completed_exercises, status.total_exercises);
+            println!("Achievements: {}", status.achievements_earned);
+            println!("Time spent: {} minutes\n", status.total_time_minutes);
+
+            println!("Tracks:");
+            for t in &status.tracks {
+                let marker = if t.is_complete { "✓" } else { " " };
+                println!("  [{marker}] {} ({}/{})", t.name, t.completed, t.total);
+            }
+
+            if let Some(current) = &status.current_track {
+                println!("\nCurrent track: {}", current);
+            }
+            if let Some(exercise) = &status.current_exercise {
+                println!("Current exercise: {}", exercise);
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle complete or skip flags
+    if complete || skip {
+        if let Some(exercise_id) = engine.state().current_exercise.clone() {
+            let track_id = engine.state().current_track.clone();
+            let event = if complete {
+                TutorialEvent::CompleteExercise(exercise_id.clone())
+            } else {
+                TutorialEvent::SkipExercise(exercise_id.clone())
+            };
+            engine.handle_event(event)?;
+            engine.save()?;
+
+            if json {
+                let action = if complete { "completed" } else { "skipped" };
+                let response = serde_json::json!({
+                    "exercise": exercise_id,
+                    "action": action
+                });
+                println!("{}", response);
+            } else {
+                let action = if complete { "completed" } else { "skipped" };
+                println!("Exercise {} {}!", exercise_id, action);
+
+                // Show next exercise or completion
+                if let Some(next) = engine.current_exercise() {
+                    println!("\nNext exercise: {}", next.title);
+                    if let Some(tid) = &track_id {
+                        println!("Run: wa learn {} to continue", tid);
+                    }
+                } else if let Some(tid) = &track_id {
+                    if engine.is_track_complete(tid) {
+                        println!("\nTrack '{}' complete!", tid);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        anyhow::bail!("No exercise in progress. Start a track first with: wa learn <track>");
+    }
+
+    // Handle track selection or show menu
+    if let Some(track_id) = track {
+        // Validate track exists
+        if engine.get_track(&track_id).is_none() {
+            let available: Vec<_> = engine.tracks().iter().map(|t| t.id.as_str()).collect();
+            anyhow::bail!(
+                "Unknown track '{}'. Available tracks: {}",
+                track_id,
+                available.join(", ")
+            );
+        }
+
+        engine.handle_event(TutorialEvent::StartTrack(track_id.clone()))?;
+        engine.save()?;
+
+        // Show current exercise
+        if let Some(exercise) = engine.current_exercise() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&exercise)?);
+            } else {
+                let (completed, total) = engine.track_progress(&track_id);
+                println!("wa learn {}\n", track_id);
+                println!("Track: {} ({}/{})",
+                    engine.get_track(&track_id).map(|t| t.name.as_str()).unwrap_or(&track_id),
+                    completed, total);
+                println!("\n--- Exercise: {} ---\n", exercise.title);
+                println!("{}\n", exercise.description);
+                println!("Instructions:");
+                for (i, step) in exercise.instructions.iter().enumerate() {
+                    println!("  {}. {}", i + 1, step);
+                }
+                println!("\nWhen done, run: wa learn --complete");
+            }
+        } else {
+            // Track complete
+            if json {
+                let response = serde_json::json!({
+                    "track": track_id,
+                    "complete": true
+                });
+                println!("{}", response);
+            } else {
+                println!("Track '{}' is complete!", track_id);
+            }
+        }
+    } else {
+        // Show track selection
+        engine.handle_event(TutorialEvent::Heartbeat)?;
+        engine.save()?;
+
+        if json {
+            let status: TutorialStatus = (&engine).into();
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            println!("wa learn\n");
+            println!("Welcome to the wa tutorial!\n");
+            println!("Available tracks:\n");
+
+            for track in engine.tracks() {
+                let (completed, total) = engine.track_progress(&track.id);
+                let status_marker = if engine.is_track_complete(&track.id) {
+                    "✓"
+                } else if completed > 0 {
+                    "…"
+                } else {
+                    " "
+                };
+                println!("  [{status_marker}] {} - {} (~{} min)",
+                    track.id, track.description, track.estimated_minutes);
+                println!("      Progress: {}/{}", completed, total);
+            }
+
+            println!("\nTo start a track, run: wa learn <track>");
+            println!("Example: wa learn basics");
+
+            if let Some(current) = engine.state().current_track.as_ref() {
+                println!("\nResume your current track: wa learn {}", current);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle `wa db` subcommands
