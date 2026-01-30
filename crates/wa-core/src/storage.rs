@@ -994,6 +994,199 @@ impl AgentSessionRecord {
     }
 }
 
+// =============================================================================
+// Timeline Data Model (wa-6sk.1)
+// =============================================================================
+
+/// Type of correlation between events
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CorrelationType {
+    /// Usage limit event followed by new session (failover)
+    Failover,
+    /// One event triggers another in cascade
+    Cascade,
+    /// Events close in time (within window)
+    Temporal,
+    /// Events from the same workflow run
+    WorkflowGroup,
+    /// Events with same dedupe key pattern
+    DedupeGroup,
+}
+
+impl std::fmt::Display for CorrelationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failover => write!(f, "failover"),
+            Self::Cascade => write!(f, "cascade"),
+            Self::Temporal => write!(f, "temporal"),
+            Self::WorkflowGroup => write!(f, "workflow_group"),
+            Self::DedupeGroup => write!(f, "dedupe_group"),
+        }
+    }
+}
+
+/// A correlation between multiple events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Correlation {
+    /// Unique correlation ID
+    pub id: String,
+    /// IDs of correlated events
+    pub event_ids: Vec<i64>,
+    /// Type of correlation
+    pub correlation_type: CorrelationType,
+    /// Confidence score (0.0-1.0)
+    pub confidence: f64,
+    /// Human-readable description
+    pub description: String,
+}
+
+/// Reference to a correlation (lightweight)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrelationRef {
+    /// Correlation ID
+    pub id: String,
+    /// Correlation type
+    pub correlation_type: CorrelationType,
+}
+
+/// Pane information snapshot for timeline events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfo {
+    /// Pane ID
+    pub pane_id: u64,
+    /// Stable pane UUID
+    pub pane_uuid: Option<String>,
+    /// Agent type detected in pane
+    pub agent_type: Option<String>,
+    /// Domain (local, ssh, etc.)
+    pub domain: String,
+    /// Current working directory
+    pub cwd: Option<String>,
+    /// Pane title
+    pub title: Option<String>,
+}
+
+/// Information about how an event was handled
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandledInfo {
+    /// When handled (epoch ms)
+    pub handled_at: i64,
+    /// Workflow that handled this
+    pub workflow_id: Option<String>,
+    /// Handling status
+    pub status: String,
+}
+
+/// An event enriched with pane info and correlations for timeline display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    /// Event ID
+    pub id: i64,
+    /// Detection timestamp (epoch ms)
+    pub timestamp: i64,
+    /// Pane information
+    pub pane_info: PaneInfo,
+    /// Rule that triggered this event
+    pub rule_id: String,
+    /// Event type
+    pub event_type: String,
+    /// Severity level
+    pub severity: String,
+    /// Confidence score
+    pub confidence: f64,
+    /// Handling information (if handled)
+    pub handled: Option<HandledInfo>,
+    /// References to correlations involving this event
+    pub correlations: Vec<CorrelationRef>,
+    /// Brief summary for display
+    pub summary: Option<String>,
+}
+
+/// A timeline of events across panes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Timeline {
+    /// Start of time range (epoch ms)
+    pub start: i64,
+    /// End of time range (epoch ms)
+    pub end: i64,
+    /// Events in chronological order
+    pub events: Vec<TimelineEvent>,
+    /// All correlations referenced by events
+    pub correlations: Vec<Correlation>,
+    /// Total event count (may be more than events.len() if paginated)
+    pub total_count: u64,
+    /// Whether there are more events beyond this page
+    pub has_more: bool,
+}
+
+/// Query parameters for timeline
+#[derive(Debug, Clone, Default)]
+pub struct TimelineQuery {
+    /// Start of time range (epoch ms, inclusive)
+    pub start: Option<i64>,
+    /// End of time range (epoch ms, inclusive)
+    pub end: Option<i64>,
+    /// Filter by pane IDs
+    pub pane_ids: Option<Vec<u64>>,
+    /// Filter by severity levels
+    pub severities: Option<Vec<String>>,
+    /// Filter by event types
+    pub event_types: Option<Vec<String>>,
+    /// Filter by agent types
+    pub agent_types: Option<Vec<String>>,
+    /// Only unhandled events
+    pub unhandled_only: bool,
+    /// Include correlations
+    pub include_correlations: bool,
+    /// Maximum events to return
+    pub limit: usize,
+    /// Offset for pagination
+    pub offset: usize,
+}
+
+impl TimelineQuery {
+    /// Create a new query with default settings
+    pub fn new() -> Self {
+        Self {
+            limit: 100,
+            include_correlations: true,
+            ..Default::default()
+        }
+    }
+
+    /// Set time range
+    pub fn with_range(mut self, start: i64, end: i64) -> Self {
+        self.start = Some(start);
+        self.end = Some(end);
+        self
+    }
+
+    /// Filter by panes
+    pub fn with_panes(mut self, pane_ids: Vec<u64>) -> Self {
+        self.pane_ids = Some(pane_ids);
+        self
+    }
+
+    /// Filter by severities
+    pub fn with_severities(mut self, severities: Vec<String>) -> Self {
+        self.severities = Some(severities);
+        self
+    }
+
+    /// Only show unhandled events
+    pub fn unhandled_only(mut self) -> Self {
+        self.unhandled_only = true;
+        self
+    }
+
+    /// Set pagination
+    pub fn with_pagination(mut self, limit: usize, offset: usize) -> Self {
+        self.limit = limit;
+        self.offset = offset;
+        self
+    }
+}
+
 /// Workflow execution record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRecord {
@@ -3528,6 +3721,24 @@ impl StorageHandle {
             })?;
 
             query_events(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get a unified timeline of events across panes.
+    ///
+    /// Returns events enriched with pane info and correlations,
+    /// sorted chronologically with pagination support.
+    pub async fn get_timeline(&self, query: TimelineQuery) -> Result<Timeline> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_timeline(&conn, &query)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -6608,6 +6819,300 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
     }
 
     Ok(results)
+}
+
+// =============================================================================
+// Timeline Query Implementation (wa-6sk.1)
+// =============================================================================
+
+/// Query timeline with unified event view across panes
+fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> {
+    // Build the SQL query with joins for pane info
+    let mut sql = String::from(
+        "SELECT e.id, e.pane_id, e.rule_id, e.agent_type, e.event_type, e.severity,
+                e.confidence, e.detected_at, e.handled_at, e.handled_by_workflow_id,
+                e.handled_status, e.matched_text,
+                p.pane_uuid, p.domain, p.cwd, p.title
+         FROM events e
+         JOIN panes p ON p.pane_id = e.pane_id
+         WHERE 1=1",
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    // Time range filters
+    if let Some(start) = query.start {
+        sql.push_str(" AND e.detected_at >= ?");
+        params.push(Box::new(start));
+    }
+
+    if let Some(end) = query.end {
+        sql.push_str(" AND e.detected_at <= ?");
+        params.push(Box::new(end));
+    }
+
+    // Pane filter
+    if let Some(ref pane_ids) = query.pane_ids {
+        if !pane_ids.is_empty() {
+            let placeholders: Vec<&str> = pane_ids.iter().map(|_| "?").collect();
+            sql.push_str(&format!(" AND e.pane_id IN ({})", placeholders.join(",")));
+            for &pid in pane_ids {
+                params.push(Box::new(pid as i64));
+            }
+        }
+    }
+
+    // Severity filter
+    if let Some(ref severities) = query.severities {
+        if !severities.is_empty() {
+            let placeholders: Vec<&str> = severities.iter().map(|_| "?").collect();
+            sql.push_str(&format!(" AND e.severity IN ({})", placeholders.join(",")));
+            for s in severities {
+                params.push(Box::new(s.clone()));
+            }
+        }
+    }
+
+    // Event type filter
+    if let Some(ref event_types) = query.event_types {
+        if !event_types.is_empty() {
+            let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
+            sql.push_str(&format!(" AND e.event_type IN ({})", placeholders.join(",")));
+            for et in event_types {
+                params.push(Box::new(et.clone()));
+            }
+        }
+    }
+
+    // Agent type filter
+    if let Some(ref agent_types) = query.agent_types {
+        if !agent_types.is_empty() {
+            let placeholders: Vec<&str> = agent_types.iter().map(|_| "?").collect();
+            sql.push_str(&format!(" AND e.agent_type IN ({})", placeholders.join(",")));
+            for at in agent_types {
+                params.push(Box::new(at.clone()));
+            }
+        }
+    }
+
+    // Unhandled filter
+    if query.unhandled_only {
+        sql.push_str(" AND e.handled_at IS NULL");
+    }
+
+    // Count total before pagination
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM events e JOIN panes p ON p.pane_id = e.pane_id WHERE {}",
+        sql.split("WHERE").nth(1).unwrap_or("1=1")
+    );
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let total_count: i64 = conn
+        .query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or(0);
+
+    // Add ordering and pagination
+    sql.push_str(" ORDER BY e.detected_at ASC");
+
+    let limit_i64 = query.limit as i64;
+    let offset_i64 = query.offset as i64;
+    sql.push_str(" LIMIT ? OFFSET ?");
+    params.push(Box::new(limit_i64));
+    params.push(Box::new(offset_i64));
+
+    // Execute query
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare timeline query: {e}")))?;
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
+
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let pane_id: i64 = row.get(1)?;
+            let pane_id_u64 = pane_id as u64;
+
+            Ok(TimelineEvent {
+                id: row.get(0)?,
+                timestamp: row.get(7)?,
+                pane_info: PaneInfo {
+                    pane_id: pane_id_u64,
+                    pane_uuid: row.get(12)?,
+                    agent_type: {
+                        let at: String = row.get(3)?;
+                        if at == "unknown" { None } else { Some(at) }
+                    },
+                    domain: row.get(13)?,
+                    cwd: row.get(14)?,
+                    title: row.get(15)?,
+                },
+                rule_id: row.get(2)?,
+                event_type: row.get(4)?,
+                severity: row.get(5)?,
+                confidence: row.get(6)?,
+                handled: {
+                    let handled_at: Option<i64> = row.get(8)?;
+                    handled_at.map(|ts| HandledInfo {
+                        handled_at: ts,
+                        workflow_id: row.get(9).ok().flatten(),
+                        status: row.get::<_, Option<String>>(10).ok().flatten()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    })
+                },
+                correlations: Vec::new(), // Populated later if requested
+                summary: row.get::<_, Option<String>>(11).ok().flatten(),
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Timeline query failed: {e}")))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    // Calculate time range from results
+    let (start, end) = if events.is_empty() {
+        let now = now_ms();
+        (query.start.unwrap_or(now), query.end.unwrap_or(now))
+    } else {
+        (
+            events.first().map_or(0, |e| e.timestamp),
+            events.last().map_or(0, |e| e.timestamp),
+        )
+    };
+
+    // Detect correlations if requested
+    let correlations = if query.include_correlations && !events.is_empty() {
+        detect_correlations(&events)
+    } else {
+        Vec::new()
+    };
+
+    // Attach correlation refs to events
+    let mut events_with_refs = events;
+    for event in &mut events_with_refs {
+        event.correlations = correlations
+            .iter()
+            .filter(|c| c.event_ids.contains(&event.id))
+            .map(|c| CorrelationRef {
+                id: c.id.clone(),
+                correlation_type: c.correlation_type,
+            })
+            .collect();
+    }
+
+    let has_more = (query.offset + events_with_refs.len()) < total_count as usize;
+
+    Ok(Timeline {
+        start,
+        end,
+        events: events_with_refs,
+        correlations,
+        total_count: total_count as u64,
+        has_more,
+    })
+}
+
+/// Detect correlations between timeline events
+fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
+    let mut correlations = Vec::new();
+    let mut correlation_counter = 0u64;
+
+    // Temporal correlation: events within 5 seconds of each other
+    const TEMPORAL_WINDOW_MS: i64 = 5000;
+
+    // Find temporal clusters
+    let mut i = 0;
+    while i < events.len() {
+        let base_event = &events[i];
+        let mut cluster = vec![base_event.id];
+        let mut j = i + 1;
+
+        // Collect events within temporal window
+        while j < events.len() {
+            let candidate = &events[j];
+            if candidate.timestamp - base_event.timestamp <= TEMPORAL_WINDOW_MS {
+                // Different panes = more interesting correlation
+                if candidate.pane_info.pane_id != base_event.pane_info.pane_id {
+                    cluster.push(candidate.id);
+                }
+            } else {
+                break;
+            }
+            j += 1;
+        }
+
+        // Only create correlation if multiple events from different panes
+        if cluster.len() > 1 {
+            correlation_counter += 1;
+            correlations.push(Correlation {
+                id: format!("corr-temporal-{correlation_counter}"),
+                event_ids: cluster,
+                correlation_type: CorrelationType::Temporal,
+                confidence: 0.6,
+                description: "Events occurred within 5 seconds across different panes".to_string(),
+            });
+        }
+
+        i += 1;
+    }
+
+    // Workflow group correlation: events handled by same workflow
+    let mut workflow_groups: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+
+    for event in events {
+        if let Some(ref handled) = event.handled {
+            if let Some(ref wf_id) = handled.workflow_id {
+                workflow_groups
+                    .entry(wf_id.clone())
+                    .or_default()
+                    .push(event.id);
+            }
+        }
+    }
+
+    for (wf_id, event_ids) in workflow_groups {
+        if event_ids.len() > 1 {
+            correlation_counter += 1;
+            correlations.push(Correlation {
+                id: format!("corr-workflow-{correlation_counter}"),
+                event_ids,
+                correlation_type: CorrelationType::WorkflowGroup,
+                confidence: 0.95,
+                description: format!("Events handled by workflow {wf_id}"),
+            });
+        }
+    }
+
+    // Failover correlation: usage_limit followed by new session in different pane
+    for (i, event) in events.iter().enumerate() {
+        if event.event_type == "usage_limit" || event.rule_id.contains("usage_limit") {
+            // Look for session start in another pane within 60 seconds
+            for later_event in events.iter().skip(i + 1) {
+                if later_event.timestamp - event.timestamp > 60000 {
+                    break;
+                }
+                if later_event.pane_info.pane_id != event.pane_info.pane_id
+                    && (later_event.event_type == "session_start"
+                        || later_event.rule_id.contains("session_start"))
+                {
+                    correlation_counter += 1;
+                    correlations.push(Correlation {
+                        id: format!("corr-failover-{correlation_counter}"),
+                        event_ids: vec![event.id, later_event.id],
+                        correlation_type: CorrelationType::Failover,
+                        confidence: 0.8,
+                        description: "Usage limit followed by new session (potential failover)"
+                            .to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    correlations
 }
 
 /// Query audit actions with optional filters
@@ -10651,6 +11156,237 @@ mod fts_sync_tests {
         // Progress should be at the end
         let progress = get_fts_pane_progress_sync(&conn, 1).unwrap().unwrap();
         assert_eq!(progress.last_indexed_seq, 10);
+    }
+}
+
+// =============================================================================
+// Timeline Data Model Tests (wa-6sk.1)
+// =============================================================================
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    /// Helper to create a pane
+    fn insert_test_pane(conn: &Connection, pane_id: u64, domain: &str) {
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            params![pane_id as i64, domain, now, now],
+        )
+        .unwrap();
+    }
+
+    /// Helper to create an event
+    fn insert_test_event(
+        conn: &Connection,
+        pane_id: u64,
+        rule_id: &str,
+        event_type: &str,
+        severity: &str,
+        detected_at: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity,
+             confidence, detected_at)
+             VALUES (?1, ?2, 'claude_code', ?3, ?4, 0.9, ?5)",
+            params![pane_id as i64, rule_id, event_type, severity, detected_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn correlation_type_display() {
+        assert_eq!(CorrelationType::Failover.to_string(), "failover");
+        assert_eq!(CorrelationType::Temporal.to_string(), "temporal");
+        assert_eq!(CorrelationType::WorkflowGroup.to_string(), "workflow_group");
+    }
+
+    #[test]
+    fn timeline_query_builder() {
+        let query = TimelineQuery::new()
+            .with_range(1000, 2000)
+            .with_panes(vec![1, 2])
+            .with_severities(vec!["critical".to_string()])
+            .unhandled_only()
+            .with_pagination(50, 10);
+
+        assert_eq!(query.start, Some(1000));
+        assert_eq!(query.end, Some(2000));
+        assert_eq!(query.pane_ids, Some(vec![1, 2]));
+        assert_eq!(query.severities, Some(vec!["critical".to_string()]));
+        assert!(query.unhandled_only);
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.offset, 10);
+    }
+
+    #[test]
+    fn empty_timeline_query() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let query = TimelineQuery::new();
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert!(timeline.events.is_empty());
+        assert!(timeline.correlations.is_empty());
+        assert_eq!(timeline.total_count, 0);
+        assert!(!timeline.has_more);
+    }
+
+    #[test]
+    fn timeline_with_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Create panes
+        insert_test_pane(&conn, 1, "local");
+        insert_test_pane(&conn, 2, "ssh");
+
+        // Create events
+        let now = now_ms();
+        insert_test_event(&conn, 1, "codex.usage_limit", "usage_limit", "warning", now - 2000);
+        insert_test_event(&conn, 2, "codex.compaction", "compaction", "info", now - 1000);
+        insert_test_event(&conn, 1, "codex.error", "error", "critical", now);
+
+        let query = TimelineQuery::new();
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 3);
+        assert_eq!(timeline.total_count, 3);
+        assert!(!timeline.has_more);
+
+        // Events should be in chronological order
+        assert!(timeline.events[0].timestamp <= timeline.events[1].timestamp);
+        assert!(timeline.events[1].timestamp <= timeline.events[2].timestamp);
+
+        // Pane info should be populated
+        assert_eq!(timeline.events[0].pane_info.domain, "local");
+        assert_eq!(timeline.events[1].pane_info.domain, "ssh");
+    }
+
+    #[test]
+    fn timeline_with_pane_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+        insert_test_pane(&conn, 2, "ssh");
+
+        let now = now_ms();
+        insert_test_event(&conn, 1, "rule1", "event1", "info", now - 1000);
+        insert_test_event(&conn, 2, "rule2", "event2", "info", now);
+        insert_test_event(&conn, 1, "rule3", "event3", "info", now + 1000);
+
+        let query = TimelineQuery::new().with_panes(vec![1]);
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 2);
+        assert!(timeline.events.iter().all(|e| e.pane_info.pane_id == 1));
+    }
+
+    #[test]
+    fn timeline_with_severity_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+
+        let now = now_ms();
+        insert_test_event(&conn, 1, "rule1", "event1", "info", now - 2000);
+        insert_test_event(&conn, 1, "rule2", "event2", "warning", now - 1000);
+        insert_test_event(&conn, 1, "rule3", "event3", "critical", now);
+
+        let query = TimelineQuery::new().with_severities(vec!["critical".to_string()]);
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].severity, "critical");
+    }
+
+    #[test]
+    fn timeline_pagination() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+
+        let now = now_ms();
+        for i in 0..10 {
+            insert_test_event(&conn, 1, &format!("rule{i}"), "event", "info", now + i * 1000);
+        }
+
+        // First page
+        let query = TimelineQuery::new().with_pagination(3, 0);
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 3);
+        assert_eq!(timeline.total_count, 10);
+        assert!(timeline.has_more);
+
+        // Second page
+        let query = TimelineQuery::new().with_pagination(3, 3);
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 3);
+        assert!(timeline.has_more);
+
+        // Last page
+        let query = TimelineQuery::new().with_pagination(3, 9);
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 1);
+        assert!(!timeline.has_more);
+    }
+
+    #[test]
+    fn detect_temporal_correlations() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+        insert_test_pane(&conn, 2, "ssh");
+
+        let now = now_ms();
+        // Events within 5 second window across different panes
+        insert_test_event(&conn, 1, "rule1", "event1", "info", now);
+        insert_test_event(&conn, 2, "rule2", "event2", "info", now + 2000); // 2s later
+
+        let query = TimelineQuery::new();
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        // Should detect temporal correlation
+        assert!(!timeline.correlations.is_empty());
+        let temporal = timeline.correlations.iter()
+            .find(|c| c.correlation_type == CorrelationType::Temporal);
+        assert!(temporal.is_some());
+    }
+
+    #[test]
+    fn unhandled_only_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1, "local");
+
+        let now = now_ms();
+        let event1_id = insert_test_event(&conn, 1, "rule1", "event1", "info", now - 1000);
+        insert_test_event(&conn, 1, "rule2", "event2", "info", now);
+
+        // Mark first event as handled
+        conn.execute(
+            "UPDATE events SET handled_at = ?1, handled_status = 'completed' WHERE id = ?2",
+            params![now, event1_id],
+        )
+        .unwrap();
+
+        let query = TimelineQuery::new().unhandled_only();
+        let timeline = query_timeline(&conn, &query).unwrap();
+
+        assert_eq!(timeline.events.len(), 1);
+        assert!(timeline.events[0].handled.is_none());
     }
 }
 
