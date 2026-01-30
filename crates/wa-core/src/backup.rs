@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike, Weekday};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Weekday};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -293,9 +293,7 @@ fn cron_matches(candidate: DateTime<Local>, cron: &CronSchedule) -> bool {
         }
     }
 
-    let dom_match = cron
-        .day_of_month
-        .map_or(true, |dom| candidate.day() == dom);
+    let dom_match = cron.day_of_month.map_or(true, |dom| candidate.day() == dom);
     let dow_match = cron.day_of_week.map_or(true, |dow| {
         let normalized = if dow == 7 { 0 } else { dow };
         let candidate_dow = candidate.weekday().num_days_from_sunday();
@@ -449,9 +447,7 @@ pub fn scheduled_backup_status(
     let schedule = BackupSchedule::parse(&config.schedule)?;
     let destination_root = resolve_destination_root(workspace_root, config.destination.as_deref());
     let entries = list_backup_entries(&destination_root)?;
-    let latest = entries
-        .iter()
-        .max_by(|a, b| compare_backup_entries(a, b));
+    let latest = entries.iter().max_by(|a, b| compare_backup_entries(a, b));
 
     let next_backup_at = if config.enabled {
         Some(format_local_datetime(schedule.next_after(now)?))
@@ -477,10 +473,7 @@ pub fn scheduled_backup_status(
 
 /// Resolve a backup destination root directory.
 #[must_use]
-pub fn backup_destination_root(
-    workspace_root: &Path,
-    destination: Option<&str>,
-) -> PathBuf {
+pub fn backup_destination_root(workspace_root: &Path, destination: Option<&str>) -> PathBuf {
     resolve_destination_root(workspace_root, destination)
 }
 
@@ -563,7 +556,10 @@ pub fn prune_backups(
 ) -> Result<PruneSummary> {
     let mut entries = list_backup_entries(base_dir)?;
     if entries.is_empty() {
-        return Ok(PruneSummary { removed: 0, kept: 0 });
+        return Ok(PruneSummary {
+            removed: 0,
+            kept: 0,
+        });
     }
 
     let mut removed = 0_usize;
@@ -1110,6 +1106,7 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Timelike};
     use tempfile::TempDir;
 
     fn create_test_db(path: &Path) -> Connection {
@@ -1285,6 +1282,76 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
             .unwrap();
         assert_eq!(seg_count, 3);
+    }
+
+    #[test]
+    fn schedule_parses_keywords() {
+        assert!(matches!(
+            BackupSchedule::parse("hourly").unwrap(),
+            BackupSchedule::Hourly { .. }
+        ));
+        assert!(matches!(
+            BackupSchedule::parse("daily").unwrap(),
+            BackupSchedule::Daily { .. }
+        ));
+        assert!(matches!(
+            BackupSchedule::parse("weekly").unwrap(),
+            BackupSchedule::Weekly { .. }
+        ));
+    }
+
+    #[test]
+    fn schedule_next_daily_advances() {
+        let schedule = BackupSchedule::parse("daily").unwrap();
+        let now = Local.with_ymd_and_hms(2026, 1, 18, 12, 0, 0).unwrap();
+        let next = schedule.next_after(now).unwrap();
+        assert!(next > now);
+        assert_eq!(next.hour(), 3);
+        assert_eq!(next.minute(), 0);
+    }
+
+    #[test]
+    fn schedule_parses_cron() {
+        let schedule = BackupSchedule::parse("15 3 * * *").unwrap();
+        assert!(matches!(schedule, BackupSchedule::Cron(_)));
+    }
+
+    #[test]
+    fn prune_backups_respects_max() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let mut create_backup = |name: &str, created_at: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let manifest = BackupManifest {
+                wa_version: "test".to_string(),
+                schema_version: 1,
+                created_at: created_at.to_string(),
+                workspace: root.display().to_string(),
+                db_size_bytes: 0,
+                db_checksum: "deadbeef".to_string(),
+                stats: BackupStats::default(),
+            };
+            let data = serde_json::to_string(&manifest).unwrap();
+            fs::write(dir.join("manifest.json"), data).unwrap();
+        };
+
+        create_backup("b1", "2026-01-01T00:00:00Z");
+        create_backup("b2", "2026-01-10T00:00:00Z");
+        create_backup("b3", "2026-01-20T00:00:00Z");
+
+        let now = Local.with_ymd_and_hms(2026, 1, 25, 12, 0, 0).unwrap();
+        let summary = prune_backups(root, 0, 2, now).unwrap();
+        assert_eq!(summary.kept, 2);
+
+        let entries = list_backup_entries(root).unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"b2".to_string()));
+        assert!(names.contains(&"b3".to_string()));
     }
 
     #[test]
