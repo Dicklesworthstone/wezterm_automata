@@ -3144,10 +3144,14 @@ fn format_send_result_human(
     output
 }
 
-fn resolve_workflow(name: &str) -> Option<std::sync::Arc<dyn wa_core::workflows::Workflow>> {
+fn resolve_workflow(
+    name: &str,
+    workflows_config: &wa_core::config::WorkflowsConfig,
+) -> Option<std::sync::Arc<dyn wa_core::workflows::Workflow>> {
     match name {
         "handle_compaction" => Some(std::sync::Arc::new(
-            wa_core::workflows::HandleCompaction::default(),
+            wa_core::workflows::HandleCompaction::new()
+                .with_prompt_config(workflows_config.compaction_prompts.clone()),
         )),
         "handle_usage_limits" => Some(std::sync::Arc::new(
             wa_core::workflows::HandleUsageLimits::new(),
@@ -3174,6 +3178,7 @@ fn build_workflow_dry_run_report(
     name: &str,
     pane: u64,
     pane_info: Option<&wa_core::wezterm::PaneInfo>,
+    config: &wa_core::config::Config,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
         ActionType, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
@@ -3199,7 +3204,7 @@ fn build_workflow_dry_run_report(
 
     // Policy evaluation for workflow
     let mut eval = PolicyEvaluation::new();
-    let workflow = resolve_workflow(name);
+    let workflow = resolve_workflow(name, &config.workflows);
     match workflow.as_ref() {
         Some(wf) => {
             eval.add_check(PolicyCheck::passed(
@@ -4030,7 +4035,9 @@ async fn run_watcher(
         );
 
         // Register built-in workflows
-        workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
+        workflow_runner.register_workflow(Arc::new(
+            HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
+        ));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleSessionEnd::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleAuthRequired::new()));
@@ -5079,6 +5086,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &name,
                                             pane_id,
                                             pane_info.as_ref(),
+                                            &config,
                                         );
                                         let response = RobotResponse::success(
                                             report.redacted(),
@@ -7138,6 +7146,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             &name,
                             pane,
                             pane_info.as_ref(),
+                            &config,
                         );
                         println!("{}", wa_core::dry_run::format_human(&report));
                     } else {
@@ -7279,6 +7288,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "version": wa_core::VERSION,
                     "wezterm_circuit": wezterm.circuit_status(),
                 });
+                let local_version = wa_core::vendored::read_local_wezterm_version();
+                let compat = wa_core::vendored::compatibility_report(local_version.as_ref());
+                payload["vendored_compatibility"] =
+                    serde_json::to_value(&compat).unwrap_or(serde_json::Value::Null);
                 if let Some(snap) = snapshot {
                     payload["health"] =
                         serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null);
@@ -12578,6 +12591,7 @@ fn run_diagnostics(
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
 
     // Check 2: WezTerm CLI available
+    let mut local_wezterm_version: Option<wa_core::vendored::WeztermVersion> = None;
     match std::process::Command::new("wezterm")
         .arg("--version")
         .output()
@@ -12586,6 +12600,7 @@ fn run_diagnostics(
             let version = String::from_utf8_lossy(&output.stdout);
             let version = version.trim();
             checks.push(DiagnosticCheck::ok_with_detail("WezTerm CLI", version));
+            local_wezterm_version = Some(wa_core::vendored::WeztermVersion::parse(version));
         }
         Ok(_) => {
             checks.push(DiagnosticCheck::error(
@@ -12600,6 +12615,44 @@ fn run_diagnostics(
                 "wezterm not found",
                 "Install WezTerm from https://wezfurlong.org/wezterm/",
             ));
+        }
+    }
+
+    // Check 2b: Vendored compatibility (only meaningful when vendored feature is enabled)
+    let compat = wa_core::vendored::compatibility_report(local_wezterm_version.as_ref());
+    if !compat.vendored_enabled {
+        checks.push(DiagnosticCheck::ok_with_detail(
+            "WezTerm vendored",
+            "vendored feature not enabled",
+        ));
+    } else {
+        match compat.status {
+            wa_core::vendored::VendoredCompatibilityStatus::Matched => {
+                checks.push(DiagnosticCheck::ok_with_detail(
+                    "WezTerm vendored",
+                    compat.message,
+                ));
+            }
+            wa_core::vendored::VendoredCompatibilityStatus::Compatible => {
+                let recommendation = compat
+                    .recommendation
+                    .unwrap_or_else(|| "Review vendored compatibility".to_string());
+                checks.push(DiagnosticCheck::warning(
+                    "WezTerm vendored",
+                    compat.message,
+                    recommendation,
+                ));
+            }
+            wa_core::vendored::VendoredCompatibilityStatus::Incompatible => {
+                let recommendation = compat
+                    .recommendation
+                    .unwrap_or_else(|| "Update WezTerm or rebuild wa".to_string());
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm vendored",
+                    compat.message,
+                    recommendation,
+                ));
+            }
         }
     }
 
@@ -12799,7 +12852,9 @@ mod tests {
     #[test]
     fn workflow_dry_run_report_includes_steps() {
         let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
-        let report = build_workflow_dry_run_report(&command_ctx, "handle_compaction", 42, None);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 42, None, &config);
 
         assert!(!report.expected_actions.is_empty());
         assert!(
@@ -12840,7 +12895,9 @@ mod tests {
     #[test]
     fn workflow_dry_run_report_unknown_workflow() {
         let command_ctx = wa_core::dry_run::CommandContext::new("workflow run", true);
-        let report = build_workflow_dry_run_report(&command_ctx, "unknown_workflow", 7, None);
+        let config = wa_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "unknown_workflow", 7, None, &config);
 
         assert!(report.expected_actions.is_empty());
         assert!(

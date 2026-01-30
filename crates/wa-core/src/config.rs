@@ -54,6 +54,9 @@ pub struct Config {
     /// Safety and policy settings
     pub safety: SafetyConfig,
 
+    /// Vendored WezTerm settings
+    pub vendored: VendoredConfig,
+
     /// Metrics/telemetry settings
     pub metrics: MetricsConfig,
 
@@ -1157,6 +1160,26 @@ impl Default for ReservationConfig {
 }
 
 // =============================================================================
+// Vendored Config
+// =============================================================================
+
+/// Vendored WezTerm configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VendoredConfig {
+    /// Optional mux socket path override (WEZTERM_UNIX_SOCKET equivalent)
+    pub mux_socket_path: Option<String>,
+}
+
+impl Default for VendoredConfig {
+    fn default() -> Self {
+        Self {
+            mux_socket_path: None,
+        }
+    }
+}
+
+// =============================================================================
 // Metrics Config
 // =============================================================================
 
@@ -1829,6 +1852,11 @@ impl Config {
 
         let db_path = expand_tilde(&self.storage.db_path);
         self.storage.db_path = path_to_string(&db_path);
+
+        if let Some(path) = self.vendored.mux_socket_path.take() {
+            let mux_path = expand_tilde(&path);
+            self.vendored.mux_socket_path = Some(path_to_string(&mux_path));
+        }
     }
 
     /// Validate semantic constraints

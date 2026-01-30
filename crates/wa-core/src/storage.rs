@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Schema initialization SQL
 ///
@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     agent_type TEXT NOT NULL,         -- codex, claude_code, gemini, unknown
     session_id TEXT,                  -- Agent's internal session ID if available
     external_id TEXT,                 -- Correlation with cass, etc.
+    external_meta TEXT,               -- JSON metadata for correlation decisions
     started_at INTEGER NOT NULL,      -- epoch ms
     ended_at INTEGER,                 -- epoch ms (NULL = still active)
     end_reason TEXT,                  -- completed, limit_reached, error, manual
@@ -647,6 +648,12 @@ static MIGRATIONS: &[Migration] = &[
         ",
         ),
     },
+    Migration {
+        version: 9,
+        description: "Add external_meta to agent_sessions for correlation metadata",
+        up_sql: "ALTER TABLE agent_sessions ADD COLUMN external_meta TEXT;",
+        down_sql: Some("ALTER TABLE agent_sessions DROP COLUMN external_meta;"),
+    },
 ];
 
 // =============================================================================
@@ -828,6 +835,8 @@ pub struct AgentSessionRecord {
     pub session_id: Option<String>,
     /// External correlation ID (e.g., cass session)
     pub external_id: Option<String>,
+    /// External correlation metadata (JSON)
+    pub external_meta: Option<serde_json::Value>,
     /// Session start timestamp (epoch ms)
     pub started_at: i64,
     /// Session end timestamp (epoch ms, None = active)
@@ -860,6 +869,7 @@ impl AgentSessionRecord {
             agent_type: agent_type.to_string(),
             session_id: None,
             external_id: None,
+            external_meta: None,
             started_at: now_ms(),
             ended_at: None,
             end_reason: None,
@@ -4640,19 +4650,24 @@ fn insert_step_log_sync(
 /// Returns the session ID.
 fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) -> Result<i64> {
     let pane_id_i64 = u64_to_i64(session.pane_id, "pane_id")?;
+    let external_meta_json = session
+        .external_meta
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok());
 
     if session.id == 0 {
         // Insert new session
         conn.execute(
-            "INSERT INTO agent_sessions (pane_id, agent_type, session_id, external_id,
+            "INSERT INTO agent_sessions (pane_id, agent_type, session_id, external_id, external_meta,
              started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
              cached_tokens, reasoning_tokens, model_name, estimated_cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 pane_id_i64,
                 session.agent_type,
                 session.session_id,
                 session.external_id,
+                external_meta_json,
                 session.started_at,
                 session.ended_at,
                 session.end_reason,
@@ -4672,16 +4687,17 @@ fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) ->
         // Update existing session
         conn.execute(
             "UPDATE agent_sessions SET
-             pane_id = ?1, agent_type = ?2, session_id = ?3, external_id = ?4,
-             started_at = ?5, ended_at = ?6, end_reason = ?7, total_tokens = ?8,
-             input_tokens = ?9, output_tokens = ?10, cached_tokens = ?11,
-             reasoning_tokens = ?12, model_name = ?13, estimated_cost_usd = ?14
-             WHERE id = ?15",
+             pane_id = ?1, agent_type = ?2, session_id = ?3, external_id = ?4, external_meta = ?5,
+             started_at = ?6, ended_at = ?7, end_reason = ?8, total_tokens = ?9,
+             input_tokens = ?10, output_tokens = ?11, cached_tokens = ?12,
+             reasoning_tokens = ?13, model_name = ?14, estimated_cost_usd = ?15
+             WHERE id = ?16",
             params![
                 pane_id_i64,
                 session.agent_type,
                 session.session_id,
                 session.external_id,
+                external_meta_json,
                 session.started_at,
                 session.ended_at,
                 session.end_reason,
@@ -5666,12 +5682,16 @@ fn build_indexing_health_report(
 #[allow(clippy::cast_sign_loss)]
 fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<AgentSessionRecord>> {
     conn.query_row(
-        "SELECT id, pane_id, agent_type, session_id, external_id, started_at, ended_at,
-         end_reason, total_tokens, input_tokens, output_tokens, cached_tokens,
-         reasoning_tokens, model_name, estimated_cost_usd
+        "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
+         started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
+         cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
          FROM agent_sessions WHERE id = ?1",
         [session_id],
         |row| {
+            let external_meta_str: Option<String> = row.get(5)?;
+            let external_meta = external_meta_str
+                .as_ref()
+                .and_then(|value| serde_json::from_str(value).ok());
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -5681,16 +5701,17 @@ fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<Agen
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
-                started_at: row.get(5)?,
-                ended_at: row.get(6)?,
-                end_reason: row.get(7)?,
-                total_tokens: row.get(8)?,
-                input_tokens: row.get(9)?,
-                output_tokens: row.get(10)?,
-                cached_tokens: row.get(11)?,
-                reasoning_tokens: row.get(12)?,
-                model_name: row.get(13)?,
-                estimated_cost_usd: row.get(14)?,
+                external_meta,
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                end_reason: row.get(8)?,
+                total_tokens: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                cached_tokens: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
+                model_name: row.get(14)?,
+                estimated_cost_usd: row.get(15)?,
             })
         },
     )
@@ -5703,9 +5724,9 @@ fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<Agen
 fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, pane_id, agent_type, session_id, external_id, started_at, ended_at,
-             end_reason, total_tokens, input_tokens, output_tokens, cached_tokens,
-             reasoning_tokens, model_name, estimated_cost_usd
+            "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
+             started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
+             cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
              FROM agent_sessions WHERE ended_at IS NULL
              ORDER BY started_at DESC",
         )
@@ -5713,6 +5734,10 @@ fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
 
     let rows = stmt
         .query_map([], |row| {
+            let external_meta_str: Option<String> = row.get(5)?;
+            let external_meta = external_meta_str
+                .as_ref()
+                .and_then(|value| serde_json::from_str(value).ok());
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -5722,16 +5747,17 @@ fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
-                started_at: row.get(5)?,
-                ended_at: row.get(6)?,
-                end_reason: row.get(7)?,
-                total_tokens: row.get(8)?,
-                input_tokens: row.get(9)?,
-                output_tokens: row.get(10)?,
-                cached_tokens: row.get(11)?,
-                reasoning_tokens: row.get(12)?,
-                model_name: row.get(13)?,
-                estimated_cost_usd: row.get(14)?,
+                external_meta,
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                end_reason: row.get(8)?,
+                total_tokens: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                cached_tokens: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
+                model_name: row.get(14)?,
+                estimated_cost_usd: row.get(15)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -5750,9 +5776,9 @@ fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentS
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, pane_id, agent_type, session_id, external_id, started_at, ended_at,
-             end_reason, total_tokens, input_tokens, output_tokens, cached_tokens,
-             reasoning_tokens, model_name, estimated_cost_usd
+            "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
+             started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
+             cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
              FROM agent_sessions WHERE pane_id = ?1
              ORDER BY started_at DESC",
         )
@@ -5760,6 +5786,10 @@ fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentS
 
     let rows = stmt
         .query_map([pane_id_i64], |row| {
+            let external_meta_str: Option<String> = row.get(5)?;
+            let external_meta = external_meta_str
+                .as_ref()
+                .and_then(|value| serde_json::from_str(value).ok());
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -5769,16 +5799,17 @@ fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentS
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
-                started_at: row.get(5)?,
-                ended_at: row.get(6)?,
-                end_reason: row.get(7)?,
-                total_tokens: row.get(8)?,
-                input_tokens: row.get(9)?,
-                output_tokens: row.get(10)?,
-                cached_tokens: row.get(11)?,
-                reasoning_tokens: row.get(12)?,
-                model_name: row.get(13)?,
-                estimated_cost_usd: row.get(14)?,
+                external_meta,
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                end_reason: row.get(8)?,
+                total_tokens: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                cached_tokens: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
+                model_name: row.get(14)?,
+                estimated_cost_usd: row.get(15)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -6848,7 +6879,7 @@ fn query_export_sessions(
     let (where_clause, params) = build_export_where(query, "started_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(
-        "SELECT id, pane_id, agent_type, session_id, external_id,
+        "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
                 started_at, ended_at, end_reason,
                 total_tokens, input_tokens, output_tokens, cached_tokens, reasoning_tokens,
                 model_name, estimated_cost_usd
@@ -6881,16 +6912,20 @@ fn query_export_sessions(
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
                 external_id: row.get(4)?,
-                started_at: row.get(5)?,
-                ended_at: row.get(6)?,
-                end_reason: row.get(7)?,
-                total_tokens: row.get(8)?,
-                input_tokens: row.get(9)?,
-                output_tokens: row.get(10)?,
-                cached_tokens: row.get(11)?,
-                reasoning_tokens: row.get(12)?,
-                model_name: row.get(13)?,
-                estimated_cost_usd: row.get(14)?,
+                external_meta: row
+                    .get::<_, Option<String>>(5)?
+                    .as_ref()
+                    .and_then(|value| serde_json::from_str(value).ok()),
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                end_reason: row.get(8)?,
+                total_tokens: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                cached_tokens: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
+                model_name: row.get(14)?,
+                estimated_cost_usd: row.get(15)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -8393,6 +8428,7 @@ mod tests {
             agent_type: "claude_code".to_string(),
             session_id: Some("sess-123".to_string()),
             external_id: Some("ext-456".to_string()),
+            external_meta: None,
             started_at: now_ms,
             ended_at: None,
             end_reason: None,

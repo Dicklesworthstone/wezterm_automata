@@ -15,7 +15,7 @@
 //! - Deterministic step logic testing
 //! - Shared runner across agent-specific workflows
 
-use crate::policy::{InjectionResult, PaneCapabilities};
+use crate::policy::{InjectionResult, PaneCapabilities, Redactor};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
     CodexSummaryWaitResult, PaneTextSource, WaitOptions, elapsed_ms, stable_hash, tail_text,
@@ -882,6 +882,27 @@ impl WorkflowStep {
 // Workflow Context
 // ============================================================================
 
+/// Cached pane metadata for workflow execution.
+#[derive(Debug, Clone, Default)]
+pub struct PaneMetadata {
+    /// Domain name (e.g., local, SSH:host)
+    pub domain: Option<String>,
+    /// Pane title
+    pub title: Option<String>,
+    /// Current working directory
+    pub cwd: Option<String>,
+}
+
+impl PaneMetadata {
+    fn from_record(record: &crate::storage::PaneRecord) -> Self {
+        Self {
+            domain: Some(record.domain.clone()),
+            title: record.title.clone(),
+            cwd: record.cwd.clone(),
+        }
+    }
+}
+
 /// Configuration for a workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowConfig {
@@ -917,6 +938,8 @@ pub struct WorkflowContext {
     storage: Arc<StorageHandle>,
     /// Target pane ID for this workflow
     pane_id: u64,
+    /// Cached pane metadata for deterministic prompt selection
+    pane_meta: PaneMetadata,
     /// Current pane capabilities snapshot
     capabilities: PaneCapabilities,
     /// The event/detection that triggered this workflow (JSON)
@@ -943,6 +966,7 @@ impl WorkflowContext {
         Self {
             storage,
             pane_id,
+            pane_meta: PaneMetadata::default(),
             capabilities,
             trigger: None,
             config: WorkflowConfig::default(),
@@ -974,6 +998,17 @@ impl WorkflowContext {
     pub fn with_config(mut self, config: WorkflowConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Set cached pane metadata for prompt selection.
+    pub fn set_pane_meta(&mut self, meta: PaneMetadata) {
+        self.pane_meta = meta;
+    }
+
+    /// Get cached pane metadata.
+    #[must_use]
+    pub fn pane_meta(&self) -> &PaneMetadata {
+        &self.pane_meta
     }
 
     /// Get the storage handle
@@ -3407,6 +3442,10 @@ impl WorkflowRunner {
         )
         .with_injector(Arc::clone(&self.injector));
 
+        if let Ok(Some(record)) = self.storage.get_pane(pane_id).await {
+            ctx.set_pane_meta(PaneMetadata::from_record(&record));
+        }
+
         // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
         if let Some(plan) = workflow.to_action_plan(&ctx, execution_id) {
             tracing::info!(
@@ -4827,16 +4866,78 @@ pub struct AbortResult {
 /// - Agent-specific (matching each agent's communication style)
 pub mod compaction_prompts {
     /// Prompt for Claude Code agents.
-    pub const CLAUDE_CODE: &str = "Reread AGENTS.md so it's still fresh in your mind.\n";
+    pub const CLAUDE_CODE: &str = crate::config::DEFAULT_COMPACTION_PROMPT_CLAUDE_CODE;
 
     /// Prompt for Codex CLI agents.
-    pub const CODEX: &str = "Please re-read AGENTS.md and any key project context files.\n";
+    pub const CODEX: &str = crate::config::DEFAULT_COMPACTION_PROMPT_CODEX;
 
     /// Prompt for Gemini CLI agents.
-    pub const GEMINI: &str = "Please re-examine AGENTS.md and project context.\n";
+    pub const GEMINI: &str = crate::config::DEFAULT_COMPACTION_PROMPT_GEMINI;
 
     /// Default prompt for unknown agents.
-    pub const UNKNOWN: &str = "Please review the project context files (AGENTS.md, README.md).\n";
+    pub const UNKNOWN: &str = crate::config::DEFAULT_COMPACTION_PROMPT_UNKNOWN;
+}
+
+#[derive(Debug, Clone)]
+struct PromptRenderContext {
+    pane_id: u64,
+    agent_type: crate::patterns::AgentType,
+    pane_domain: Option<String>,
+    pane_title: Option<String>,
+    pane_cwd: Option<String>,
+}
+
+impl PromptRenderContext {
+    fn from_context(ctx: &WorkflowContext) -> Self {
+        let agent_type = HandleCompaction::agent_type_from_trigger(ctx);
+        let meta = ctx.pane_meta();
+        Self {
+            pane_id: ctx.pane_id(),
+            agent_type,
+            pane_domain: meta.domain.clone(),
+            pane_title: meta.title.clone(),
+            pane_cwd: meta.cwd.clone(),
+        }
+    }
+}
+
+fn render_compaction_prompt(
+    template: &str,
+    ctx: &PromptRenderContext,
+    config: &crate::config::CompactionPromptConfig,
+) -> String {
+    let redactor = Redactor::new();
+    let max_prompt_len = config.max_prompt_len as usize;
+    let max_snippet_len = config.max_snippet_len as usize;
+
+    let mut rendered = template.to_string();
+    let replacements = [
+        ("agent_type", ctx.agent_type.to_string()),
+        ("pane_id", ctx.pane_id.to_string()),
+        ("pane_domain", ctx.pane_domain.clone().unwrap_or_default()),
+        ("pane_title", ctx.pane_title.clone().unwrap_or_default()),
+        ("pane_cwd", ctx.pane_cwd.clone().unwrap_or_default()),
+    ];
+
+    for (key, value) in replacements {
+        let token = format!("{{{{{key}}}}}");
+        if rendered.contains(&token) {
+            let redacted = redactor.redact(&value);
+            let clipped = truncate_to_len(&redacted, max_snippet_len);
+            rendered = rendered.replace(&token, &clipped);
+        }
+    }
+
+    let redacted = redactor.redact(&rendered);
+    truncate_to_len(&redacted, max_prompt_len)
+}
+
+fn truncate_to_len(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        return value.to_string();
+    }
+
+    value.chars().take(max_len).collect()
 }
 
 #[derive(Debug)]
@@ -4879,6 +4980,8 @@ pub struct HandleCompaction {
     pub stabilization_ms: u64,
     /// Timeout for the idle wait condition.
     pub idle_timeout_ms: u64,
+    /// Prompt templates and bounds for compaction prompts.
+    pub prompt_config: crate::config::CompactionPromptConfig,
 }
 
 impl Default for HandleCompaction {
@@ -4886,6 +4989,7 @@ impl Default for HandleCompaction {
         Self {
             stabilization_ms: 2000,
             idle_timeout_ms: 10_000,
+            prompt_config: crate::config::CompactionPromptConfig::default(),
         }
     }
 }
@@ -4911,16 +5015,43 @@ impl HandleCompaction {
         self
     }
 
-    /// Get the agent-specific prompt based on agent type from trigger detection.
-    fn get_prompt_for_agent(ctx: &WorkflowContext) -> &'static str {
-        let agent_type = Self::agent_type_from_trigger(ctx);
+    /// Create with custom compaction prompt configuration.
+    #[must_use]
+    pub fn with_prompt_config(
+        mut self,
+        prompt_config: crate::config::CompactionPromptConfig,
+    ) -> Self {
+        self.prompt_config = prompt_config;
+        self
+    }
 
-        match agent_type {
-            crate::patterns::AgentType::ClaudeCode => compaction_prompts::CLAUDE_CODE,
-            crate::patterns::AgentType::Codex => compaction_prompts::CODEX,
-            crate::patterns::AgentType::Gemini => compaction_prompts::GEMINI,
-            _ => compaction_prompts::UNKNOWN,
+    /// Get the agent-specific prompt based on agent type from trigger detection.
+    fn resolve_prompt(&self, ctx: &WorkflowContext) -> String {
+        let render_ctx = PromptRenderContext::from_context(ctx);
+        let template = self.select_prompt_template(&render_ctx);
+        render_compaction_prompt(template, &render_ctx, &self.prompt_config)
+    }
+
+    fn select_prompt_template<'a>(&'a self, ctx: &PromptRenderContext) -> &'a str {
+        if let Some(prompt) = self.prompt_config.by_pane.get(&ctx.pane_id) {
+            return prompt;
         }
+
+        let domain = ctx.pane_domain.as_deref().unwrap_or_default();
+        let title = ctx.pane_title.as_deref().unwrap_or_default();
+        let cwd = ctx.pane_cwd.as_deref().unwrap_or_default();
+        for override_item in &self.prompt_config.by_project {
+            if override_item.rule.matches(domain, title, cwd) {
+                return &override_item.prompt;
+            }
+        }
+
+        let agent_key = ctx.agent_type.to_string();
+        if let Some(prompt) = self.prompt_config.by_agent.get(&agent_key) {
+            return prompt;
+        }
+
+        &self.prompt_config.default
     }
 
     /// Extract agent type from trigger context, if available.
@@ -5066,7 +5197,7 @@ impl Workflow for HandleCompaction {
     ) -> Option<crate::plan::ActionPlan> {
         let pane_id = ctx.pane_id();
         let workspace_id = ctx.workspace_id().unwrap_or("default");
-        let prompt = Self::get_prompt_for_agent(ctx);
+        let prompt = self.resolve_prompt(ctx);
 
         let check_guards = crate::plan::StepPlan::new(
             1,
@@ -5096,7 +5227,7 @@ impl Workflow for HandleCompaction {
             3,
             crate::plan::StepAction::SendText {
                 pane_id,
-                text: prompt.to_string(),
+                text: prompt,
                 paste_mode: None,
             },
             "Send agent-specific context refresh prompt",
@@ -5149,7 +5280,7 @@ impl Workflow for HandleCompaction {
 
         // For step 2: capture prompt and injector availability
         let prompt = if step_idx == 2 {
-            Some(Self::get_prompt_for_agent(ctx))
+            Some(self.resolve_prompt(ctx))
         } else {
             None
         };
@@ -5239,7 +5370,7 @@ impl Workflow for HandleCompaction {
                 // Step 2: Send agent-specific prompt
                 // The runner will handle the actual text injection via policy-gated injector.
                 2 => {
-                    let prompt = prompt.unwrap_or(compaction_prompts::UNKNOWN);
+                    let prompt = prompt.unwrap_or_else(|| compaction_prompts::UNKNOWN.to_string());
 
                     tracing::info!(
                         pane_id,
@@ -9092,6 +9223,107 @@ mod tests {
                 agent_type
             );
         }
+    }
+
+    #[test]
+    fn handle_compaction_prompt_precedence() {
+        use crate::config::{CompactionPromptOverride, PaneFilterRule};
+        use serde_json::json;
+
+        let mut config = crate::config::CompactionPromptConfig::default();
+        config.default = "default".to_string();
+        config
+            .by_agent
+            .insert("codex".to_string(), "agent".to_string());
+        config.by_pane.insert(7, "pane".to_string());
+        config.by_project.push(CompactionPromptOverride {
+            rule: PaneFilterRule::new("project_rule").with_cwd("/repo"),
+            prompt: "project".to_string(),
+        });
+
+        let workflow = HandleCompaction::new().with_prompt_config(config);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("prec.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 7, PaneCapabilities::default(), "exec-prec")
+                    .with_trigger(json!({"agent_type": "codex"}));
+            ctx.set_pane_meta(PaneMetadata {
+                cwd: Some("/repo".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(workflow.resolve_prompt(&ctx), "pane");
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("prec2.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 8, PaneCapabilities::default(), "exec-prec2")
+                    .with_trigger(json!({"agent_type": "codex"}));
+            ctx.set_pane_meta(PaneMetadata {
+                cwd: Some("/repo".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(workflow.resolve_prompt(&ctx), "project");
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("prec3.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.unwrap());
+            let ctx = WorkflowContext::new(storage, 9, PaneCapabilities::default(), "exec-prec3")
+                .with_trigger(json!({"agent_type": "codex"}));
+            assert_eq!(workflow.resolve_prompt(&ctx), "agent");
+        });
+    }
+
+    #[test]
+    fn handle_compaction_prompt_bounds_and_redaction() {
+        use serde_json::json;
+
+        let mut config = crate::config::CompactionPromptConfig::default();
+        config.max_prompt_len = 25;
+        config.max_snippet_len = 16;
+        config.by_agent.clear();
+        config.default = "Prompt {{pane_cwd}}".to_string();
+
+        let workflow = HandleCompaction::new().with_prompt_config(config);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("bounds.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 5, PaneCapabilities::default(), "exec-bounds")
+                    .with_trigger(json!({"agent_type": "codex"}));
+            ctx.set_pane_meta(PaneMetadata {
+                cwd: Some("sk-abc123456789012345678901234567890123456789012345678901".to_string()),
+                ..Default::default()
+            });
+
+            let prompt = workflow.resolve_prompt(&ctx);
+            assert!(prompt.len() <= 25);
+            assert!(!prompt.contains("sk-abc"));
+            assert!(prompt.contains("[REDACTED]"));
+        });
     }
 
     /// Test: Workflow execution step 0 (check_guards) with PromptActive state
