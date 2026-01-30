@@ -61,7 +61,21 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          SOURCE_DATE_EPOCH: "0"
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke test binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || startsWith(matrix.target, 'aarch64-apple') || startsWith(matrix.target, 'x86_64-apple')
+        run: |
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          echo "=== wa --version ==="
+          "$BINARY" --version
+          echo "=== wa version --full ==="
+          "$BINARY" version --full
+          echo "=== wa --help ==="
+          "$BINARY" --help
+          echo "=== All smoke tests passed ==="
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
@@ -113,6 +127,15 @@ jobs:
 
       - name: List artifacts
         run: ls -la dist/
+
+      - name: Create combined checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          echo "## Release Checksums" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - uses: softprops/action-gh-release@v2
         with:

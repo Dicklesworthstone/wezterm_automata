@@ -338,6 +338,7 @@ SCENARIO_REGISTRY=(
     "capture_search:Validate ingest pipeline and FTS search"
     "natural_language:Validate event summaries and wa why output"
     "compaction_workflow:Validate pattern detection and workflow execution"
+    "unhandled_event_lifecycle:Validate unhandled event lifecycle and dedupe handling"
     "policy_denial:Validate safety gates block sends to protected panes"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
@@ -935,6 +936,211 @@ run_scenario_compaction_workflow() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_compaction_workflow
+
+    return $result
+}
+
+run_scenario_unhandled_event_lifecycle() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-unhandled-XXXXXX)
+    local wa_pid=""
+    local pane_id=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-45}
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy baseline config for workflow testing
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    # Cleanup function
+    cleanup_unhandled_event_lifecycle() {
+        log_verbose "Cleaning up unhandled_event_lifecycle scenario"
+        # Kill wa watch if running
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        # Close dummy pane if it exists
+        if [[ -n "$pane_id" ]]; then
+            log_verbose "Closing dummy agent pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        # Copy artifacts before cleanup
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_unhandled_event_lifecycle EXIT
+
+    # Step 1: Start wa watch with auto-handle
+    log_info "Step 1: Starting wa watch with --auto-handle..."
+    "$WA_BINARY" watch --foreground --auto-handle \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 2: Spawn dummy agent pane that emits compaction marker twice
+    log_info "Step 2: Spawning dummy agent pane..."
+    local agent_script="$PROJECT_ROOT/fixtures/e2e/dummy_agent.sh"
+    if [[ ! -x "$agent_script" ]]; then
+        log_fail "Dummy agent script not found or not executable: $agent_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$agent_script" 1 2 1 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn dummy agent pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned agent pane: $pane_id"
+    echo "agent_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 3: Wait for pane to be observed
+    log_info "Step 3: Waiting for pane to be observed..."
+    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+
+    # Step 4: Wait for unhandled compaction event (dedupe/cooldown)
+    log_info "Step 4: Waiting for unhandled compaction event..."
+    local unhandled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    if ! wait_for_condition "unhandled compaction event detected" "$unhandled_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for unhandled compaction event"
+        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Unhandled compaction event detected"
+    fi
+
+    # Step 5: Capture unhandled events and assert dedupe
+    log_info "Step 5: Capturing unhandled events..."
+    "$WA_BINARY" events -f json --unhandled --rule-id "codex:compaction" --limit 20 \
+        > "$scenario_dir/events_unhandled_pre.json" 2>&1 || true
+
+    local unhandled_count
+    unhandled_count=$(jq 'length' "$scenario_dir/events_unhandled_pre.json" 2>/dev/null || echo "0")
+    echo "unhandled_count: $unhandled_count" >> "$scenario_dir/scenario.log"
+
+    if [[ "$unhandled_count" -eq 1 ]]; then
+        log_pass "Deduped unhandled event count is 1"
+    else
+        log_fail "Expected 1 unhandled event, found $unhandled_count"
+        result=1
+    fi
+
+    # Step 6: Capture recommended workflow preview (avoid hard-coding)
+    log_info "Step 6: Capturing recommended workflow preview..."
+    "$WA_BINARY" robot events --unhandled --rule-id "codex:compaction" --limit 5 --would-handle --dry-run \
+        > "$scenario_dir/robot_events_preview.json" 2>&1 || true
+    local recommended_workflow
+    recommended_workflow=$(jq -r '.data.events[0].would_handle_with.workflow // empty' \
+        "$scenario_dir/robot_events_preview.json" 2>/dev/null || echo "")
+
+    if [[ -n "$recommended_workflow" ]]; then
+        log_pass "Recommended workflow: $recommended_workflow"
+        echo "recommended_workflow: $recommended_workflow" >> "$scenario_dir/scenario.log"
+    else
+        log_warn "No recommended workflow found in preview"
+    fi
+
+    # Step 7: Wait for event to be handled (unhandled list empty)
+    log_info "Step 7: Waiting for event to be handled..."
+    local handled_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"codex:compaction\" --limit 20 2>/dev/null | jq -e 'length == 0' >/dev/null 2>&1"
+    if ! wait_for_condition "compaction event handled" "$handled_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for event to be handled"
+        result=1
+    else
+        log_pass "Unhandled list cleared"
+    fi
+
+    # Step 8: Capture handled events and audit trail slice
+    log_info "Step 8: Capturing handled events and audit trail..."
+    "$WA_BINARY" events -f json --rule-id "codex:compaction" --limit 20 \
+        > "$scenario_dir/events_post.json" 2>&1 || true
+
+    local handled_count
+    handled_count=$(jq '[.[] | select(.handled_at != null)] | length' \
+        "$scenario_dir/events_post.json" 2>/dev/null || echo "0")
+    echo "handled_count: $handled_count" >> "$scenario_dir/scenario.log"
+
+    if [[ "$handled_count" -ge 1 ]]; then
+        log_pass "Event marked handled"
+    else
+        log_fail "No handled compaction events found"
+        result=1
+    fi
+
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -header -csv \
+            "SELECT action_kind, actor_kind, result FROM audit_actions ORDER BY id DESC LIMIT 50;" \
+            > "$scenario_dir/audit_actions.csv" 2>/dev/null || true
+        if grep -q "workflow_start" "$scenario_dir/audit_actions.csv" 2>/dev/null; then
+            log_pass "Audit trail shows workflow activity"
+        else
+            log_warn "Workflow audit action not found in recent audit slice"
+        fi
+    else
+        log_warn "Database file not found at $db_path"
+    fi
+
+    # Step 9: Check wa watch logs for workflow activity
+    log_info "Step 9: Checking wa watch logs for workflow activity..."
+    if [[ -n "$recommended_workflow" ]]; then
+        if grep -qi "$recommended_workflow" "$scenario_dir/wa_watch.log" 2>/dev/null; then
+            log_pass "Workflow activity found in logs"
+        else
+            log_warn "No explicit workflow name in logs (may be normal)"
+        fi
+    else
+        if grep -qi "workflow" "$scenario_dir/wa_watch.log" 2>/dev/null; then
+            log_pass "Workflow activity found in logs"
+        else
+            log_warn "No obvious workflow activity in logs"
+        fi
+    fi
+
+    # Step 10: Stop wa watch gracefully
+    log_info "Step 10: Stopping wa watch..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+    log_verbose "wa watch stopped"
+
+    trap - EXIT
+    cleanup_unhandled_event_lifecycle
 
     return $result
 }
@@ -2740,6 +2946,9 @@ run_scenario() {
                 ;;
             compaction_workflow)
                 run_scenario_compaction_workflow "$scenario_dir" || result=$?
+                ;;
+            unhandled_event_lifecycle)
+                run_scenario_unhandled_event_lifecycle "$scenario_dir" || result=$?
                 ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?

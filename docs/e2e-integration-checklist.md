@@ -25,6 +25,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - capture_search
 - natural_language
 - compaction_workflow
+- unhandled_event_lifecycle
 - policy_denial
 - graceful_shutdown
 - pane_exclude_filter
@@ -80,7 +81,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [ ] Artifacts: parsed resume/session info (redacted), next-step plan output. Scenario(s): none
 
 #### Compaction (wa-nu4.1.2)
-- [x] E2E: compaction detected and handled exactly once per event (dedupe/cooldown). Scenario(s): compaction_workflow (partial; may need explicit dedupe assertion)
+- [x] E2E: compaction detected and handled exactly once per event (dedupe/cooldown). Scenario(s): unhandled_event_lifecycle
 - [ ] E2E: injected context is verified (echo/marker). Scenario(s): compaction_workflow (partial; verify marker explicitly)
 - [ ] Artifacts: detection evidence, injection payload preview (redacted), verification tail hash. Scenario(s): none
 

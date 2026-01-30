@@ -108,3 +108,58 @@ For each dependency (completed; tests need rerun once locks clear):
 - [x] Report dependency update progress + remaining items
 - [x] Report bead status + next actions
 - [x] Keep TODO updated as tasks complete
+
+---
+
+# Agent TODO (BoldRiver)
+
+## 0) Session Bootstrap & Safety
+- [x] Read `AGENTS.md` fully
+- [x] Read `README.md` fully
+- [x] Start Agent Mail session (`macro_start_session`)
+- [x] Check inbox (`resource://inbox/BoldRiver`)
+- [x] List active agents (`resource://agents/data-projects-wezterm-automata`)
+- [x] Send intro to active agents (WildBrook, MagentaCove, RedFalcon, TurquoiseCave, RubyFox)
+
+## 1) Beads / BV Triage
+- [x] Run `bv --robot-triage`
+- [x] Run `br ready --json` to find actionable tasks
+- [x] Select bead `wa-4vx.10.13` (E2E unhandled→handled lifecycle)
+- [x] Mark `wa-4vx.10.13` as `in_progress`
+- [x] Announce start in Agent Mail thread `wa-4vx.10.13`
+
+## 2) File Reservations (Agent Mail)
+- [x] Reserve `scripts/e2e_test.sh`
+- [x] Reserve `fixtures/e2e/dummy_agent.sh`
+- [x] Reserve `docs/e2e-integration-checklist.md`
+
+## 3) Implement wa-4vx.10.13 (E2E unhandled→handled lifecycle)
+### 3.1 Scenario Definition (scripts/e2e_test.sh)
+- [x] Add new scenario function `run_scenario_unhandled_event_lifecycle`
+- [x] Add scenario to `SCENARIO_REGISTRY` with description
+- [x] Add scenario dispatch case in `run_scenario`
+- [x] Ensure scenario uses baseline config (`fixtures/e2e/config_baseline.toml`)
+- [x] Emit two compaction markers (dedupe/cooldown assertion)
+- [x] Use `wa events -f json --unhandled` to assert exactly 1 relevant event
+- [x] Use `wa robot events --unhandled --would-handle --dry-run` to fetch recommended workflow
+- [x] Confirm auto-handle workflow clears unhandled event
+- [x] Capture artifacts: events pre/post JSON, audit slice, workflow logs, pane text
+
+### 3.2 Dummy Agent Fixture (fixtures/e2e/dummy_agent.sh)
+- [x] Add optional args for repeat compaction markers (count + interval)
+- [x] Preserve default behavior for existing scenarios
+
+### 3.3 Checklist Update (docs/e2e-integration-checklist.md)
+- [x] Add new scenario reference for unhandled→handled lifecycle
+- [x] Update dedupe/cooldown row to reference new scenario (remove “partial” note if appropriate)
+
+## 4) Local Verification (required after substantive changes)
+- [ ] Run `cargo fmt --check` (failed; formatting diffs in wa-core files not touched)
+- [x] Run `cargo check --all-targets`
+- [ ] Run `cargo clippy --all-targets -- -D warnings` (failed: clippy::needless_raw_string_hashes in wa-core/desktop_notify.rs)
+- [ ] Run targeted E2E (optional if too heavy): `./scripts/e2e_test.sh --case unhandled_event_lifecycle`
+
+## 5) Wrap-up & Coordination
+- [ ] Post progress update to Agent Mail thread `wa-4vx.10.13` with files touched
+- [ ] Release file reservations
+- [ ] Mark bead `wa-4vx.10.13` closed with reason + tests run
