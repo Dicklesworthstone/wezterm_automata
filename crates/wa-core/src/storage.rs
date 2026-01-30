@@ -13878,3 +13878,264 @@ mod reservation_tests {
         assert_eq!(deserialized.status, r.status);
     }
 }
+
+// =============================================================================
+// Timeline and Correlation Detection Tests (wa-6sk.2)
+// =============================================================================
+
+#[cfg(test)]
+mod timeline_correlation_tests {
+    use super::*;
+
+    fn create_test_event(id: i64, ts: i64, pane_id: u64, rule_id: &str, event_type: &str) -> TimelineEvent {
+        TimelineEvent {
+            id,
+            timestamp: ts,
+            pane_info: PaneInfo {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                title: None,
+                cwd: None,
+                agent_type: None,
+            },
+            rule_id: rule_id.to_string(),
+            event_type: event_type.to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            handled: None,
+            correlations: Vec::new(),
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn temporal_correlation_detects_close_events() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 2000, 2, "rule_b", "error"), // Different pane, within 5s
+            create_test_event(3, 3000, 1, "rule_c", "warning"),
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        // Should find temporal correlation between events in different panes
+        let temporal = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .collect::<Vec<_>>();
+
+        assert!(!temporal.is_empty(), "Should detect temporal correlation");
+        assert!(
+            temporal.iter().any(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2)),
+            "Should correlate events 1 and 2"
+        );
+    }
+
+    #[test]
+    fn temporal_correlation_ignores_same_pane() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 2000, 1, "rule_b", "error"), // Same pane
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        // Same pane events should not create temporal correlation
+        let temporal = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .collect::<Vec<_>>();
+
+        assert!(
+            temporal.is_empty() || !temporal.iter().any(|c| c.event_ids.len() > 1),
+            "Should not correlate same-pane events"
+        );
+    }
+
+    #[test]
+    fn temporal_correlation_respects_window() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 10000, 2, "rule_b", "error"), // 9 seconds apart, outside window
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        // Events too far apart should not correlate
+        let temporal = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Temporal)
+            .filter(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2))
+            .count();
+
+        assert_eq!(temporal, 0, "Events outside window should not correlate");
+    }
+
+    #[test]
+    fn workflow_group_correlation_links_handled_events() {
+        let mut event1 = create_test_event(1, 1000, 1, "rule_a", "error");
+        event1.handled = Some(HandledInfo {
+            handled_at: 2000,
+            workflow_id: Some("wf-123".to_string()),
+            status: "handled".to_string(),
+        });
+
+        let mut event2 = create_test_event(2, 1500, 2, "rule_b", "error");
+        event2.handled = Some(HandledInfo {
+            handled_at: 2100,
+            workflow_id: Some("wf-123".to_string()), // Same workflow ID
+            status: "handled".to_string(),
+        });
+
+        let event3 = create_test_event(3, 1200, 3, "rule_c", "warning");
+
+        let correlations = detect_correlations(&[event1, event2, event3]);
+
+        let workflow_corr = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::WorkflowGroup)
+            .collect::<Vec<_>>();
+
+        assert_eq!(workflow_corr.len(), 1, "Should find one workflow group");
+        assert!(
+            workflow_corr[0].event_ids.contains(&1) && workflow_corr[0].event_ids.contains(&2),
+            "Should link events with same workflow ID"
+        );
+        assert!(!workflow_corr[0].event_ids.contains(&3), "Should not include unrelated event");
+    }
+
+    #[test]
+    fn failover_correlation_detects_limit_then_session() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "usage_limit", "usage_limit"),
+            create_test_event(2, 30000, 2, "session_start", "session_start"), // Different pane, within 60s
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .collect::<Vec<_>>();
+
+        assert_eq!(failover.len(), 1, "Should detect failover correlation");
+        assert!(
+            failover[0].event_ids.contains(&1) && failover[0].event_ids.contains(&2),
+            "Should link usage_limit to session_start"
+        );
+    }
+
+    #[test]
+    fn failover_correlation_ignores_same_pane() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "usage_limit", "usage_limit"),
+            create_test_event(2, 30000, 1, "session_start", "session_start"), // Same pane
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+
+        assert_eq!(failover, 0, "Same-pane events should not be failover");
+    }
+
+    #[test]
+    fn failover_correlation_respects_60s_window() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "usage_limit", "usage_limit"),
+            create_test_event(2, 100000, 2, "session_start", "session_start"), // >60s apart
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let failover = correlations
+            .iter()
+            .filter(|c| c.correlation_type == CorrelationType::Failover)
+            .count();
+
+        assert_eq!(failover, 0, "Events >60s apart should not be failover");
+    }
+
+    #[test]
+    fn correlation_confidence_values() {
+        let mut event1 = create_test_event(1, 1000, 1, "rule_a", "error");
+        event1.handled = Some(HandledInfo {
+            handled_at: 2000,
+            workflow_id: Some("wf-1".to_string()),
+            status: "handled".to_string(),
+        });
+        let mut event2 = create_test_event(2, 1100, 2, "rule_b", "error");
+        event2.handled = Some(HandledInfo {
+            handled_at: 2100,
+            workflow_id: Some("wf-1".to_string()),
+            status: "handled".to_string(),
+        });
+
+        let correlations = detect_correlations(&[event1, event2]);
+
+        for corr in &correlations {
+            match corr.correlation_type {
+                CorrelationType::Temporal => {
+                    assert!(
+                        (corr.confidence - 0.6).abs() < 0.01,
+                        "Temporal confidence should be 0.6"
+                    );
+                }
+                CorrelationType::WorkflowGroup => {
+                    assert!(
+                        (corr.confidence - 0.95).abs() < 0.01,
+                        "WorkflowGroup confidence should be 0.95"
+                    );
+                }
+                CorrelationType::Failover => {
+                    assert!(
+                        (corr.confidence - 0.8).abs() < 0.01,
+                        "Failover confidence should be 0.8"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn empty_events_returns_empty_correlations() {
+        let correlations = detect_correlations(&[]);
+        assert!(correlations.is_empty());
+    }
+
+    #[test]
+    fn single_event_returns_empty_correlations() {
+        let events = vec![create_test_event(1, 1000, 1, "rule_a", "error")];
+        let correlations = detect_correlations(&events);
+        assert!(correlations.is_empty());
+    }
+
+    #[test]
+    fn correlation_ids_are_unique() {
+        let events = vec![
+            create_test_event(1, 1000, 1, "rule_a", "error"),
+            create_test_event(2, 2000, 2, "rule_b", "error"),
+            create_test_event(3, 3000, 3, "rule_c", "error"),
+            create_test_event(4, 4000, 4, "rule_d", "error"),
+        ];
+
+        let correlations = detect_correlations(&events);
+
+        let ids: std::collections::HashSet<_> = correlations.iter().map(|c| &c.id).collect();
+        assert_eq!(ids.len(), correlations.len(), "Correlation IDs should be unique");
+    }
+
+    #[test]
+    fn correlation_type_display() {
+        assert_eq!(CorrelationType::Failover.to_string(), "failover");
+        assert_eq!(CorrelationType::Cascade.to_string(), "cascade");
+        assert_eq!(CorrelationType::Temporal.to_string(), "temporal");
+        assert_eq!(CorrelationType::WorkflowGroup.to_string(), "workflow_group");
+        assert_eq!(CorrelationType::DedupeGroup.to_string(), "dedupe_group");
+    }
+}
