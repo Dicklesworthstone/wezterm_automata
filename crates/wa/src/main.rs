@@ -1332,6 +1332,10 @@ enum PrepareCommands {
         /// Text to send
         text: String,
 
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+
         /// Send character by character (no paste mode)
         #[arg(long)]
         no_paste: bool,
@@ -1370,6 +1374,10 @@ enum PrepareWorkflowCommands {
         /// Target pane ID
         #[arg(long, alias = "pane")]
         pane_id: u64,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
     },
 }
 
@@ -2252,6 +2260,33 @@ enum PreparedPlanParams {
         workflow_name: String,
         pane_id: u64,
     },
+}
+
+#[derive(serde::Serialize)]
+struct PrepareApprovalOutput {
+    code: String,
+    expires_at: i64,
+    expires_at_iso: String,
+}
+
+#[derive(serde::Serialize)]
+struct PrepareCommitHint {
+    command: String,
+}
+
+#[derive(serde::Serialize)]
+struct PrepareOutput {
+    plan_id: String,
+    plan_hash: String,
+    expires_at: i64,
+    expires_at_iso: String,
+    action_kind: String,
+    pane_id: Option<u64>,
+    requires_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<PrepareApprovalOutput>,
+    commit: PrepareCommitHint,
+    plan: wa_core::plan::ActionPlan,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3316,6 +3351,327 @@ fn build_send_dry_run_report(
     }
 
     ctx.take_report()
+}
+
+fn build_prepare_send_plan(
+    workspace_id: &str,
+    pane_id: u64,
+    text: &str,
+    no_paste: bool,
+    no_newline: bool,
+    wait_for: Option<&str>,
+    wait_for_regex: bool,
+    timeout_secs: u64,
+) -> wa_core::plan::ActionPlan {
+    use wa_core::plan::{ActionPlan, StepAction, StepPlan};
+
+    let send_step = StepPlan::new(
+        1,
+        StepAction::Custom {
+            action_type: "prepare.send_text".to_string(),
+            payload: serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "no_paste": no_paste,
+                "no_newline": no_newline,
+            }),
+        },
+        "Send text to pane",
+    )
+    .idempotent();
+
+    let mut builder = ActionPlan::builder(
+        format!("Send text to pane {pane_id}"),
+        workspace_id.to_string(),
+    )
+    .add_step(send_step)
+    .created_at(now_ms_i64());
+
+    if let Some(pattern) = wait_for {
+        let wait_step = StepPlan::new(
+            2,
+            StepAction::Custom {
+                action_type: "prepare.wait_for".to_string(),
+                payload: serde_json::json!({
+                    "pane_id": pane_id,
+                    "pattern": pattern,
+                    "is_regex": wait_for_regex,
+                    "timeout_ms": timeout_secs.saturating_mul(1000),
+                }),
+            },
+            "Wait for verification pattern",
+        );
+        builder = builder.add_step(wait_step);
+    }
+
+    builder.build()
+}
+
+fn redact_prepare_plan(plan: &wa_core::plan::ActionPlan) -> wa_core::plan::ActionPlan {
+    let mut redacted = plan.clone();
+    let redactor = wa_core::policy::Redactor::new();
+
+    for step in &mut redacted.steps {
+        if let wa_core::plan::StepAction::Custom {
+            action_type,
+            payload,
+        } = &mut step.action
+        {
+            if action_type == "prepare.send_text" {
+                redact_payload_field(payload, "text", &redactor);
+            } else if action_type == "prepare.wait_for" {
+                redact_payload_field(payload, "pattern", &redactor);
+            }
+        }
+    }
+
+    redacted
+}
+
+fn redact_payload_field(
+    payload: &mut serde_json::Value,
+    field: &str,
+    redactor: &wa_core::policy::Redactor,
+) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(value) = obj.get_mut(field) else {
+        return;
+    };
+    let Some(text) = value.as_str() else {
+        return;
+    };
+
+    let len = serde_json::Number::from(text.len() as u64);
+    let redacted = redactor.redact(text);
+    *value = serde_json::Value::String(redacted);
+    obj.insert(format!("{field}_len"), serde_json::Value::Number(len));
+}
+
+async fn generate_workflow_plan(
+    storage: &std::sync::Arc<wa_core::storage::StorageHandle>,
+    workflow: &std::sync::Arc<dyn wa_core::workflows::Workflow>,
+    workspace_id: &str,
+    pane_id: u64,
+    execution_id: &str,
+) -> wa_core::plan::ActionPlan {
+    use wa_core::workflows::{PaneMetadata, WorkflowContext, workflow_to_action_plan};
+
+    let mut ctx = WorkflowContext::new(
+        std::sync::Arc::clone(storage),
+        pane_id,
+        wa_core::policy::PaneCapabilities::default(),
+        execution_id,
+    );
+    if let Ok(Some(record)) = storage.get_pane(pane_id).await {
+        ctx.set_pane_meta(PaneMetadata {
+            domain: Some(record.domain),
+            title: record.title,
+            cwd: record.cwd,
+        });
+    }
+
+    if let Some(plan) = workflow.to_action_plan(&ctx, execution_id) {
+        plan
+    } else {
+        workflow_to_action_plan(workflow.as_ref(), workspace_id, pane_id, execution_id)
+    }
+}
+
+fn build_workflow_by_name(
+    name: &str,
+    config: &wa_core::config::Config,
+) -> Option<std::sync::Arc<dyn wa_core::workflows::Workflow>> {
+    use std::sync::Arc;
+    use wa_core::workflows::{HandleCompaction, Workflow};
+
+    let workflows: Vec<Arc<dyn Workflow>> = vec![
+        Arc::new(
+            HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
+        ),
+        Arc::new(wa_core::workflows::HandleUsageLimits::new()),
+        Arc::new(wa_core::workflows::HandleSessionEnd::new()),
+        Arc::new(wa_core::workflows::HandleAuthRequired::new()),
+        Arc::new(wa_core::workflows::HandleClaudeCodeLimits::new()),
+        Arc::new(wa_core::workflows::HandleGeminiQuota::new()),
+    ];
+
+    workflows.into_iter().find(|wf| wf.name() == name)
+}
+
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+fn resolve_prepare_output_format(format: &str) -> wa_core::output::OutputFormat {
+    use wa_core::output::{OutputFormat, detect_format};
+
+    match format.to_lowercase().as_str() {
+        "json" => OutputFormat::Json,
+        "plain" => OutputFormat::Plain,
+        "auto" => detect_format(),
+        _ => {
+            eprintln!("Error: Unknown output format '{format}'. Use plain or json.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn build_prepare_output(
+    plan: &wa_core::plan::ActionPlan,
+    plan_hash: &str,
+    expires_at: i64,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    approval_request: Option<&wa_core::policy::ApprovalRequest>,
+    commit_command: String,
+) -> PrepareOutput {
+    let approval = approval_request.map(|request| PrepareApprovalOutput {
+        code: request.allow_once_code.clone(),
+        expires_at: request.expires_at,
+        expires_at_iso: format_epoch_ms(request.expires_at),
+    });
+
+    PrepareOutput {
+        plan_id: plan.plan_id.to_string(),
+        plan_hash: plan_hash.to_string(),
+        expires_at,
+        expires_at_iso: format_epoch_ms(expires_at),
+        action_kind: action_kind.to_string(),
+        pane_id,
+        requires_approval: approval_request.is_some(),
+        approval,
+        commit: PrepareCommitHint {
+            command: commit_command,
+        },
+        plan: plan.clone(),
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum CommitValidationError {
+    NotFound,
+    WorkspaceMismatch,
+    Expired,
+    Consumed,
+    MissingParams,
+    ActionKindMismatch,
+    HashMismatch,
+    PaneMismatch,
+}
+
+fn require_prepared_plan(
+    record: Option<wa_core::storage::PreparedPlanRecord>,
+) -> Result<wa_core::storage::PreparedPlanRecord, CommitValidationError> {
+    record.ok_or(CommitValidationError::NotFound)
+}
+
+fn validate_prepared_plan_record(
+    record: &wa_core::storage::PreparedPlanRecord,
+    workspace_id: &str,
+    now: i64,
+) -> Result<(), CommitValidationError> {
+    if record.workspace_id != workspace_id {
+        return Err(CommitValidationError::WorkspaceMismatch);
+    }
+    if record.expires_at < now {
+        return Err(CommitValidationError::Expired);
+    }
+    if record.consumed_at.is_some() {
+        return Err(CommitValidationError::Consumed);
+    }
+    Ok(())
+}
+
+fn parse_prepared_plan_params(
+    record: &wa_core::storage::PreparedPlanRecord,
+) -> Result<PreparedPlanParams, CommitValidationError> {
+    record
+        .params_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<PreparedPlanParams>(json).ok())
+        .ok_or(CommitValidationError::MissingParams)
+}
+
+fn ensure_action_kind(
+    record: &wa_core::storage::PreparedPlanRecord,
+    expected: &str,
+) -> Result<(), CommitValidationError> {
+    if record.action_kind != expected {
+        return Err(CommitValidationError::ActionKindMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_plan_hash(expected: &str, actual: &str) -> Result<(), CommitValidationError> {
+    if expected != actual {
+        return Err(CommitValidationError::HashMismatch);
+    }
+    Ok(())
+}
+
+fn ensure_pane_uuid_matches(
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> Result<(), CommitValidationError> {
+    if let Some(expected) = expected {
+        if actual != Some(expected) {
+            return Err(CommitValidationError::PaneMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn commit_validation_message(
+    err: CommitValidationError,
+    plan_id: &str,
+) -> (String, Option<String>) {
+    match err {
+        CommitValidationError::NotFound => (
+            format!("Error: Plan not found: {plan_id} (E_PLAN_NOT_FOUND)"),
+            Some("Hint: Re-run `wa prepare ...` and try again.".to_string()),
+        ),
+        CommitValidationError::WorkspaceMismatch => (
+            "Error: Plan workspace mismatch (E_PLAN_WORKSPACE_MISMATCH).".to_string(),
+            None,
+        ),
+        CommitValidationError::Expired => (
+            "Error: Plan expired (E_PLAN_EXPIRED).".to_string(),
+            Some("Hint: Re-run `wa prepare ...` and try again.".to_string()),
+        ),
+        CommitValidationError::Consumed => (
+            "Error: Plan already consumed (E_PLAN_CONSUMED).".to_string(),
+            None,
+        ),
+        CommitValidationError::MissingParams => (
+            "Error: Prepared plan params missing or invalid.".to_string(),
+            None,
+        ),
+        CommitValidationError::ActionKindMismatch => (
+            "Error: Prepared plan action kind mismatch.".to_string(),
+            None,
+        ),
+        CommitValidationError::HashMismatch => (
+            "Error: Plan hash mismatch (E_PLAN_HASH_MISMATCH).".to_string(),
+            Some("Hint: Re-run `wa prepare ...` and try again.".to_string()),
+        ),
+        CommitValidationError::PaneMismatch => (
+            "Error: Pane identity changed (E_PLAN_PANE_MISMATCH).".to_string(),
+            Some("Hint: Re-run `wa prepare ...` for the current pane.".to_string()),
+        ),
+    }
+}
+
+fn exit_on_commit_validation_error(err: CommitValidationError, plan_id: &str) -> ! {
+    let (message, hint) = commit_validation_message(err, plan_id);
+    eprintln!("{message}");
+    if let Some(hint) = hint {
+        eprintln!("{hint}");
+    }
+    std::process::exit(1);
 }
 
 fn format_send_result_human(
@@ -8711,6 +9067,866 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Prepare { command }) => match command {
+            PrepareCommands::Send {
+                pane_id,
+                text,
+                format,
+                no_paste,
+                no_newline,
+                wait_for,
+                timeout_secs,
+                wait_for_regex,
+            } => {
+                let output_format = resolve_prepare_output_format(&format);
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: Failed to open database: {e}");
+                        eprintln!("Is the watcher running? Try: wa watch --foreground");
+                        std::process::exit(1);
+                    }
+                };
+
+                let workspace_id = layout.root.to_string_lossy().to_string();
+                let now = now_ms_i64();
+
+                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let pane_info = match wezterm.get_pane(pane_id).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        eprintln!("Error: Failed to query pane {pane_id}: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let domain = pane_info.inferred_domain();
+
+                let resolution = resolve_pane_capabilities(
+                    pane_id,
+                    Some(&storage),
+                    Some(layout.ipc_socket_path.as_path()),
+                )
+                .await;
+                let capabilities = resolution.capabilities;
+
+                let mut engine = wa_core::policy::PolicyEngine::new(
+                    config.safety.rate_limit_per_pane,
+                    config.safety.rate_limit_global,
+                    config.safety.require_prompt_active,
+                )
+                .with_command_gate_config(config.safety.command_gate.clone())
+                .with_policy_rules(config.safety.rules.clone());
+
+                let summary = engine.redact_secrets(&text);
+                let mut input = wa_core::policy::PolicyInput::new(
+                    wa_core::policy::ActionKind::SendText,
+                    wa_core::policy::ActorKind::Human,
+                )
+                .with_pane(pane_id)
+                .with_domain(domain)
+                .with_capabilities(capabilities)
+                .with_text_summary(&summary)
+                .with_command_text(&text);
+
+                if let Some(title) = &pane_info.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &pane_info.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+
+                let decision = engine.authorize(&input);
+                let (decision, approval_request) = if decision.requires_approval() {
+                    let store = wa_core::approval::ApprovalStore::new(
+                        &storage,
+                        config.safety.approval.clone(),
+                        workspace_id.clone(),
+                    );
+                    let decision = match store
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
+                        .await
+                    {
+                        Ok(updated) => updated,
+                        Err(e) => {
+                            eprintln!("Error: Failed to issue approval token: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let approval_request = decision.approval_request().cloned();
+                    (decision, approval_request)
+                } else {
+                    (decision, None)
+                };
+                if decision.is_denied() {
+                    let reason = decision.reason().unwrap_or("denied by policy");
+                    eprintln!("Error: Action denied by policy: {reason}");
+                    std::process::exit(1);
+                }
+
+                let plan = build_prepare_send_plan(
+                    &workspace_id,
+                    pane_id,
+                    &text,
+                    no_paste,
+                    no_newline,
+                    wait_for.as_deref(),
+                    wait_for_regex,
+                    timeout_secs,
+                );
+                let plan_hash = plan.compute_hash();
+                let plan_id = plan.plan_id.to_string();
+                let redacted_plan = redact_prepare_plan(&plan);
+                let plan_json =
+                    serde_json::to_string(&redacted_plan).unwrap_or_else(|_| "{}".to_string());
+                let params = PreparedPlanParams::SendText {
+                    pane_id,
+                    no_paste,
+                    no_newline,
+                    wait_for: wait_for.clone(),
+                    wait_for_regex,
+                    timeout_secs,
+                };
+                let params_json = serde_json::to_string(&params).ok();
+                let pane_uuid = storage
+                    .get_pane(pane_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.pane_uuid);
+
+                let expires_at =
+                    now.saturating_add(config.safety.approval.token_expiry_secs as i64 * 1000);
+
+                let record = wa_core::storage::PreparedPlanRecord {
+                    plan_id: plan_id.clone(),
+                    plan_hash: plan_hash.clone(),
+                    workspace_id: workspace_id.clone(),
+                    action_kind: wa_core::policy::ActionKind::SendText.as_str().to_string(),
+                    pane_id: Some(pane_id),
+                    pane_uuid,
+                    params_json,
+                    plan_json,
+                    requires_approval: decision.requires_approval(),
+                    created_at: now,
+                    expires_at,
+                    consumed_at: None,
+                };
+
+                if let Err(e) = storage.insert_prepared_plan(record).await {
+                    eprintln!("Error: Failed to store prepared plan: {e}");
+                    std::process::exit(1);
+                }
+
+                let commit_command = if let Some(approval) = &approval_request {
+                    format!(
+                        "wa commit {plan_id} --approval-code {} --text <TEXT>",
+                        approval.allow_once_code
+                    )
+                } else {
+                    format!("wa commit {plan_id} --text <TEXT>")
+                };
+
+                if output_format.is_json() {
+                    let output = build_prepare_output(
+                        &plan,
+                        &plan_hash,
+                        expires_at,
+                        wa_core::policy::ActionKind::SendText.as_str(),
+                        Some(pane_id),
+                        approval_request.as_ref(),
+                        commit_command,
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("Plan prepared.");
+                    println!("  plan_id: {plan_id}");
+                    println!("  plan_hash: {plan_hash}");
+                    println!(
+                        "  expires_at: {} ({expires_at} ms)",
+                        format_epoch_ms(expires_at)
+                    );
+
+                    if let Some(approval) = &approval_request {
+                        println!();
+                        println!("Approval required:");
+                        println!("  code: {}", approval.allow_once_code);
+                        println!(
+                            "  expires_at: {} ({})",
+                            format_epoch_ms(approval.expires_at),
+                            approval.expires_at
+                        );
+                    }
+
+                    println!();
+                    println!("Commit:");
+                    println!("  {commit_command}");
+
+                    println!();
+                    println!("Plan preview:");
+                    if let Ok(pretty) = serde_json::to_string_pretty(&plan) {
+                        println!("{pretty}");
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&plan).unwrap_or_else(|_| "{}".to_string())
+                        );
+                    }
+                }
+            }
+            PrepareCommands::Workflow { command } => match command {
+                PrepareWorkflowCommands::Run {
+                    name,
+                    pane_id,
+                    format,
+                } => {
+                    let output_format = resolve_prepare_output_format(&format);
+                    let db_path = layout.db_path.to_string_lossy();
+                    let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                        Ok(s) => std::sync::Arc::new(s),
+                        Err(e) => {
+                            eprintln!("Error: Failed to open database: {e}");
+                            eprintln!("Is the watcher running? Try: wa watch --foreground");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let workspace_id = layout.root.to_string_lossy().to_string();
+                    let now = now_ms_i64();
+                    let execution_id = format!("prepare-{name}-{now}");
+
+                    let workflow = build_workflow_by_name(&name, &config);
+                    let Some(workflow) = workflow else {
+                        eprintln!("Error: Workflow '{name}' not found.");
+                        eprintln!("Hint: Use 'wa workflow list' to see available workflows.");
+                        std::process::exit(1);
+                    };
+
+                    let plan = generate_workflow_plan(
+                        &storage,
+                        &workflow,
+                        &workspace_id,
+                        pane_id,
+                        &execution_id,
+                    )
+                    .await;
+
+                    let plan_hash = plan.compute_hash();
+                    let plan_id = plan.plan_id.to_string();
+                    let redacted_plan = redact_prepare_plan(&plan);
+                    let plan_json =
+                        serde_json::to_string(&redacted_plan).unwrap_or_else(|_| "{}".to_string());
+
+                    let params = PreparedPlanParams::WorkflowRun {
+                        workflow_name: name.clone(),
+                        pane_id,
+                    };
+                    let params_json = serde_json::to_string(&params).ok();
+                    let pane_uuid = storage
+                        .get_pane(pane_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|record| record.pane_uuid);
+
+                    let mut engine = wa_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        config.safety.require_prompt_active,
+                    )
+                    .with_command_gate_config(config.safety.command_gate.clone())
+                    .with_policy_rules(config.safety.rules.clone());
+
+                    let input = wa_core::policy::PolicyInput::new(
+                        wa_core::policy::ActionKind::WorkflowRun,
+                        wa_core::policy::ActorKind::Human,
+                    )
+                    .with_pane(pane_id)
+                    .with_workflow(&name);
+
+                    let decision = engine.authorize(&input);
+                    let (decision, approval_request) = if decision.requires_approval() {
+                        let store = wa_core::approval::ApprovalStore::new(
+                            storage.as_ref(),
+                            config.safety.approval.clone(),
+                            workspace_id.clone(),
+                        );
+                        let decision = match store
+                            .attach_to_decision(decision, &input, Some(name.clone()))
+                            .await
+                        {
+                            Ok(updated) => updated,
+                            Err(e) => {
+                                eprintln!("Error: Failed to issue approval token: {e}");
+                                std::process::exit(1);
+                            }
+                        };
+                        let approval_request = decision.approval_request().cloned();
+                        (decision, approval_request)
+                    } else {
+                        (decision, None)
+                    };
+                    if decision.is_denied() {
+                        let reason = decision.reason().unwrap_or("denied by policy");
+                        eprintln!("Error: Workflow run denied by policy: {reason}");
+                        std::process::exit(1);
+                    }
+
+                    let expires_at =
+                        now.saturating_add(config.safety.approval.token_expiry_secs as i64 * 1000);
+                    let record = wa_core::storage::PreparedPlanRecord {
+                        plan_id: plan_id.clone(),
+                        plan_hash: plan_hash.clone(),
+                        workspace_id: workspace_id.clone(),
+                        action_kind: wa_core::policy::ActionKind::WorkflowRun
+                            .as_str()
+                            .to_string(),
+                        pane_id: Some(pane_id),
+                        pane_uuid,
+                        params_json,
+                        plan_json,
+                        requires_approval: decision.requires_approval(),
+                        created_at: now,
+                        expires_at,
+                        consumed_at: None,
+                    };
+
+                    if let Err(e) = storage.insert_prepared_plan(record).await {
+                        eprintln!("Error: Failed to store prepared plan: {e}");
+                        std::process::exit(1);
+                    }
+
+                    let commit_command = if let Some(approval) = &approval_request {
+                        format!(
+                            "wa commit {plan_id} --approval-code {}",
+                            approval.allow_once_code
+                        )
+                    } else {
+                        format!("wa commit {plan_id}")
+                    };
+
+                    if output_format.is_json() {
+                        let output = build_prepare_output(
+                            &plan,
+                            &plan_hash,
+                            expires_at,
+                            wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                            Some(pane_id),
+                            approval_request.as_ref(),
+                            commit_command,
+                        );
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&output)
+                                .unwrap_or_else(|_| "{}".to_string())
+                        );
+                    } else {
+                        println!("Plan prepared.");
+                        println!("  plan_id: {plan_id}");
+                        println!("  plan_hash: {plan_hash}");
+                        println!(
+                            "  expires_at: {} ({expires_at} ms)",
+                            format_epoch_ms(expires_at)
+                        );
+
+                        if let Some(approval) = &approval_request {
+                            println!();
+                            println!("Approval required:");
+                            println!("  code: {}", approval.allow_once_code);
+                            println!(
+                                "  expires_at: {} ({})",
+                                format_epoch_ms(approval.expires_at),
+                                approval.expires_at
+                            );
+                        }
+
+                        println!();
+                        println!("Commit:");
+                        println!("  {commit_command}");
+
+                        println!();
+                        println!("Plan preview:");
+                        if let Ok(pretty) = serde_json::to_string_pretty(&plan) {
+                            println!("{pretty}");
+                        } else {
+                            println!(
+                                "{}",
+                                serde_json::to_string(&plan).unwrap_or_else(|_| "{}".to_string())
+                            );
+                        }
+                    }
+                }
+            },
+        },
+
+        Some(Commands::Commit {
+            plan_id,
+            text,
+            text_file,
+            approval_code,
+        }) => {
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => {
+                    eprintln!("Error: Failed to open database: {e}");
+                    eprintln!("Is the watcher running? Try: wa watch --foreground");
+                    std::process::exit(1);
+                }
+            };
+
+            let workspace_id = layout.root.to_string_lossy().to_string();
+            let now = now_ms_i64();
+
+            if text.is_some() && text_file.is_some() {
+                eprintln!("Error: Provide only one of --text or --text-file.");
+                std::process::exit(1);
+            }
+
+            let commit_text = if let Some(path) = text_file.as_ref() {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => Some(contents),
+                    Err(e) => {
+                        eprintln!("Error: Failed to read text file {}: {e}", path.display());
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                text.clone()
+            };
+
+            let existing = match storage.get_prepared_plan(&plan_id).await {
+                Ok(record) => record,
+                Err(e) => {
+                    eprintln!("Error: Failed to load prepared plan: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let record = match require_prepared_plan(existing) {
+                Ok(record) => record,
+                Err(err) => exit_on_commit_validation_error(err, &plan_id),
+            };
+
+            if let Err(err) = validate_prepared_plan_record(&record, &workspace_id, now) {
+                exit_on_commit_validation_error(err, &plan_id);
+            }
+
+            let params = match parse_prepared_plan_params(&record) {
+                Ok(params) => params,
+                Err(err) => exit_on_commit_validation_error(err, &plan_id),
+            };
+
+            match params {
+                PreparedPlanParams::SendText {
+                    pane_id,
+                    no_paste,
+                    no_newline,
+                    wait_for,
+                    wait_for_regex,
+                    timeout_secs,
+                } => {
+                    if let Err(err) =
+                        ensure_action_kind(&record, wa_core::policy::ActionKind::SendText.as_str())
+                    {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+                    let Some(text) = commit_text else {
+                        eprintln!("Error: --text or --text-file is required for send_text plans.");
+                        std::process::exit(1);
+                    };
+
+                    let current = storage.get_pane(pane_id).await.ok().flatten();
+                    let current_uuid = current.and_then(|pane| pane.pane_uuid);
+                    if let Err(err) = ensure_pane_uuid_matches(
+                        record.pane_uuid.as_deref(),
+                        current_uuid.as_deref(),
+                    ) {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+
+                    let plan = build_prepare_send_plan(
+                        &workspace_id,
+                        pane_id,
+                        &text,
+                        no_paste,
+                        no_newline,
+                        wait_for.as_deref(),
+                        wait_for_regex,
+                        timeout_secs,
+                    );
+                    let plan_hash = plan.compute_hash();
+                    if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+
+                    let wezterm = wa_core::wezterm::WeztermClient::new();
+                    let pane_info = match wezterm.get_pane(pane_id).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            eprintln!("Error: Failed to query pane {pane_id}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let domain = pane_info.inferred_domain();
+
+                    let resolution = resolve_pane_capabilities(
+                        pane_id,
+                        Some(storage.as_ref()),
+                        Some(layout.ipc_socket_path.as_path()),
+                    )
+                    .await;
+                    let capabilities = resolution.capabilities;
+
+                    let mut engine = wa_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        config.safety.require_prompt_active,
+                    )
+                    .with_command_gate_config(config.safety.command_gate.clone())
+                    .with_policy_rules(config.safety.rules.clone());
+
+                    let summary = engine.redact_secrets(&text);
+                    let mut input = wa_core::policy::PolicyInput::new(
+                        wa_core::policy::ActionKind::SendText,
+                        wa_core::policy::ActorKind::Human,
+                    )
+                    .with_pane(pane_id)
+                    .with_domain(domain.clone())
+                    .with_capabilities(capabilities)
+                    .with_text_summary(&summary)
+                    .with_command_text(&text);
+                    if let Some(title) = &pane_info.title {
+                        input = input.with_pane_title(title.clone());
+                    }
+                    if let Some(cwd) = &pane_info.cwd {
+                        input = input.with_pane_cwd(cwd.clone());
+                    }
+
+                    let mut decision = engine.authorize(&input);
+                    if decision.requires_approval() {
+                        let Some(code) = approval_code.as_deref() else {
+                            eprintln!("Error: Approval required (E_PLAN_APPROVAL_MISSING).");
+                            eprintln!("Hint: Use --approval-code from wa prepare.");
+                            std::process::exit(1);
+                        };
+                        let store = wa_core::approval::ApprovalStore::new(
+                            storage.as_ref(),
+                            config.safety.approval.clone(),
+                            workspace_id.clone(),
+                        );
+                        match store.consume(code, &input).await {
+                            Ok(Some(_)) => {
+                                decision = wa_core::policy::PolicyDecision::allow_with_rule(
+                                    "approval.allow_once",
+                                );
+                            }
+                            Ok(None) => {
+                                eprintln!("Error: Invalid or expired approval code.");
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Error: Failed to consume approval: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if decision.is_denied() {
+                        eprintln!("Error: Action denied by policy.");
+                        std::process::exit(1);
+                    }
+
+                    match storage.consume_prepared_plan(&plan_id, now).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            eprintln!("Error: Plan already consumed or expired.");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to consume prepared plan: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let send_result = wezterm
+                        .send_text_with_options(pane_id, &text, no_paste, no_newline)
+                        .await;
+
+                    let injection = match send_result {
+                        Ok(()) => wa_core::policy::InjectionResult::Allowed {
+                            decision,
+                            summary: summary.clone(),
+                            pane_id,
+                            action: wa_core::policy::ActionKind::SendText,
+                            audit_action_id: None,
+                        },
+                        Err(e) => wa_core::policy::InjectionResult::Error {
+                            error: e.to_string(),
+                            pane_id,
+                            action: wa_core::policy::ActionKind::SendText,
+                            audit_action_id: None,
+                        },
+                    };
+
+                    let mut audit_record = injection.to_audit_record(
+                        wa_core::policy::ActorKind::Human,
+                        None,
+                        Some(domain.clone()),
+                    );
+                    audit_record.input_summary = Some(
+                        wa_core::policy::build_send_text_audit_summary(&text, None, None),
+                    );
+                    if let Err(e) = storage.record_audit_action_redacted(audit_record).await {
+                        tracing::warn!(pane_id, "Failed to record audit: {e}");
+                    }
+
+                    if !injection.is_allowed() {
+                        eprintln!("Commit failed: send denied or errored.");
+                        std::process::exit(1);
+                    }
+
+                    if let Some(pattern) = &wait_for {
+                        let matcher = if wait_for_regex {
+                            match fancy_regex::Regex::new(pattern) {
+                                Ok(compiled) => {
+                                    Some(wa_core::wezterm::WaitMatcher::regex(compiled))
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Invalid wait-for regex: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            Some(wa_core::wezterm::WaitMatcher::substring(pattern))
+                        };
+
+                        if let Some(matcher) = matcher {
+                            let options = wa_core::wezterm::WaitOptions {
+                                tail_lines: 200,
+                                escapes: false,
+                                ..wa_core::wezterm::WaitOptions::default()
+                            };
+                            let waiter =
+                                wa_core::wezterm::PaneWaiter::new(&wezterm).with_options(options);
+                            let timeout = std::time::Duration::from_secs(timeout_secs);
+                            match waiter.wait_for(pane_id, &matcher, timeout).await {
+                                Ok(wa_core::wezterm::WaitResult::Matched { .. }) => {
+                                    println!("Commit succeeded (wait-for matched).");
+                                }
+                                Ok(wa_core::wezterm::WaitResult::TimedOut { .. }) => {
+                                    eprintln!("Commit succeeded but wait-for timed out.");
+                                }
+                                Err(e) => {
+                                    eprintln!("Commit succeeded but wait-for failed: {e}");
+                                }
+                            }
+                        }
+                    } else {
+                        println!("Commit succeeded.");
+                    }
+                }
+                PreparedPlanParams::WorkflowRun {
+                    workflow_name,
+                    pane_id,
+                } => {
+                    if let Err(err) = ensure_action_kind(
+                        &record,
+                        wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                    ) {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+                    let current = storage.get_pane(pane_id).await.ok().flatten();
+                    let current_uuid = current.and_then(|pane| pane.pane_uuid);
+                    if let Err(err) = ensure_pane_uuid_matches(
+                        record.pane_uuid.as_deref(),
+                        current_uuid.as_deref(),
+                    ) {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+
+                    let workflow = build_workflow_by_name(&workflow_name, &config);
+                    let Some(workflow) = workflow else {
+                        eprintln!("Error: Workflow '{workflow_name}' not found.");
+                        eprintln!("Hint: Use 'wa workflow list' to see available workflows.");
+                        std::process::exit(1);
+                    };
+
+                    let execution_id = format!("commit-{workflow_name}-{now}");
+                    let plan = generate_workflow_plan(
+                        &storage,
+                        &workflow,
+                        &workspace_id,
+                        pane_id,
+                        &execution_id,
+                    )
+                    .await;
+                    let plan_hash = plan.compute_hash();
+                    if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
+                        exit_on_commit_validation_error(err, &plan_id);
+                    }
+
+                    let mut engine = wa_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        config.safety.require_prompt_active,
+                    )
+                    .with_command_gate_config(config.safety.command_gate.clone())
+                    .with_policy_rules(config.safety.rules.clone());
+
+                    let input = wa_core::policy::PolicyInput::new(
+                        wa_core::policy::ActionKind::WorkflowRun,
+                        wa_core::policy::ActorKind::Human,
+                    )
+                    .with_pane(pane_id)
+                    .with_workflow(&workflow_name);
+
+                    let decision = engine.authorize(&input);
+                    if decision.requires_approval() {
+                        let Some(code) = approval_code.as_deref() else {
+                            eprintln!("Error: Approval required (E_PLAN_APPROVAL_MISSING).");
+                            eprintln!("Hint: Use --approval-code from wa prepare.");
+                            std::process::exit(1);
+                        };
+                        let store = wa_core::approval::ApprovalStore::new(
+                            storage.as_ref(),
+                            config.safety.approval.clone(),
+                            workspace_id.clone(),
+                        );
+                        match store.consume(code, &input).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                eprintln!("Error: Invalid or expired approval code.");
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Error: Failed to consume approval: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if decision.is_denied() {
+                        eprintln!("Error: Workflow run denied by policy.");
+                        std::process::exit(1);
+                    }
+
+                    match storage.consume_prepared_plan(&plan_id, now).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            eprintln!("Error: Plan already consumed or expired.");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to consume prepared plan: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let engine = wa_core::workflows::WorkflowEngine::new(10);
+                    let lock_manager =
+                        std::sync::Arc::new(wa_core::workflows::PaneWorkflowLockManager::new());
+                    let policy_engine = wa_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        true,
+                    );
+                    let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                    let injector = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        wa_core::policy::PolicyGatedInjector::with_storage(
+                            policy_engine,
+                            wezterm_client,
+                            storage.as_ref().clone(),
+                        ),
+                    ));
+                    let runner_config = wa_core::workflows::WorkflowRunnerConfig::default();
+                    let runner = wa_core::workflows::WorkflowRunner::new(
+                        engine,
+                        lock_manager,
+                        std::sync::Arc::clone(&storage),
+                        injector,
+                        runner_config,
+                    );
+
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleCompaction::new()
+                            .with_prompt_config(config.workflows.compaction_prompts.clone()),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleUsageLimits::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleSessionEnd::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleAuthRequired::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleClaudeCodeLimits::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        wa_core::workflows::HandleGeminiQuota::new(),
+                    ));
+
+                    println!("Workflow: {} ({})", workflow.name(), workflow.description());
+                    println!("Target pane: {pane_id}");
+                    println!("Steps: {}", workflow.step_count());
+                    println!();
+
+                    let run_start = std::time::Instant::now();
+                    let result = runner
+                        .run_workflow(pane_id, workflow, &execution_id, 0)
+                        .await;
+                    let elapsed = run_start.elapsed();
+
+                    match result {
+                        wa_core::workflows::WorkflowExecutionResult::Completed {
+                            steps_executed,
+                            ..
+                        } => {
+                            println!(
+                                "Commit completed ({} step(s) in {:.1}s)",
+                                steps_executed,
+                                elapsed.as_secs_f64()
+                            );
+                            println!("Execution ID: {execution_id}");
+                        }
+                        wa_core::workflows::WorkflowExecutionResult::Aborted {
+                            reason,
+                            step_index,
+                            ..
+                        } => {
+                            eprintln!("Commit aborted at step {step_index}");
+                            eprintln!("Reason: {reason}");
+                            eprintln!("Execution ID: {execution_id}");
+                            eprintln!(
+                                "\nHint: Use 'wa workflow status {execution_id}' for details."
+                            );
+                            std::process::exit(1);
+                        }
+                        wa_core::workflows::WorkflowExecutionResult::PolicyDenied {
+                            reason,
+                            step_index,
+                            ..
+                        } => {
+                            eprintln!("Commit denied by policy at step {step_index}");
+                            eprintln!("Reason: {reason}");
+                            eprintln!("Execution ID: {execution_id}");
+                            std::process::exit(1);
+                        }
+                        wa_core::workflows::WorkflowExecutionResult::Error { error, .. } => {
+                            eprintln!("Commit failed: {error}");
+                            eprintln!("Execution ID: {execution_id}");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    if let Err(e) = storage.shutdown().await {
+                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                    }
+                }
+            }
+        }
+
         Some(Commands::Approve {
             code,
             pane,
@@ -13984,7 +15200,7 @@ fn parse_toml_value(value: &str) -> toml_edit::Item {
 mod tests {
     use super::*;
     use wa_core::approval::hash_allow_once_code;
-    use wa_core::storage::{ApprovalTokenRecord, PaneRecord, StorageHandle};
+    use wa_core::storage::{ApprovalTokenRecord, PaneRecord, PreparedPlanRecord, StorageHandle};
 
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
@@ -14054,6 +15270,31 @@ mod tests {
             action_fingerprint: fingerprint.to_string(),
         };
         storage.insert_approval_token(token).await.unwrap();
+    }
+
+    fn sample_prepared_plan_record(expires_at: i64) -> PreparedPlanRecord {
+        let params = PreparedPlanParams::SendText {
+            pane_id: 7,
+            no_paste: false,
+            no_newline: false,
+            wait_for: None,
+            wait_for_regex: false,
+            timeout_secs: 30,
+        };
+        PreparedPlanRecord {
+            plan_id: "plan:deadbeef".to_string(),
+            plan_hash: "sha256:deadbeef".to_string(),
+            workspace_id: "ws-test".to_string(),
+            action_kind: wa_core::policy::ActionKind::SendText.as_str().to_string(),
+            pane_id: Some(7),
+            pane_uuid: None,
+            params_json: Some(serde_json::to_string(&params).unwrap()),
+            plan_json: "{}".to_string(),
+            requires_approval: false,
+            created_at: 1000,
+            expires_at,
+            consumed_at: None,
+        }
     }
 
     #[test]
@@ -16992,5 +18233,135 @@ mod tests {
             }
             _ => panic!("expected Workflow::Status"),
         }
+    }
+
+    // ========================================================================
+    // Prepare/Commit CLI parsing tests
+    // ========================================================================
+
+    #[test]
+    fn human_prepare_send_parses() {
+        let cli = Cli::try_parse_from(["wa", "prepare", "send", "--pane", "7", "echo hi"])
+            .expect("prepare send should parse");
+        match cli.command {
+            Some(Commands::Prepare {
+                command: PrepareCommands::Send { pane_id, text, .. },
+            }) => {
+                assert_eq!(pane_id, 7);
+                assert_eq!(text, "echo hi");
+            }
+            Some(Commands::Prepare {
+                command: PrepareCommands::Workflow { .. },
+            }) => panic!("expected Prepare::Send"),
+            _ => panic!("expected Prepare command"),
+        }
+    }
+
+    #[test]
+    fn human_prepare_workflow_run_parses() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "prepare",
+            "workflow",
+            "run",
+            "handle_compaction",
+            "--pane",
+            "4",
+        ])
+        .expect("prepare workflow run should parse");
+        match cli.command {
+            Some(Commands::Prepare {
+                command:
+                    PrepareCommands::Workflow {
+                        command: PrepareWorkflowCommands::Run { name, pane_id, .. },
+                    },
+            }) => {
+                assert_eq!(name, "handle_compaction");
+                assert_eq!(pane_id, 4);
+            }
+            Some(Commands::Prepare {
+                command: PrepareCommands::Send { .. },
+            }) => panic!("expected Prepare::Workflow"),
+            _ => panic!("expected Prepare command"),
+        }
+    }
+
+    #[test]
+    fn human_commit_parses() {
+        let cli = Cli::try_parse_from(["wa", "commit", "plan:abcd", "--text", "ls"])
+            .expect("commit should parse");
+        match cli.command {
+            Some(Commands::Commit { plan_id, text, .. }) => {
+                assert_eq!(plan_id, "plan:abcd");
+                assert_eq!(text.as_deref(), Some("ls"));
+            }
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn prepare_output_json_includes_plan_hash_and_plan() {
+        let plan = build_prepare_send_plan("ws-test", 7, "echo hi", false, false, None, false, 30);
+        let plan_hash = plan.compute_hash();
+        let output = build_prepare_output(
+            &plan,
+            &plan_hash,
+            1234,
+            wa_core::policy::ActionKind::SendText.as_str(),
+            Some(7),
+            None,
+            format!("wa commit {} --text <TEXT>", plan.plan_id),
+        );
+        let json = serde_json::to_string(&output).expect("serialize prepare output");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse prepare output");
+        assert_eq!(
+            value.get("plan_hash").and_then(|v| v.as_str()),
+            Some(plan_hash.as_str())
+        );
+        assert!(value.get("plan").is_some());
+    }
+
+    #[test]
+    fn commit_validation_rejects_missing_plan() {
+        let err = require_prepared_plan(None).expect_err("missing plan should fail");
+        assert_eq!(err, CommitValidationError::NotFound);
+    }
+
+    #[test]
+    fn commit_validation_rejects_expired_plan() {
+        let record = sample_prepared_plan_record(500);
+        let err =
+            validate_prepared_plan_record(&record, "ws-test", 1000).expect_err("expired plan");
+        assert_eq!(err, CommitValidationError::Expired);
+    }
+
+    #[test]
+    fn commit_validation_rejects_hash_mismatch() {
+        let err =
+            ensure_plan_hash("sha256:deadbeef", "sha256:feedface").expect_err("hash mismatch");
+        assert_eq!(err, CommitValidationError::HashMismatch);
+    }
+
+    #[test]
+    fn commit_validation_rejects_workspace_mismatch() {
+        let record = sample_prepared_plan_record(1500);
+        let err = validate_prepared_plan_record(&record, "other-workspace", 1000)
+            .expect_err("workspace mismatch");
+        assert_eq!(err, CommitValidationError::WorkspaceMismatch);
+    }
+
+    #[test]
+    fn commit_validation_rejects_pane_mismatch() {
+        let err = ensure_pane_uuid_matches(Some("pane-abc"), Some("pane-def"))
+            .expect_err("pane mismatch");
+        assert_eq!(err, CommitValidationError::PaneMismatch);
+    }
+
+    #[test]
+    fn commit_validation_messages_include_codes_and_hints() {
+        let (message, hint) =
+            commit_validation_message(CommitValidationError::Expired, "plan:deadbeef");
+        assert!(message.contains("E_PLAN_EXPIRED"));
+        assert!(hint.unwrap().contains("Re-run `wa prepare"));
     }
 }

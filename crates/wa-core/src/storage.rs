@@ -3638,7 +3638,10 @@ impl StorageHandle {
     pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send(WriteCommand::InsertPreparedPlan { record, respond: tx })
+            .send(WriteCommand::InsertPreparedPlan {
+                record,
+                respond: tx,
+            })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
@@ -4113,10 +4116,7 @@ impl StorageHandle {
     }
 
     /// Get a prepared plan preview by plan_id
-    pub async fn get_prepared_plan(
-        &self,
-        plan_id: &str,
-    ) -> Result<Option<PreparedPlanRecord>> {
+    pub async fn get_prepared_plan(&self, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
         let db_path = Arc::clone(&self.db_path);
         let plan_id = plan_id.to_string();
 
@@ -5757,7 +5757,7 @@ fn insert_prepared_plan_sync(conn: &Connection, record: &PreparedPlanRecord) -> 
         .pane_id
         .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
         .transpose()?;
-    let requires = if record.requires_approval { 1 } else { 0 };
+    let requires = i32::from(record.requires_approval);
 
     conn.execute(
         "INSERT OR REPLACE INTO prepared_plans
@@ -7298,12 +7298,12 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     let mut correlations = Vec::new();
     let mut correlation_counter = 0u64;
 
-    // Temporal correlation: events within 10 seconds of each other
-    const TEMPORAL_WINDOW_MS: i64 = 10_000;
+    // Temporal correlation: events within 5 seconds of each other
+    const TEMPORAL_WINDOW_MS: i64 = 5_000;
     // Cascade correlation window: 30 seconds
     const CASCADE_WINDOW_MS: i64 = 30_000;
-    // Failover correlation window: 5 minutes
-    const FAILOVER_WINDOW_MS: i64 = 300_000;
+    // Failover correlation window: 60 seconds
+    const FAILOVER_WINDOW_MS: i64 = 60_000;
 
     fn rule_prefix(rule_id: &str) -> Option<&str> {
         let prefix = rule_id.split('.').next()?;
@@ -7329,13 +7329,19 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     }
 
     fn is_session_start_event(event: &TimelineEvent) -> bool {
-        event.event_type == "session.start" || event.rule_id.contains("session.start")
+        event.event_type == "session.start"
+            || event.event_type == "session_start"
+            || event.rule_id.contains("session.start")
+            || event.rule_id.contains("session_start")
     }
 
     fn is_recovery_event(event: &TimelineEvent) -> bool {
         event.event_type.starts_with("session.")
+            || event.event_type.starts_with("session_")
             || event.rule_id.contains("session.resume")
             || event.rule_id.contains("session.start")
+            || event.rule_id.contains("session_resume")
+            || event.rule_id.contains("session_start")
     }
 
     // Find temporal clusters
@@ -7989,10 +7995,7 @@ fn query_action_plan(
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
-fn query_prepared_plan(
-    conn: &Connection,
-    plan_id: &str,
-) -> Result<Option<PreparedPlanRecord>> {
+fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
     conn.query_row(
         "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
                 plan_json, requires_approval, created_at, expires_at, consumed_at
@@ -10636,6 +10639,43 @@ fn can_insert_and_query_workflow_action_plan() {
 
     let parsed: crate::plan::ActionPlan = serde_json::from_str(&fetched.plan_json).unwrap();
     assert_eq!(parsed.plan_id, plan.plan_id);
+}
+
+#[test]
+fn can_insert_and_consume_prepared_plan() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    let record = PreparedPlanRecord {
+        plan_id: "plan:abcd1234".to_string(),
+        plan_hash: "sha256:abcd1234".to_string(),
+        workspace_id: "/tmp/wa".to_string(),
+        action_kind: "send_text".to_string(),
+        pane_id: Some(1),
+        pane_uuid: None,
+        params_json: Some(r#"{"type":"send_text","pane_id":1}"#.to_string()),
+        plan_json: r#"{"plan_id":"plan:abcd1234","plan_hash":"sha256:abcd1234"}"#.to_string(),
+        requires_approval: false,
+        created_at: now_ms,
+        expires_at: now_ms + 60_000,
+        consumed_at: None,
+    };
+
+    insert_prepared_plan_sync(&conn, &record).unwrap();
+    let fetched = query_prepared_plan(&conn, "plan:abcd1234")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.plan_id, record.plan_id);
+    assert_eq!(fetched.action_kind, "send_text");
+
+    let consumed = consume_prepared_plan_sync(&mut conn, "plan:abcd1234", now_ms + 1)
+        .unwrap()
+        .unwrap();
+    assert!(consumed.consumed_at.is_some());
+
+    let second = consume_prepared_plan_sync(&mut conn, "plan:abcd1234", now_ms + 2).unwrap();
+    assert!(second.is_none());
 }
 
 // =========================================================================
@@ -14185,7 +14225,13 @@ mod reservation_tests {
 mod timeline_correlation_tests {
     use super::*;
 
-    fn create_test_event(id: i64, ts: i64, pane_id: u64, rule_id: &str, event_type: &str) -> TimelineEvent {
+    fn create_test_event(
+        id: i64,
+        ts: i64,
+        pane_id: u64,
+        rule_id: &str,
+        event_type: &str,
+    ) -> TimelineEvent {
         TimelineEvent {
             id,
             timestamp: ts,
@@ -14225,7 +14271,9 @@ mod timeline_correlation_tests {
 
         assert!(!temporal.is_empty(), "Should detect temporal correlation");
         assert!(
-            temporal.iter().any(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2)),
+            temporal
+                .iter()
+                .any(|c| c.event_ids.contains(&1) && c.event_ids.contains(&2)),
             "Should correlate events 1 and 2"
         );
     }
@@ -14300,7 +14348,10 @@ mod timeline_correlation_tests {
             workflow_corr[0].event_ids.contains(&1) && workflow_corr[0].event_ids.contains(&2),
             "Should link events with same workflow ID"
         );
-        assert!(!workflow_corr[0].event_ids.contains(&3), "Should not include unrelated event");
+        assert!(
+            !workflow_corr[0].event_ids.contains(&3),
+            "Should not include unrelated event"
+        );
     }
 
     #[test]
@@ -14425,7 +14476,11 @@ mod timeline_correlation_tests {
         let correlations = detect_correlations(&events);
 
         let ids: std::collections::HashSet<_> = correlations.iter().map(|c| &c.id).collect();
-        assert_eq!(ids.len(), correlations.len(), "Correlation IDs should be unique");
+        assert_eq!(
+            ids.len(),
+            correlations.len(),
+            "Correlation IDs should be unique"
+        );
     }
 
     #[test]

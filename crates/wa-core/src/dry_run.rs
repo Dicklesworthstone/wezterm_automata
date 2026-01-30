@@ -987,7 +987,8 @@ mod tests {
             "target_pane": 42,
             "text_length": 100
         });
-        let action = PlannedAction::new(1, ActionType::SendText, "send text").with_metadata(metadata);
+        let action =
+            PlannedAction::new(1, ActionType::SendText, "send text").with_metadata(metadata);
 
         assert!(action.metadata.is_some());
         let meta = action.metadata.unwrap();
@@ -1032,9 +1033,19 @@ mod tests {
 
         let policy = redacted.policy_evaluation.as_ref().unwrap();
         assert!(!policy.checks[0].message.contains("sk-secret"));
-        assert!(!policy.checks[0].details.as_ref().unwrap().contains("sk-secret"));
+        assert!(
+            !policy.checks[0]
+                .details
+                .as_ref()
+                .unwrap()
+                .contains("sk-secret")
+        );
 
-        assert!(!redacted.expected_actions[0].description.contains("sk-secret"));
+        assert!(
+            !redacted.expected_actions[0]
+                .description
+                .contains("sk-secret")
+        );
         assert!(!redacted.warnings[0].contains("sk-secret"));
     }
 
@@ -1071,8 +1082,14 @@ mod tests {
         assert_eq!(format!("{}", ActionType::ReleaseLock), "release-lock");
         assert_eq!(format!("{}", ActionType::StoreData), "store-data");
         assert_eq!(format!("{}", ActionType::WorkflowStep), "workflow-step");
-        assert_eq!(format!("{}", ActionType::MarkEventHandled), "mark-event-handled");
-        assert_eq!(format!("{}", ActionType::ValidateApproval), "validate-approval");
+        assert_eq!(
+            format!("{}", ActionType::MarkEventHandled),
+            "mark-event-handled"
+        );
+        assert_eq!(
+            format!("{}", ActionType::ValidateApproval),
+            "validate-approval"
+        );
         assert_eq!(format!("{}", ActionType::Other), "other");
     }
 
