@@ -18,8 +18,8 @@
 use crate::policy::{InjectionResult, PaneCapabilities, Redactor};
 use crate::storage::StorageHandle;
 use crate::wezterm::{
-    CodexSummaryWaitResult, PaneTextSource, WaitOptions, elapsed_ms, stable_hash, tail_text,
-    wait_for_codex_session_summary,
+    CodexSummaryWaitResult, PaneTextSource, PaneWaiter, WaitMatcher, WaitOptions, WaitResult,
+    elapsed_ms, stable_hash, tail_text, wait_for_codex_session_summary,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -741,12 +741,68 @@ impl StepResult {
 // Wait Conditions
 // ============================================================================
 
+/// Matchers for text-based wait conditions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextMatch {
+    /// Match a substring.
+    Substring { value: String },
+    /// Match a regex pattern.
+    Regex { pattern: String },
+}
+
+impl TextMatch {
+    /// Create a substring matcher.
+    #[must_use]
+    pub fn substring(value: impl Into<String>) -> Self {
+        Self::Substring {
+            value: value.into(),
+        }
+    }
+
+    /// Create a regex matcher from a pattern string.
+    #[must_use]
+    pub fn regex(pattern: impl Into<String>) -> Self {
+        Self::Regex {
+            pattern: pattern.into(),
+        }
+    }
+
+    fn to_wait_matcher(&self) -> crate::Result<WaitMatcher> {
+        match self {
+            Self::Substring { value } => Ok(WaitMatcher::substring(value.clone())),
+            Self::Regex { pattern } => {
+                let regex = fancy_regex::Regex::new(pattern)
+                    .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()))?;
+                Ok(WaitMatcher::regex(regex))
+            }
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Substring { value } => format!(
+                "substring(len={}, hash={:016x})",
+                value.len(),
+                stable_hash(value.as_bytes())
+            ),
+            Self::Regex { pattern } => format!(
+                "regex(len={}, hash={:016x})",
+                pattern.len(),
+                stable_hash(pattern.as_bytes())
+            ),
+        }
+    }
+}
+
 /// Conditions that a workflow can wait for before proceeding.
 ///
 /// Wait conditions pause workflow execution until satisfied:
 /// - `Pattern`: Wait for a pattern rule to match on a pane
 /// - `PaneIdle`: Wait for a pane to become idle (no output)
 /// - `StableTail`: Wait for pane output to stop changing for a duration
+/// - `TextMatch`: Wait for substring/regex match in pane text
+/// - `Sleep`: Wait for a fixed duration
 /// - `External`: Wait for an external signal by key
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -771,6 +827,18 @@ pub enum WaitCondition {
         pane_id: Option<u64>,
         /// Required stability duration in milliseconds
         stable_for_ms: u64,
+    },
+    /// Wait for a text match (substring or regex) to appear in pane output.
+    TextMatch {
+        /// Pane to monitor (None = workflow's target pane)
+        pane_id: Option<u64>,
+        /// Matcher to apply to pane text
+        matcher: TextMatch,
+    },
+    /// Wait for a fixed duration (sleep).
+    Sleep {
+        /// Duration to sleep in milliseconds
+        duration_ms: u64,
     },
     /// Wait for an external signal
     External {
@@ -834,6 +902,30 @@ impl WaitCondition {
         }
     }
 
+    /// Create a TextMatch wait condition for the workflow's target pane.
+    #[must_use]
+    pub fn text_match(matcher: TextMatch) -> Self {
+        Self::TextMatch {
+            pane_id: None,
+            matcher,
+        }
+    }
+
+    /// Create a TextMatch wait condition for a specific pane.
+    #[must_use]
+    pub fn text_match_on_pane(pane_id: u64, matcher: TextMatch) -> Self {
+        Self::TextMatch {
+            pane_id: Some(pane_id),
+            matcher,
+        }
+    }
+
+    /// Create a Sleep wait condition.
+    #[must_use]
+    pub fn sleep(duration_ms: u64) -> Self {
+        Self::Sleep { duration_ms }
+    }
+
     /// Create an External wait condition
     #[must_use]
     pub fn external(key: impl Into<String>) -> Self {
@@ -846,8 +938,9 @@ impl WaitCondition {
         match self {
             Self::Pattern { pane_id, .. }
             | Self::PaneIdle { pane_id, .. }
-            | Self::StableTail { pane_id, .. } => *pane_id,
-            Self::External { .. } => None,
+            | Self::StableTail { pane_id, .. }
+            | Self::TextMatch { pane_id, .. } => *pane_id,
+            Self::Sleep { .. } | Self::External { .. } => None,
         }
     }
 }
@@ -875,6 +968,439 @@ impl WorkflowStep {
             name: name.into(),
             description: description.into(),
         }
+    }
+}
+
+// ============================================================================
+// Data-Driven Workflow Descriptors (wa-nu4.1.1.6)
+// ============================================================================
+
+const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+const DESCRIPTOR_MAX_STEPS: usize = 32;
+const DESCRIPTOR_MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
+const DESCRIPTOR_MAX_SLEEP_MS: u64 = 30_000;
+const DESCRIPTOR_MAX_TEXT_LEN: usize = 8_192;
+const DESCRIPTOR_MAX_MATCH_LEN: usize = 1_024;
+
+/// Limits for descriptor validation.
+#[derive(Debug, Clone)]
+pub struct DescriptorLimits {
+    pub max_steps: usize,
+    pub max_wait_timeout_ms: u64,
+    pub max_sleep_ms: u64,
+    pub max_text_len: usize,
+    pub max_match_len: usize,
+}
+
+impl Default for DescriptorLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: DESCRIPTOR_MAX_STEPS,
+            max_wait_timeout_ms: DESCRIPTOR_MAX_WAIT_TIMEOUT_MS,
+            max_sleep_ms: DESCRIPTOR_MAX_SLEEP_MS,
+            max_text_len: DESCRIPTOR_MAX_TEXT_LEN,
+            max_match_len: DESCRIPTOR_MAX_MATCH_LEN,
+        }
+    }
+}
+
+/// Descriptor for a simple, data-driven workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDescriptor {
+    pub workflow_schema_version: u32,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub steps: Vec<DescriptorStep>,
+}
+
+impl WorkflowDescriptor {
+    pub fn from_yaml_str(input: &str) -> crate::Result<Self> {
+        let descriptor: Self = serde_yaml::from_str(input).map_err(|e| {
+            crate::Error::Config(crate::error::ConfigError::ParseFailed(e.to_string()))
+        })?;
+        descriptor.validate(&DescriptorLimits::default())?;
+        Ok(descriptor)
+    }
+
+    pub fn from_toml_str(input: &str) -> crate::Result<Self> {
+        let descriptor: Self = toml::from_str(input).map_err(|e| {
+            crate::Error::Config(crate::error::ConfigError::ParseFailed(e.to_string()))
+        })?;
+        descriptor.validate(&DescriptorLimits::default())?;
+        Ok(descriptor)
+    }
+
+    pub fn validate(&self, limits: &DescriptorLimits) -> crate::Result<()> {
+        if self.workflow_schema_version != DESCRIPTOR_SCHEMA_VERSION {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "Unsupported workflow_schema_version {} (expected {})",
+                    self.workflow_schema_version, DESCRIPTOR_SCHEMA_VERSION
+                )),
+            ));
+        }
+
+        if self.steps.is_empty() {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(
+                    "Descriptor must contain at least one step".to_string(),
+                ),
+            ));
+        }
+
+        if self.steps.len() > limits.max_steps {
+            return Err(crate::Error::Config(
+                crate::error::ConfigError::ValidationError(format!(
+                    "Descriptor has too many steps ({} > max {})",
+                    self.steps.len(),
+                    limits.max_steps
+                )),
+            ));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for step in &self.steps {
+            let id = step.id();
+            if id.trim().is_empty() {
+                return Err(crate::Error::Config(
+                    crate::error::ConfigError::ValidationError(
+                        "Descriptor step id cannot be empty".to_string(),
+                    ),
+                ));
+            }
+            if !seen.insert(id.to_string()) {
+                return Err(crate::Error::Config(
+                    crate::error::ConfigError::ValidationError(format!("Duplicate step id: {id}")),
+                ));
+            }
+
+            step.validate(limits)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Matchers in descriptors (substring or regex).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescriptorMatcher {
+    Substring { value: String },
+    Regex { pattern: String },
+}
+
+impl DescriptorMatcher {
+    fn to_text_match(&self) -> TextMatch {
+        match self {
+            Self::Substring { value } => TextMatch::substring(value.clone()),
+            Self::Regex { pattern } => TextMatch::regex(pattern.clone()),
+        }
+    }
+
+    fn validate(&self, limits: &DescriptorLimits) -> crate::Result<()> {
+        match self {
+            Self::Substring { value } => {
+                if value.len() > limits.max_match_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "Substring matcher too long ({} > max {})",
+                            value.len(),
+                            limits.max_match_len
+                        )),
+                    ));
+                }
+            }
+            Self::Regex { pattern } => {
+                if pattern.len() > limits.max_match_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "Regex matcher too long ({} > max {})",
+                            pattern.len(),
+                            limits.max_match_len
+                        )),
+                    ));
+                }
+                fancy_regex::Regex::new(pattern).map_err(|e| {
+                    crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
+                        "Invalid regex pattern: {e}"
+                    )))
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Supported control key sends in descriptor workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescriptorControlKey {
+    CtrlC,
+    CtrlD,
+    CtrlZ,
+}
+
+/// Descriptor step definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescriptorStep {
+    WaitFor {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        matcher: DescriptorMatcher,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    Sleep {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        duration_ms: u64,
+    },
+    SendText {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        text: String,
+        #[serde(default)]
+        wait_for: Option<DescriptorMatcher>,
+        #[serde(default)]
+        wait_timeout_ms: Option<u64>,
+    },
+    SendCtrl {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        key: DescriptorControlKey,
+    },
+}
+
+impl DescriptorStep {
+    fn id(&self) -> &str {
+        match self {
+            Self::WaitFor { id, .. }
+            | Self::Sleep { id, .. }
+            | Self::SendText { id, .. }
+            | Self::SendCtrl { id, .. } => id,
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::WaitFor { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Wait for substring/regex match".to_string()),
+            Self::Sleep { description, .. } => {
+                description.clone().unwrap_or_else(|| "Sleep".to_string())
+            }
+            Self::SendText { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Send text".to_string()),
+            Self::SendCtrl { description, .. } => description
+                .clone()
+                .unwrap_or_else(|| "Send control key".to_string()),
+        }
+    }
+
+    fn validate(&self, limits: &DescriptorLimits) -> crate::Result<()> {
+        match self {
+            Self::WaitFor {
+                matcher,
+                timeout_ms,
+                ..
+            } => {
+                matcher.validate(limits)?;
+                if let Some(timeout_ms) = timeout_ms {
+                    if *timeout_ms > limits.max_wait_timeout_ms {
+                        return Err(crate::Error::Config(
+                            crate::error::ConfigError::ValidationError(format!(
+                                "wait_for timeout_ms too large ({} > max {})",
+                                timeout_ms, limits.max_wait_timeout_ms
+                            )),
+                        ));
+                    }
+                }
+            }
+            Self::Sleep { duration_ms, .. } => {
+                if *duration_ms > limits.max_sleep_ms {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "sleep duration_ms too large ({} > max {})",
+                            duration_ms, limits.max_sleep_ms
+                        )),
+                    ));
+                }
+            }
+            Self::SendText {
+                text,
+                wait_for,
+                wait_timeout_ms,
+                ..
+            } => {
+                if text.len() > limits.max_text_len {
+                    return Err(crate::Error::Config(
+                        crate::error::ConfigError::ValidationError(format!(
+                            "send_text too large ({} > max {})",
+                            text.len(),
+                            limits.max_text_len
+                        )),
+                    ));
+                }
+                if let Some(wait_for) = wait_for {
+                    wait_for.validate(limits)?;
+                }
+                if let Some(wait_timeout_ms) = wait_timeout_ms {
+                    if *wait_timeout_ms > limits.max_wait_timeout_ms {
+                        return Err(crate::Error::Config(
+                            crate::error::ConfigError::ValidationError(format!(
+                                "send_text wait_timeout_ms too large ({} > max {})",
+                                wait_timeout_ms, limits.max_wait_timeout_ms
+                            )),
+                        ));
+                    }
+                }
+            }
+            Self::SendCtrl { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// Workflow implementation backed by a descriptor.
+pub struct DescriptorWorkflow {
+    name: &'static str,
+    description: &'static str,
+    descriptor: WorkflowDescriptor,
+}
+
+impl DescriptorWorkflow {
+    #[must_use]
+    pub fn new(descriptor: WorkflowDescriptor) -> Self {
+        let name: &'static str = Box::leak(descriptor.name.clone().into_boxed_str());
+        let desc_value = descriptor
+            .description
+            .clone()
+            .unwrap_or_else(|| "Descriptor workflow".to_string());
+        let description: &'static str = Box::leak(desc_value.into_boxed_str());
+        Self {
+            name,
+            description,
+            descriptor,
+        }
+    }
+
+    pub fn from_yaml_str(input: &str) -> crate::Result<Self> {
+        WorkflowDescriptor::from_yaml_str(input).map(Self::new)
+    }
+
+    pub fn from_toml_str(input: &str) -> crate::Result<Self> {
+        WorkflowDescriptor::from_toml_str(input).map(Self::new)
+    }
+
+    #[must_use]
+    pub fn descriptor(&self) -> &WorkflowDescriptor {
+        &self.descriptor
+    }
+}
+
+impl Workflow for DescriptorWorkflow {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        self.descriptor
+            .steps
+            .iter()
+            .map(|step| WorkflowStep::new(step.id(), step.description()))
+            .collect()
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let step = self.descriptor.steps.get(step_idx).cloned();
+        let default_wait_timeout_ms = ctx.default_wait_timeout_ms();
+        let ctx_clone = ctx.clone();
+        Box::pin(async move {
+            let Some(step) = step else {
+                return StepResult::abort("Unexpected step index");
+            };
+
+            match step {
+                DescriptorStep::WaitFor {
+                    matcher,
+                    timeout_ms,
+                    ..
+                } => {
+                    let condition = WaitCondition::text_match(matcher.to_text_match());
+                    if let Some(timeout_ms) = timeout_ms {
+                        StepResult::wait_for_with_timeout(condition, timeout_ms)
+                    } else {
+                        StepResult::wait_for(condition)
+                    }
+                }
+                DescriptorStep::Sleep { duration_ms, .. } => StepResult::wait_for_with_timeout(
+                    WaitCondition::sleep(duration_ms),
+                    duration_ms,
+                ),
+                DescriptorStep::SendText {
+                    text,
+                    wait_for,
+                    wait_timeout_ms,
+                    ..
+                } => {
+                    if let Some(wait_for) = wait_for {
+                        let condition = WaitCondition::text_match(wait_for.to_text_match());
+                        StepResult::send_text_and_wait(
+                            text,
+                            condition,
+                            wait_timeout_ms.unwrap_or(default_wait_timeout_ms),
+                        )
+                    } else {
+                        StepResult::send_text(text)
+                    }
+                }
+                DescriptorStep::SendCtrl { key, .. } => {
+                    let mut ctx_clone = ctx_clone;
+                    let result = match key {
+                        DescriptorControlKey::CtrlC => ctx_clone.send_ctrl_c().await,
+                        DescriptorControlKey::CtrlD => ctx_clone.send_ctrl_d().await,
+                        DescriptorControlKey::CtrlZ => ctx_clone.send_ctrl_z().await,
+                    };
+                    match result {
+                        Ok(InjectionResult::Allowed { .. }) => StepResult::cont(),
+                        Ok(InjectionResult::Denied { decision, .. }) => StepResult::abort(format!(
+                            "Policy denied control send: {}",
+                            decision.reason().unwrap_or("denied")
+                        )),
+                        Ok(InjectionResult::RequiresApproval { decision, .. }) => {
+                            StepResult::abort(format!(
+                                "Control send requires approval: {}",
+                                decision.reason().unwrap_or("requires approval")
+                            ))
+                        }
+                        Ok(InjectionResult::Error { error, .. }) => {
+                            StepResult::abort(format!("Control send failed: {error}"))
+                        }
+                        Err(err) => StepResult::abort(err),
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -1795,6 +2321,32 @@ fn build_verification_refs(
     }
 }
 
+fn redact_text_for_log(text: &str, max_len: usize) -> String {
+    let redactor = Redactor::new();
+    let redacted = redactor.redact(text);
+    if redacted.len() <= max_len {
+        return redacted;
+    }
+    let mut truncated = redacted.chars().take(max_len).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn redacted_step_result_for_logging(step_result: &StepResult) -> StepResult {
+    match step_result {
+        StepResult::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+        } => StepResult::SendText {
+            text: redact_text_for_log(text, 160),
+            wait_for: wait_for.clone(),
+            wait_timeout_ms: *wait_timeout_ms,
+        },
+        _ => step_result.clone(),
+    }
+}
+
 fn step_error_code_from_result(step_result: &StepResult) -> Option<String> {
     match step_result {
         StepResult::Abort { .. } => Some("WA-5002".to_string()),
@@ -2695,6 +3247,21 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 self.execute_stable_tail_wait(target_pane, *stable_for_ms, timeout)
                     .await
             }
+            WaitCondition::TextMatch { pane_id, matcher } => {
+                let target_pane = pane_id.unwrap_or(context_pane_id);
+                self.execute_text_match_wait(target_pane, matcher, timeout)
+                    .await
+            }
+            WaitCondition::Sleep { duration_ms } => {
+                let dur = Duration::from_millis(*duration_ms);
+                let capped = dur.min(timeout);
+                tokio::time::sleep(capped).await;
+                Ok(WaitConditionResult::Satisfied {
+                    elapsed_ms: capped.as_millis() as u64,
+                    polls: 0,
+                    context: Some("sleep completed".to_string()),
+                })
+            }
             WaitCondition::External { key } => {
                 // External signals are not implemented in this layer
                 Ok(WaitConditionResult::Unsupported {
@@ -2996,6 +3563,38 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             if interval > self.options.poll_max {
                 interval = self.options.poll_max;
             }
+        }
+    }
+
+    async fn execute_text_match_wait(
+        &self,
+        pane_id: u64,
+        matcher: &TextMatch,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        let wait_matcher = matcher.to_wait_matcher()?;
+        let waiter = PaneWaiter::new(self.source).with_options(WaitOptions {
+            tail_lines: self.options.tail_lines,
+            escapes: false,
+            poll_initial: self.options.poll_initial,
+            poll_max: self.options.poll_max,
+            max_polls: self.options.max_polls,
+        });
+
+        let result = waiter.wait_for(pane_id, &wait_matcher, timeout).await?;
+        match result {
+            WaitResult::Matched { elapsed_ms, polls } => Ok(WaitConditionResult::Satisfied {
+                elapsed_ms,
+                polls,
+                context: Some(format!("matched {}", matcher.description())),
+            }),
+            WaitResult::TimedOut {
+                elapsed_ms, polls, ..
+            } => Ok(WaitConditionResult::TimedOut {
+                elapsed_ms,
+                polls,
+                last_observed: Some(format!("timeout {}", matcher.description())),
+            }),
         }
     }
 }
@@ -3568,11 +4167,12 @@ impl WorkflowRunner {
             let step_kind = step_plan_ref.map(|step| step.action.action_type_name().to_string());
             let verification_refs = build_verification_refs(&step_result, step_plan_ref);
             let step_error_code = step_error_code_from_result(&step_result);
+            let log_step_result = redacted_step_result_for_logging(&step_result);
 
             // Build result data, enriching with plan information if available (wa-upg.2.3)
             let result_data = {
                 let mut data = serde_json::json!({
-                    "step_result": &step_result,
+                    "step_result": &log_step_result,
                 });
 
                 // Include idempotency key from plan if executing in plan-first mode
@@ -3907,6 +4507,13 @@ impl WorkflowRunner {
                             // Would use WaitConditionExecutor here
                             tokio::time::sleep(Duration::from_millis(*stable_for_ms)).await;
                         }
+                        WaitCondition::TextMatch { .. } => {
+                            // Would use WaitConditionExecutor here
+                            tokio::time::sleep(timeout).await;
+                        }
+                        WaitCondition::Sleep { duration_ms } => {
+                            tokio::time::sleep(Duration::from_millis(*duration_ms)).await;
+                        }
                         WaitCondition::External { .. } => {
                             // Would wait for external signal
                             tokio::time::sleep(timeout).await;
@@ -4036,6 +4643,13 @@ impl WorkflowRunner {
                                     }
                                     WaitCondition::StableTail { stable_for_ms, .. } => {
                                         tokio::time::sleep(Duration::from_millis(*stable_for_ms))
+                                            .await;
+                                    }
+                                    WaitCondition::TextMatch { .. } => {
+                                        tokio::time::sleep(timeout).await;
+                                    }
+                                    WaitCondition::Sleep { duration_ms } => {
+                                        tokio::time::sleep(Duration::from_millis(*duration_ms))
                                             .await;
                                     }
                                     WaitCondition::External { .. } => {
@@ -6930,6 +7544,30 @@ mod tests {
         assert_eq!(parsed.pane_id(), None);
     }
 
+    #[test]
+    fn wait_condition_text_match_serializes() {
+        let cond = WaitCondition::text_match(TextMatch::substring("ready"));
+        let json = serde_json::to_string(&cond).unwrap();
+        assert!(json.contains("text_match"));
+        assert!(json.contains("substring"));
+
+        let parsed: WaitCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cond);
+        assert_eq!(parsed.pane_id(), None);
+    }
+
+    #[test]
+    fn wait_condition_sleep_serializes() {
+        let cond = WaitCondition::sleep(1500);
+        let json = serde_json::to_string(&cond).unwrap();
+        assert!(json.contains("sleep"));
+        assert!(json.contains("1500"));
+
+        let parsed: WaitCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cond);
+        assert_eq!(parsed.pane_id(), None);
+    }
+
     // ========================================================================
     // WorkflowStep Tests
     // ========================================================================
@@ -7420,6 +8058,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_match_wait_succeeds_on_substring() {
+        let source = MockPaneSource::new(vec!["booting".to_string(), "ready> prompt".to_string()]);
+        let engine = PatternEngine::new();
+
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            });
+
+        let condition = WaitCondition::text_match(TextMatch::substring("ready>"));
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        assert!(source.calls() >= 2);
+    }
+
+    #[tokio::test]
+    async fn text_match_wait_succeeds_on_regex() {
+        let source = MockPaneSource::new(vec![
+            "waiting".to_string(),
+            "completed in 123ms".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                tail_lines: 200,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(5),
+                max_polls: 100,
+                allow_idle_heuristics: true,
+            });
+
+        let condition = WaitCondition::text_match(TextMatch::regex(r"completed in \d+ms"));
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_satisfied());
+        assert!(source.calls() >= 2);
+    }
+
+    #[tokio::test]
     async fn pane_idle_succeeds_with_osc133_prompt_active() {
         use crate::ingest::{Osc133State, ShellState};
 
@@ -7479,6 +8170,170 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_timed_out());
+    }
+
+    // ========================================================================
+    // Descriptor Workflow Tests (wa-nu4.1.1.6)
+    // ========================================================================
+
+    #[test]
+    fn descriptor_yaml_parses_and_validates() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "demo_wait"
+description: "Demo workflow"
+steps:
+  - type: wait_for
+    id: wait_prompt
+    matcher:
+      kind: substring
+      value: "ready>"
+    timeout_ms: 1000
+  - type: send_text
+    id: send_cmd
+    text: "echo hi"
+    wait_for:
+      kind: regex
+      pattern: "hi"
+    wait_timeout_ms: 2000
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        assert_eq!(descriptor.name, "demo_wait");
+        assert_eq!(descriptor.steps.len(), 2);
+
+        let workflow = DescriptorWorkflow::new(descriptor);
+        assert_eq!(workflow.steps().len(), 2);
+    }
+
+    #[test]
+    fn descriptor_toml_parses_and_validates() {
+        let toml = r#"
+workflow_schema_version = 1
+name = "demo_sleep"
+
+[[steps]]
+type = "sleep"
+id = "pause"
+duration_ms = 500
+"#;
+        let descriptor = WorkflowDescriptor::from_toml_str(toml).unwrap();
+        assert_eq!(descriptor.name, "demo_sleep");
+        assert_eq!(descriptor.steps.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_rejects_duplicate_step_ids() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "dup_steps"
+steps:
+  - type: sleep
+    id: step
+    duration_ms: 10
+  - type: sleep
+    id: step
+    duration_ms: 10
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Duplicate step id"));
+    }
+
+    #[test]
+    fn descriptor_rejects_invalid_regex() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "bad_regex"
+steps:
+  - type: wait_for
+    id: wait_bad
+    matcher:
+      kind: regex
+      pattern: "(["
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Invalid regex pattern"));
+    }
+
+    #[test]
+    fn descriptor_rejects_schema_version() {
+        let yaml = r#"
+workflow_schema_version: 999
+name: "bad_version"
+steps:
+  - type: sleep
+    id: pause
+    duration_ms: 10
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("workflow_schema_version"));
+    }
+
+    #[test]
+    fn descriptor_rejects_too_many_steps() {
+        let mut yaml = String::from("workflow_schema_version: 1\nname: \"too_many\"\nsteps:\n");
+        for idx in 0..=DESCRIPTOR_MAX_STEPS {
+            yaml.push_str(&format!(
+                "  - type: sleep\n    id: step_{idx}\n    duration_ms: 1\n"
+            ));
+        }
+        let err = WorkflowDescriptor::from_yaml_str(&yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too many steps"));
+    }
+
+    #[test]
+    fn descriptor_rejects_wait_timeout_too_large() {
+        let too_long = DESCRIPTOR_MAX_WAIT_TIMEOUT_MS + 1;
+        let yaml = format!(
+            r#"
+workflow_schema_version: 1
+name: "timeout_too_large"
+steps:
+  - type: wait_for
+    id: wait_too_long
+    matcher:
+      kind: substring
+      value: "ready"
+    timeout_ms: {too_long}
+"#
+        );
+        let err = WorkflowDescriptor::from_yaml_str(&yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("timeout_ms too large"));
+    }
+
+    #[tokio::test]
+    async fn descriptor_send_ctrl_requires_injector() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "ctrl_only"
+steps:
+  - type: send_ctrl
+    id: interrupt
+    key: ctrl_c
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        let workflow = DescriptorWorkflow::new(descriptor);
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("descriptor_send_ctrl.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-ctrl");
+        let result = workflow.execute_step(&mut ctx, 0).await;
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(reason.contains("No injector configured"));
+            }
+            other => panic!("Expected abort, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

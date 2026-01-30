@@ -1012,7 +1012,10 @@ impl EventFilter {
             include: include.to_vec(),
             exclude: exclude.to_vec(),
             min_severity: min_severity.and_then(parse_severity),
-            agent_types: agent_types.iter().filter_map(|s| parse_agent_type(s)).collect(),
+            agent_types: agent_types
+                .iter()
+                .filter_map(|s| parse_agent_type(s))
+                .collect(),
         }
     }
 
@@ -1039,8 +1042,7 @@ impl EventFilter {
         }
 
         // 2. Include (if non-empty, at least one must match)
-        if !self.include.is_empty()
-            && !self.include.iter().any(|pat| match_rule_glob(pat, rule_id))
+        if !self.include.is_empty() && !self.include.iter().any(|pat| match_rule_glob(pat, rule_id))
         {
             return false;
         }
@@ -1132,8 +1134,14 @@ impl NotificationGate {
     ) -> Self {
         Self {
             filter,
-            dedup: EventDeduplicator::with_config(dedup_window, EventDeduplicator::DEFAULT_MAX_CAPACITY),
-            cooldown: NotificationCooldown::with_config(cooldown_period, NotificationCooldown::DEFAULT_MAX_CAPACITY),
+            dedup: EventDeduplicator::with_config(
+                dedup_window,
+                EventDeduplicator::DEFAULT_MAX_CAPACITY,
+            ),
+            cooldown: NotificationCooldown::with_config(
+                cooldown_period,
+                NotificationCooldown::DEFAULT_MAX_CAPACITY,
+            ),
         }
     }
 
@@ -1956,12 +1964,7 @@ mod tests {
     #[test]
     fn filter_include_glob_star() {
         // Pattern "*:usage_*" matches rule_ids with ":usage_" separator
-        let f = EventFilter::from_config(
-            &["*:usage_*".to_string()],
-            &[],
-            None,
-            &[],
-        );
+        let f = EventFilter::from_config(&["*:usage_*".to_string()], &[], None, &[]);
         let hit = make_detection(
             "core.codex:usage_reached",
             crate::patterns::Severity::Warning,
@@ -1979,12 +1982,7 @@ mod tests {
     #[test]
     fn filter_include_glob_dot_separated() {
         // Pattern "*.error" matches rule_ids like "codex.error"
-        let f = EventFilter::from_config(
-            &["*.error".to_string()],
-            &[],
-            None,
-            &[],
-        );
+        let f = EventFilter::from_config(&["*.error".to_string()], &[], None, &[]);
         let hit = make_detection(
             "codex.error",
             crate::patterns::Severity::Warning,
@@ -2001,12 +1999,7 @@ mod tests {
 
     #[test]
     fn filter_include_exact_match() {
-        let f = EventFilter::from_config(
-            &["core.codex:usage_reached".to_string()],
-            &[],
-            None,
-            &[],
-        );
+        let f = EventFilter::from_config(&["core.codex:usage_reached".to_string()], &[], None, &[]);
         let hit = make_detection(
             "core.codex:usage_reached",
             crate::patterns::Severity::Info,
@@ -2124,12 +2117,8 @@ mod tests {
 
     #[test]
     fn filter_agent_type_allowlist() {
-        let f = EventFilter::from_config(
-            &[],
-            &[],
-            None,
-            &["codex".to_string(), "gemini".to_string()],
-        );
+        let f =
+            EventFilter::from_config(&[], &[], None, &["codex".to_string(), "gemini".to_string()]);
         let codex = make_detection(
             "x",
             crate::patterns::Severity::Info,
@@ -2163,12 +2152,7 @@ mod tests {
 
     #[test]
     fn filter_combined_severity_and_agent() {
-        let f = EventFilter::from_config(
-            &[],
-            &[],
-            Some("warning"),
-            &["codex".to_string()],
-        );
+        let f = EventFilter::from_config(&[], &[], Some("warning"), &["codex".to_string()]);
         // Codex + Warning → pass
         assert!(f.matches(&make_detection(
             "x",
@@ -2202,12 +2186,7 @@ mod tests {
 
     #[test]
     fn filter_question_mark_glob() {
-        let f = EventFilter::from_config(
-            &["codex.usage_?eached".to_string()],
-            &[],
-            None,
-            &[],
-        );
+        let f = EventFilter::from_config(&["codex.usage_?eached".to_string()], &[], None, &[]);
         assert!(f.matches(&make_detection(
             "codex.usage_reached",
             crate::patterns::Severity::Info,
@@ -2252,12 +2231,7 @@ mod tests {
 
     #[test]
     fn gate_filtered_event_returns_filtered() {
-        let filter = EventFilter::from_config(
-            &[],
-            &["codex.*".to_string()],
-            None,
-            &[],
-        );
+        let filter = EventFilter::from_config(&[], &["codex.*".to_string()], None, &[]);
         let mut gate = NotificationGate::from_config(
             filter,
             Duration::from_secs(300),
@@ -2300,8 +2274,8 @@ mod tests {
         // Short dedup window, longer cooldown
         let mut gate = NotificationGate::from_config(
             EventFilter::allow_all(),
-            Duration::from_millis(1),   // dedup expires fast
-            Duration::from_secs(300),   // cooldown stays
+            Duration::from_millis(1), // dedup expires fast
+            Duration::from_secs(300), // cooldown stays
         );
         let d = make_detection(
             "codex.usage_reached",
@@ -2348,12 +2322,7 @@ mod tests {
 
     #[test]
     fn gate_filter_accessor() {
-        let filter = EventFilter::from_config(
-            &["test.*".to_string()],
-            &[],
-            None,
-            &[],
-        );
+        let filter = EventFilter::from_config(&["test.*".to_string()], &[], None, &[]);
         let gate = NotificationGate::from_config(
             filter,
             Duration::from_secs(300),
@@ -2386,8 +2355,14 @@ mod tests {
 
     #[test]
     fn glob_star_middle() {
-        assert!(match_rule_glob("core.*:usage_reached", "core.codex:usage_reached"));
-        assert!(!match_rule_glob("core.*:usage_reached", "core.codex:session_end"));
+        assert!(match_rule_glob(
+            "core.*:usage_reached",
+            "core.codex:usage_reached"
+        ));
+        assert!(!match_rule_glob(
+            "core.*:usage_reached",
+            "core.codex:session_end"
+        ));
     }
 
     #[test]
@@ -2400,26 +2375,51 @@ mod tests {
 
     #[test]
     fn severity_level_ordering() {
-        assert!(severity_level(crate::patterns::Severity::Info)
-            < severity_level(crate::patterns::Severity::Warning));
-        assert!(severity_level(crate::patterns::Severity::Warning)
-            < severity_level(crate::patterns::Severity::Critical));
+        assert!(
+            severity_level(crate::patterns::Severity::Info)
+                < severity_level(crate::patterns::Severity::Warning)
+        );
+        assert!(
+            severity_level(crate::patterns::Severity::Warning)
+                < severity_level(crate::patterns::Severity::Critical)
+        );
     }
 
     #[test]
     fn parse_severity_roundtrip() {
-        assert_eq!(parse_severity("info"), Some(crate::patterns::Severity::Info));
-        assert_eq!(parse_severity("WARNING"), Some(crate::patterns::Severity::Warning));
-        assert_eq!(parse_severity("Critical"), Some(crate::patterns::Severity::Critical));
+        assert_eq!(
+            parse_severity("info"),
+            Some(crate::patterns::Severity::Info)
+        );
+        assert_eq!(
+            parse_severity("WARNING"),
+            Some(crate::patterns::Severity::Warning)
+        );
+        assert_eq!(
+            parse_severity("Critical"),
+            Some(crate::patterns::Severity::Critical)
+        );
         assert_eq!(parse_severity("bogus"), None);
     }
 
     #[test]
     fn parse_agent_type_roundtrip() {
-        assert_eq!(parse_agent_type("codex"), Some(crate::patterns::AgentType::Codex));
-        assert_eq!(parse_agent_type("CLAUDE_CODE"), Some(crate::patterns::AgentType::ClaudeCode));
-        assert_eq!(parse_agent_type("Gemini"), Some(crate::patterns::AgentType::Gemini));
-        assert_eq!(parse_agent_type("wezterm"), Some(crate::patterns::AgentType::Wezterm));
+        assert_eq!(
+            parse_agent_type("codex"),
+            Some(crate::patterns::AgentType::Codex)
+        );
+        assert_eq!(
+            parse_agent_type("CLAUDE_CODE"),
+            Some(crate::patterns::AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            parse_agent_type("Gemini"),
+            Some(crate::patterns::AgentType::Gemini)
+        );
+        assert_eq!(
+            parse_agent_type("wezterm"),
+            Some(crate::patterns::AgentType::Wezterm)
+        );
         assert_eq!(parse_agent_type("nope"), None);
     }
 }
