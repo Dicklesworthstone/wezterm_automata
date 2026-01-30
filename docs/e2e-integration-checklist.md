@@ -99,10 +99,10 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [ ] Artifacts: diag bundle layout + redaction proofs. Scenario(s): none
 
 #### Notifications (wa-psm)
-- [ ] E2E: events trigger notifications (webhook mock server). Scenario(s): none
-- [ ] E2E: throttling prevents spam. Scenario(s): none
-- [ ] E2E: failure recovery works (network down, endpoint 500). Scenario(s): none
-- [ ] Artifacts: delivery attempts, retry/backoff, persisted notification history. Scenario(s): none
+- [x] E2E: events trigger notifications (webhook mock server). Scenario(s): notification_webhook
+- [x] E2E: throttling prevents spam. Scenario(s): notification_webhook
+- [x] E2E: failure recovery works (network down, endpoint 500). Scenario(s): notification_webhook
+- [x] Artifacts: delivery attempts, retry/backoff, persisted notification history. Scenario(s): notification_webhook
 
 #### CLI polish (wa-rnf)
 - [ ] E2E: shell completion generation works (smoke). Scenario(s): none

@@ -340,6 +340,7 @@ SCENARIO_REGISTRY=(
     "compaction_workflow:Validate pattern detection and workflow execution"
     "unhandled_event_lifecycle:Validate unhandled event lifecycle and dedupe handling"
     "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
+    "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
@@ -1507,6 +1508,552 @@ EOF
 
     trap - EXIT
     cleanup_usage_limit_safe_pause
+
+    return $result
+}
+
+run_scenario_notification_webhook() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-notify-XXXXXX)
+    local wa_pid=""
+    local mock_pid=""
+    local pane_id=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-120}
+    local secret_token="SECRET_NOTIFY_$(date +%s%N)"
+    local mock_script="$temp_workspace/mock_webhook_server.py"
+    local emit_script="$temp_workspace/emit_compaction.sh"
+    local throttle_script="$temp_workspace/emit_compaction_throttle.sh"
+    local mock_port=""
+    local mock_addr=""
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_fail "python3 is required for mock webhook server"
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log_fail "curl is required for mock webhook server checks"
+        return 1
+    fi
+
+    cleanup_notification_webhook() {
+        log_verbose "Cleaning up notification_webhook scenario"
+        if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
+            log_verbose "Stopping mock webhook server (pid $mock_pid)"
+            kill "$mock_pid" 2>/dev/null || true
+            wait "$mock_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${pane_id:-}" ]]; then
+            log_verbose "Closing pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_notification_webhook EXIT
+
+    # Prepare mock webhook server script
+    cat > "$mock_script" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class State:
+    def __init__(self, responses, log_path):
+        self.responses = responses
+        self.log_path = log_path
+        self.attempts = 0
+        self.received = []
+
+    def log(self, message):
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        else:
+            print(message, flush=True)
+
+
+STATE = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def _send_json(self, code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._send_json(200, {"ok": True})
+        if self.path == "/received":
+            return self._send_json(200, STATE.received)
+        if self.path == "/attempt_count":
+            return self._send_json(200, {"attempts": STATE.attempts})
+        return self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        if self.path != "/webhook":
+            return self._send_json(404, {"error": "not_found"})
+
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        STATE.attempts += 1
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {"_raw": body.decode("utf-8", errors="replace")}
+        STATE.received.append(payload)
+
+        if STATE.responses:
+            idx = min(STATE.attempts - 1, len(STATE.responses) - 1)
+            status = STATE.responses[idx]
+        else:
+            status = 200
+
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        STATE.log(f"{ts} attempt={STATE.attempts} status={status} bytes={len(body)}")
+        return self._send_json(status, {"ok": status == 200})
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--responses", default="")
+    parser.add_argument("--log", default="")
+    args = parser.parse_args()
+
+    responses = []
+    if args.responses:
+        for item in args.responses.split(","):
+            item = item.strip()
+            if item:
+                responses.append(int(item))
+
+    global STATE
+    STATE = State(responses, args.log)
+    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+    chmod +x "$mock_script"
+
+    # Prepare compaction emitters
+    cat > "$emit_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+secret="$1"
+repeat_count="${2:-1}"
+repeat_interval="${3:-0}"
+sleep_tail="${4:-120}"
+
+echo "$secret"
+for ((i=1; i<=repeat_count; i++)); do
+    echo "[CODEX] Compaction required: context window 95% full"
+    echo "[CODEX] Waiting for refresh prompt..."
+    if [[ "$i" -lt "$repeat_count" ]]; then
+        sleep "$repeat_interval"
+    fi
+done
+
+sleep "$sleep_tail"
+EOS
+    chmod +x "$emit_script"
+
+    cat > "$throttle_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+secret="$1"
+burst_count="${2:-3}"
+burst_interval="${3:-0.1}"
+cooldown_delay="${4:-2}"
+sleep_tail="${5:-120}"
+
+echo "$secret"
+for ((i=1; i<=burst_count; i++)); do
+    echo "[CODEX] Compaction required: context window 95% full"
+    echo "[CODEX] Waiting for refresh prompt..."
+    if [[ "$i" -lt "$burst_count" ]]; then
+        sleep "$burst_interval"
+    fi
+done
+
+sleep "$cooldown_delay"
+echo "[CODEX] Compaction required: context window 95% full"
+echo "[CODEX] Waiting for refresh prompt..."
+
+sleep "$sleep_tail"
+EOS
+    chmod +x "$throttle_script"
+
+    # Pick a free port for the mock server
+    mock_port=$(python3 - <<'PY'
+import socket
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+    )
+
+    if [[ -z "$mock_port" ]]; then
+        log_fail "Failed to allocate mock webhook port"
+        return 1
+    fi
+    mock_addr="http://127.0.0.1:$mock_port"
+
+    echo "[NOTIFY_E2E] workspace=$temp_workspace" >> "$scenario_dir/scenario.log"
+    echo "[NOTIFY_E2E] mock_addr=$mock_addr" >> "$scenario_dir/scenario.log"
+    echo "[NOTIFY_E2E] secret_token=$secret_token" >> "$scenario_dir/scenario.log"
+
+    # Helper functions for mock server
+    start_mock_server() {
+        local responses="$1"
+        local log_file="$2"
+        local out_file="$3"
+
+        if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
+            kill "$mock_pid" 2>/dev/null || true
+            wait "$mock_pid" 2>/dev/null || true
+        fi
+
+        python3 "$mock_script" --port "$mock_port" --responses "$responses" --log "$log_file" \
+            > "$out_file" 2>&1 &
+        mock_pid=$!
+
+        local check_cmd="curl -fs \"$mock_addr/health\" >/dev/null 2>&1"
+        if ! wait_for_condition "mock server ready" "$check_cmd" "$wait_timeout"; then
+            log_fail "Mock webhook server failed to start"
+            return 1
+        fi
+        return 0
+    }
+
+    stop_mock_server() {
+        if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
+            kill "$mock_pid" 2>/dev/null || true
+            wait "$mock_pid" 2>/dev/null || true
+        fi
+        mock_pid=""
+    }
+
+    mock_received_count() {
+        local payload=""
+        payload=$(curl -s "$mock_addr/received" 2>/dev/null || true)
+        echo "$payload" | jq -r 'length' 2>/dev/null || echo "0"
+    }
+
+    mock_attempt_count() {
+        local payload=""
+        payload=$(curl -s "$mock_addr/attempt_count" 2>/dev/null || true)
+        echo "$payload" | jq -r '.attempts // 0' 2>/dev/null || echo "0"
+    }
+
+    wait_for_stable_attempts() {
+        local stable_seconds="$1"
+        local timeout="$2"
+        local start
+        start=$(date +%s)
+        local last=""
+        local stable_start=""
+
+        while true; do
+            local current
+            current=$(mock_attempt_count)
+            if [[ -n "$last" && "$current" == "$last" ]]; then
+                if [[ -z "$stable_start" ]]; then
+                    stable_start=$(date +%s)
+                fi
+                if [[ $(( $(date +%s) - stable_start )) -ge $stable_seconds ]]; then
+                    return 0
+                fi
+            else
+                last="$current"
+                stable_start=""
+            fi
+
+            if [[ $(( $(date +%s) - start )) -ge $timeout ]]; then
+                return 1
+            fi
+            sleep 0.5
+        done
+    }
+
+    spawn_compaction_pane() {
+        local script="$1"
+        shift
+        local spawn_output=""
+        spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$script" "$@" 2>&1)
+        local new_pane_id
+        new_pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+        if [[ -z "$new_pane_id" ]]; then
+            echo ""
+            return 1
+        fi
+        echo "$new_pane_id"
+        return 0
+    }
+
+    wait_for_pane_observed() {
+        local pane="$1"
+        local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane)' >/dev/null 2>&1"
+        wait_for_condition "pane $pane observed" "$check_cmd" "$wait_timeout"
+    }
+
+    # Step 1: Configure isolated workspace and notifications
+    log_info "Step 1: Preparing workspace + notifications config..."
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+    else
+        log_fail "Baseline config not found: $baseline_config"
+        return 1
+    fi
+
+    cat >> "$temp_workspace/wa.toml" <<EOF
+
+[notifications]
+enabled = true
+cooldown_ms = 1500
+dedup_window_ms = 1
+min_severity = "info"
+include = ["codex:compaction"]
+
+[[notifications.webhooks]]
+name = "e2e-webhook"
+url = "${mock_addr}/webhook"
+template = "generic"
+events = ["codex:compaction"]
+EOF
+
+    export WA_CONFIG="$temp_workspace/wa.toml"
+    log_pass "Notifications configured for $mock_addr"
+
+    # Step 2: Start wa watch
+    log_info "Step 2: Starting wa watch..."
+    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "wa watch failed to start"
+        return 1
+    fi
+    log_pass "wa watch running"
+
+    # Step 3: Successful delivery
+    log_info "Step 3: Successful webhook delivery..."
+    if ! start_mock_server "200" "$scenario_dir/mock_server_success.log" \
+        "$scenario_dir/mock_server_success.out"; then
+        return 1
+    fi
+    pane_id=$(spawn_compaction_pane "$emit_script" "$secret_token" 1 0.1) || {
+        log_fail "Failed to spawn compaction pane for success case"
+        return 1
+    }
+    log_info "Spawned pane: $pane_id"
+    if ! wait_for_pane_observed "$pane_id"; then
+        log_fail "Pane not observed for success case"
+        result=1
+    fi
+
+    local check_success_cmd='[[ $(mock_received_count) -ge 1 ]]'
+    if ! wait_for_condition "webhook received (success)" "$check_success_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for webhook delivery"
+        result=1
+    else
+        log_pass "Webhook delivery observed"
+    fi
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_success.json" 2>/dev/null || true
+    if jq -e '.[-1].event_type == "codex:compaction"' \
+        "$scenario_dir/notifications_received_success.json" >/dev/null 2>&1; then
+        log_pass "Payload contains expected event_type"
+    else
+        log_fail "Payload missing expected event_type"
+        result=1
+    fi
+    if grep -q "$secret_token" "$scenario_dir/notifications_received_success.json" 2>/dev/null; then
+        log_fail "Secret token leaked in webhook payload"
+        result=1
+    else
+        log_pass "Webhook payloads redacted (no secret token)"
+    fi
+    wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+    pane_id=""
+    stop_mock_server
+
+    # Step 4: Retry/backoff (500,500,200)
+    log_info "Step 4: Webhook retry/backoff on failures..."
+    if ! start_mock_server "500,500,200" "$scenario_dir/mock_server_retry.log" \
+        "$scenario_dir/mock_server_retry.out"; then
+        return 1
+    fi
+    pane_id=$(spawn_compaction_pane "$emit_script" "$secret_token" 1 0.1) || {
+        log_fail "Failed to spawn compaction pane for retry case"
+        return 1
+    }
+    log_info "Spawned pane: $pane_id"
+    if ! wait_for_pane_observed "$pane_id"; then
+        log_fail "Pane not observed for retry case"
+        result=1
+    fi
+
+    local check_attempts_cmd='[[ $(mock_attempt_count) -ge 3 ]]'
+    if ! wait_for_condition "webhook attempts >=3" "$check_attempts_cmd" "$wait_timeout"; then
+        log_fail "Retry attempts did not reach expected count"
+        result=1
+    else
+        log_pass "Retry/backoff attempts observed"
+    fi
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_retry.json" 2>/dev/null || true
+    if grep -q "status=200" "$scenario_dir/mock_server_retry.log" 2>/dev/null; then
+        log_pass "Final retry succeeded (200)"
+    else
+        log_fail "No successful retry observed in mock log"
+        result=1
+    fi
+    wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+    pane_id=""
+    stop_mock_server
+
+    # Step 5: Throttling prevents spam (cooldown)
+    log_info "Step 5: Throttling prevents spam..."
+    if ! start_mock_server "200" "$scenario_dir/mock_server_throttle.log" \
+        "$scenario_dir/mock_server_throttle.out"; then
+        return 1
+    fi
+    pane_id=$(spawn_compaction_pane "$throttle_script" "$secret_token" 4 0.1 2) || {
+        log_fail "Failed to spawn compaction pane for throttle case"
+        return 1
+    }
+    log_info "Spawned pane: $pane_id"
+    if ! wait_for_pane_observed "$pane_id"; then
+        log_fail "Pane not observed for throttle case"
+        result=1
+    fi
+
+    local check_throttle_cmd='[[ $(mock_received_count) -ge 2 ]]'
+    if ! wait_for_condition "throttle second delivery" "$check_throttle_cmd" "$wait_timeout"; then
+        log_fail "Throttle second delivery not observed"
+        result=1
+    else
+        log_pass "Throttle delivery observed"
+    fi
+
+    if ! wait_for_stable_attempts 2 "$wait_timeout"; then
+        log_warn "Webhook attempt count did not stabilize"
+    fi
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_throttle.json" 2>/dev/null || true
+    if jq -e '.[-1].suppressed_since_last >= 1' \
+        "$scenario_dir/notifications_received_throttle.json" >/dev/null 2>&1; then
+        log_pass "Throttle suppression count recorded"
+    else
+        log_fail "Throttle suppression count missing"
+        result=1
+    fi
+    wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+    pane_id=""
+    stop_mock_server
+
+    # Step 6: Recovery after endpoint downtime
+    log_info "Step 6: Recovery after endpoint downtime..."
+    stop_mock_server
+    pane_id=$(spawn_compaction_pane "$emit_script" "$secret_token" 1 0.1) || {
+        log_fail "Failed to spawn compaction pane for recovery case"
+        return 1
+    }
+    log_info "Spawned pane: $pane_id"
+    if ! wait_for_pane_observed "$pane_id"; then
+        log_fail "Pane not observed for recovery case"
+        result=1
+    fi
+
+    local log_offset
+    log_offset=$(wc -l < "$scenario_dir/wa_watch.log" 2>/dev/null || echo "0")
+    local check_fail_cmd="tail -n +$((log_offset + 1)) \"$scenario_dir/wa_watch.log\" | grep -q \"webhook delivery failed\""
+    if ! wait_for_condition "webhook failure logged" "$check_fail_cmd" "$wait_timeout"; then
+        log_fail "No webhook failure logged before recovery"
+        result=1
+    else
+        log_pass "Webhook failure logged"
+    fi
+
+    if ! start_mock_server "200" "$scenario_dir/mock_server_recovery.log" \
+        "$scenario_dir/mock_server_recovery.out"; then
+        return 1
+    fi
+    local check_recovery_cmd='[[ $(mock_received_count) -ge 1 ]]'
+    if ! wait_for_condition "webhook recovery delivery" "$check_recovery_cmd" "$wait_timeout"; then
+        log_fail "Recovery delivery not observed"
+        result=1
+    else
+        log_pass "Recovery delivery observed"
+    fi
+    curl -s "$mock_addr/received" > "$scenario_dir/notifications_received_recovery.json" 2>/dev/null || true
+
+    wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+    pane_id=""
+    stop_mock_server
+
+    # Step 7: Capture events + audit slice artifacts
+    log_info "Step 7: Capturing events + audit slice..."
+    "$WA_BINARY" events -f json --limit 200 > "$scenario_dir/events.json" 2>&1 || true
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        sqlite3 "$db_path" -json \
+            "SELECT id, action_kind, actor_kind, result, summary, error FROM audit_actions ORDER BY id DESC LIMIT 200;" \
+            | jq -c '.[]' > "$scenario_dir/policy_audit_slice.jsonl" 2>/dev/null || true
+    fi
+
+    trap - EXIT
+    cleanup_notification_webhook
 
     return $result
 }
@@ -3626,6 +4173,9 @@ run_scenario() {
             ;;
         usage_limit_safe_pause)
             run_scenario_usage_limit_safe_pause "$scenario_dir" || result=$?
+            ;;
+        notification_webhook)
+            run_scenario_notification_webhook "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"
