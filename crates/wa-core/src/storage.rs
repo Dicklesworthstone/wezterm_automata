@@ -3572,6 +3572,25 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Get the latest step log for a workflow (highest step_index).
+    pub async fn get_latest_step_log(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowStepLogRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let workflow_id = workflow_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_latest_step_log(&conn, &workflow_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Get the persisted action plan for a workflow execution, if available
     pub async fn get_action_plan(
         &self,
@@ -6591,6 +6610,46 @@ fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowS
     Ok(results)
 }
 
+fn query_latest_step_log(
+    conn: &Connection,
+    workflow_id: &str,
+) -> Result<Option<WorkflowStepLogRecord>> {
+    conn.query_row(
+        "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
+             result_type, result_data, policy_summary, verification_refs, error_code,
+             started_at, completed_at, duration_ms
+         FROM workflow_step_logs
+         WHERE workflow_id = ?1
+         ORDER BY step_index DESC
+         LIMIT 1",
+        [workflow_id],
+        |row| {
+            Ok(WorkflowStepLogRecord {
+                id: row.get(0)?,
+                workflow_id: row.get(1)?,
+                audit_action_id: row.get(2)?,
+                step_index: {
+                    let val: i64 = row.get(3)?;
+                    i64_to_usize(val)?
+                },
+                step_name: row.get(4)?,
+                step_id: row.get(5)?,
+                step_kind: row.get(6)?,
+                result_type: row.get(7)?,
+                result_data: row.get(8)?,
+                policy_summary: row.get(9)?,
+                verification_refs: row.get(10)?,
+                error_code: row.get(11)?,
+                started_at: row.get(12)?,
+                completed_at: row.get(13)?,
+                duration_ms: row.get(14)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
 /// Query incomplete workflows for resume on restart
 #[allow(clippy::cast_sign_loss)]
 fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> {
@@ -8915,6 +8974,97 @@ fn query_step_logs_returns_empty_for_unknown_workflow() {
         logs.is_empty(),
         "Should return empty vec for unknown workflow"
     );
+}
+
+#[test]
+fn query_latest_step_log_returns_last_step() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params!["wf-test-latest", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
+    )
+    .unwrap();
+
+    insert_step_log_sync(
+        &conn,
+        "wf-test-latest",
+        None,
+        0,
+        "step_one",
+        None,
+        None,
+        "continue",
+        None,
+        None,
+        None,
+        None,
+        now_ms,
+        now_ms + 100,
+    )
+    .unwrap();
+
+    insert_step_log_sync(
+        &conn,
+        "wf-test-latest",
+        None,
+        2,
+        "step_three",
+        None,
+        None,
+        "done",
+        None,
+        None,
+        None,
+        None,
+        now_ms + 200,
+        now_ms + 400,
+    )
+    .unwrap();
+
+    insert_step_log_sync(
+        &conn,
+        "wf-test-latest",
+        None,
+        1,
+        "step_two",
+        None,
+        None,
+        "continue",
+        None,
+        None,
+        None,
+        None,
+        now_ms + 100,
+        now_ms + 200,
+    )
+    .unwrap();
+
+    let latest = query_latest_step_log(&conn, "wf-test-latest")
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.step_index, 2);
+    assert_eq!(latest.step_name, "step_three");
+    assert_eq!(latest.result_type, "done");
+}
+
+#[test]
+fn query_latest_step_log_returns_none_for_unknown_workflow() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let latest = query_latest_step_log(&conn, "unknown-workflow").unwrap();
+    assert!(latest.is_none());
 }
 
 #[test]
