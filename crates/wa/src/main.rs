@@ -5543,15 +5543,55 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         return Ok(());
                                     }
 
+                                    if execution_id.is_none() {
+                                        if let Some(pane_id) = pane {
+                                            match storage.get_pane(pane_id).await {
+                                                Ok(Some(_)) => {}
+                                                Ok(None) => {
+                                                    let response = RobotResponse::<
+                                                        RobotWorkflowStatusListData,
+                                                    >::error_with_code(
+                                                        "E_PANE_NOT_FOUND",
+                                                        format!(
+                                                            "No pane found with ID: {pane_id}"
+                                                        ),
+                                                        Some(
+                                                            "Check the pane ID or run 'wa robot state' to list panes."
+                                                                .to_string(),
+                                                        ),
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                                Err(e) => {
+                                                    let response = RobotResponse::<
+                                                        RobotWorkflowStatusListData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_STORAGE,
+                                                        format!(
+                                                            "Failed to query pane metadata: {e}"
+                                                        ),
+                                                        None,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Query by execution_id if provided
                                     if let Some(exec_id) = &execution_id {
                                         match storage.get_workflow(exec_id).await {
                                             Ok(Some(record)) => {
-                                                // Get step logs if verbose
-                                                let step_logs = if verbose > 0 {
+                                                let (step_logs, latest_log) = if verbose > 0 {
                                                     match storage.get_step_logs(exec_id).await {
-                                                        Ok(logs) => Some(
-                                                            logs.into_iter()
+                                                        Ok(logs) => {
+                                                            let latest = logs.last().cloned();
+                                                            let mapped = logs
+                                                                .into_iter()
                                                                 .map(|log| RobotWorkflowStepLog {
                                                                     step_index: log.step_index,
                                                                     step_name: log.step_name,
@@ -5585,31 +5625,88 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                         log.duration_ms,
                                                                     ),
                                                                 })
-                                                                .collect(),
-                                                        ),
-                                                        Err(_) => None,
-                                                    }
-                                                } else {
-                                                    None
-                                                };
-                                                let action_plan = if verbose > 0 {
-                                                    match storage.get_action_plan(exec_id).await {
-                                                        Ok(Some(record)) => {
-                                                            Some(RobotWorkflowActionPlan {
-                                                                plan_id: record.plan_id,
-                                                                plan_hash: record.plan_hash,
-                                                                plan: serde_json::from_str(
-                                                                    &record.plan_json,
-                                                                )
-                                                                .ok(),
-                                                                created_at: Some(record.created_at),
-                                                            })
+                                                                .collect();
+                                                            (Some(mapped), latest)
                                                         }
-                                                        _ => None,
+                                                        Err(_) => (None, None),
                                                     }
                                                 } else {
-                                                    None
+                                                    let latest = storage
+                                                        .get_latest_step_log(exec_id)
+                                                        .await
+                                                        .unwrap_or_default();
+                                                    (None, latest)
                                                 };
+
+                                                let (action_plan, plan_step_name, total_steps) =
+                                                    match storage.get_action_plan(exec_id).await {
+                                                        Ok(Some(plan_record)) => {
+                                                            let parsed_plan =
+                                                                serde_json::from_str::<
+                                                                    wa_core::plan::ActionPlan,
+                                                                >(
+                                                                    &plan_record.plan_json
+                                                                )
+                                                                .ok();
+                                                            let step_name = parsed_plan
+                                                                .as_ref()
+                                                                .and_then(|plan| {
+                                                                    plan.steps
+                                                                        .get(record.current_step)
+                                                                })
+                                                                .map(|step| {
+                                                                    step.description.clone()
+                                                                });
+                                                            let total_steps = parsed_plan
+                                                                .as_ref()
+                                                                .and_then(|plan| {
+                                                                    let count = plan.steps.len();
+                                                                    if count > 0 {
+                                                                        Some(count)
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                });
+
+                                                            let action_plan = if verbose > 0 {
+                                                                let plan_value = parsed_plan
+                                                                    .as_ref()
+                                                                    .and_then(|plan| {
+                                                                        serde_json::to_value(plan)
+                                                                            .ok()
+                                                                    })
+                                                                    .or_else(|| {
+                                                                        serde_json::from_str(
+                                                                            &plan_record.plan_json,
+                                                                        )
+                                                                        .ok()
+                                                                    });
+                                                                Some(RobotWorkflowActionPlan {
+                                                                    plan_id: plan_record.plan_id,
+                                                                    plan_hash: plan_record
+                                                                        .plan_hash,
+                                                                    plan: plan_value,
+                                                                    created_at: Some(
+                                                                        plan_record.created_at,
+                                                                    ),
+                                                                })
+                                                            } else {
+                                                                None
+                                                            };
+
+                                                            (action_plan, step_name, total_steps)
+                                                        }
+                                                        _ => (None, None, None),
+                                                    };
+
+                                                let step_name = plan_step_name.or_else(|| {
+                                                    latest_log
+                                                        .as_ref()
+                                                        .map(|log| log.step_name.clone())
+                                                });
+                                                let last_step_result = latest_log
+                                                    .as_ref()
+                                                    .map(|log| log.result_type.clone());
 
                                                 // Calculate elapsed_ms
                                                 let now = std::time::SystemTime::now()
@@ -5631,11 +5728,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     pane_id: Some(record.pane_id),
                                                     trigger_event_id: record.trigger_event_id,
                                                     status: record.status,
-                                                    step_name: None, // Would need workflow definition to get step names
+                                                    step_name,
                                                     elapsed_ms: elapsed,
-                                                    last_step_result: None, // Would need step logs to derive
+                                                    last_step_result,
                                                     current_step: Some(record.current_step),
-                                                    total_steps: None, // Would need workflow definition
+                                                    total_steps,
                                                     wait_condition: record.wait_condition,
                                                     context: record.context,
                                                     result: record.result,
@@ -5685,9 +5782,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // Query active/by-pane workflows
                                         let records = if active {
                                             storage.find_incomplete_workflows().await
+                                        } else if let Some(pane_id) = pane {
+                                            let query = wa_core::storage::ExportQuery {
+                                                pane_id: Some(pane_id),
+                                                limit: Some(50),
+                                                ..Default::default()
+                                            };
+                                            storage.export_workflows(query).await
                                         } else {
-                                            // Note: pane filter would require a custom query
-                                            // For now, filter in-memory after getting incomplete workflows
                                             storage.find_incomplete_workflows().await
                                         };
 
@@ -7251,9 +7353,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Workflow { command }) => {
             match command {
                 WorkflowCommands::List => {
-                    println!("Available workflows:");
-                    println!("  - handle_compaction");
-                    println!("  - handle_usage_limits");
+                    use std::sync::Arc;
+                    use wa_core::workflows::{
+                        HandleCompaction, Workflow,
+                    };
+
+                    let workflows: Vec<Arc<dyn Workflow>> = vec![
+                        Arc::new(
+                            HandleCompaction::new()
+                                .with_prompt_config(config.workflows.compaction_prompts.clone()),
+                        ),
+                        Arc::new(wa_core::workflows::HandleUsageLimits::new()),
+                        Arc::new(wa_core::workflows::HandleSessionEnd::new()),
+                        Arc::new(wa_core::workflows::HandleAuthRequired::new()),
+                        Arc::new(wa_core::workflows::HandleClaudeCodeLimits::new()),
+                        Arc::new(wa_core::workflows::HandleGeminiQuota::new()),
+                    ];
+
+                    println!(
+                        "{:<30} {:<8} {:<7} {}",
+                        "NAME", "STEPS", "PANE?", "DESCRIPTION"
+                    );
+                    for wf in &workflows {
+                        let steps = wf.steps();
+                        println!(
+                            "{:<30} {:<8} {:<7} {}",
+                            wf.name(),
+                            steps.len(),
+                            "yes",
+                            wf.description()
+                        );
+                    }
+                    println!("\n{} workflow(s) available.", workflows.len());
                 }
                 WorkflowCommands::Run {
                     name,
@@ -7279,9 +7410,178 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
                         println!("{}", wa_core::dry_run::format_human(&report));
                     } else {
+                        use std::sync::Arc;
+                        use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
+                        use wa_core::storage::StorageHandle;
+                        use wa_core::workflows::{
+                            PaneWorkflowLockManager, WorkflowEngine,
+                            WorkflowExecutionResult, WorkflowRunner,
+                            WorkflowRunnerConfig,
+                        };
+
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);
-                        // TODO: Implement workflow run
-                        println!("Workflow run not yet implemented");
+
+                        // Verify pane exists
+                        let wezterm = wa_core::wezterm::WeztermClient::new();
+                        match wezterm.list_panes().await {
+                            Ok(panes) => {
+                                if !panes.iter().any(|p| p.pane_id == pane) {
+                                    eprintln!("Error: Pane {pane} does not exist.");
+                                    eprintln!("Hint: Use 'wa status' to list available panes.");
+                                    std::process::exit(1);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: Failed to query WezTerm panes: {e}");
+                                eprintln!(
+                                    "Hint: Ensure WezTerm is running and wezterm CLI is in PATH."
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+
+                        // Set up workflow infrastructure
+                        let db_path = layout.db_path.to_string_lossy();
+                        let storage = match StorageHandle::new(&db_path).await {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                eprintln!("Error: Failed to open storage: {e}");
+                                eprintln!("Hint: Check database path and permissions.");
+                                std::process::exit(1);
+                            }
+                        };
+
+                        let engine = WorkflowEngine::new(10);
+                        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+
+                        // Human mode requires prompt active
+                        let policy_engine = PolicyEngine::new(
+                            config.safety.rate_limit_per_pane,
+                            config.safety.rate_limit_global,
+                            true, // Require prompt active for human mode
+                        );
+
+                        let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                        let injector = Arc::new(tokio::sync::Mutex::new(
+                            PolicyGatedInjector::with_storage(
+                                policy_engine,
+                                wezterm_client,
+                                storage.as_ref().clone(),
+                            ),
+                        ));
+                        let runner_config = WorkflowRunnerConfig::default();
+                        let runner = WorkflowRunner::new(
+                            engine,
+                            lock_manager,
+                            Arc::clone(&storage),
+                            injector,
+                            runner_config,
+                        );
+
+                        // Register built-in workflows
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleCompaction::new()
+                                .with_prompt_config(config.workflows.compaction_prompts.clone()),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleUsageLimits::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleSessionEnd::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleAuthRequired::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleClaudeCodeLimits::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            wa_core::workflows::HandleGeminiQuota::new(),
+                        ));
+
+                        // Look up workflow
+                        let workflow = runner.find_workflow_by_name(&name);
+
+                        if let Some(wf) = workflow {
+                            println!(
+                                "Workflow: {} ({})",
+                                wf.name(), wf.description()
+                            );
+                            println!("Target pane: {pane}");
+                            println!("Steps: {}", wf.step_count());
+                            println!();
+
+                            // Generate execution ID
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let execution_id = format!("human-{name}-{now_ms}");
+
+                            // Run the workflow
+                            let run_start = std::time::Instant::now();
+                            let result = runner
+                                .run_workflow(pane, wf, &execution_id, 0)
+                                .await;
+                            let elapsed = run_start.elapsed();
+
+                            match result {
+                                WorkflowExecutionResult::Completed {
+                                    steps_executed,
+                                    ..
+                                } => {
+                                    println!(
+                                        "Result: completed ({} step(s) in {:.1}s)",
+                                        steps_executed,
+                                        elapsed.as_secs_f64()
+                                    );
+                                    println!("Execution ID: {execution_id}");
+                                }
+                                WorkflowExecutionResult::Aborted {
+                                    reason,
+                                    step_index,
+                                    ..
+                                } => {
+                                    eprintln!(
+                                        "Result: aborted at step {step_index}"
+                                    );
+                                    eprintln!("Reason: {reason}");
+                                    eprintln!("Execution ID: {execution_id}");
+                                    eprintln!(
+                                        "\nHint: Use 'wa workflow status {execution_id}' for details."
+                                    );
+                                }
+                                WorkflowExecutionResult::PolicyDenied {
+                                    reason,
+                                    step_index,
+                                    ..
+                                } => {
+                                    eprintln!(
+                                        "Result: denied by policy at step {step_index}"
+                                    );
+                                    eprintln!("Reason: {reason}");
+                                    eprintln!("Execution ID: {execution_id}");
+                                    eprintln!(
+                                        "\nHint: Check safety configuration or use --dry-run to preview."
+                                    );
+                                }
+                                WorkflowExecutionResult::Error { error, .. } => {
+                                    eprintln!("Result: error");
+                                    eprintln!("Error: {error}");
+                                    eprintln!("Execution ID: {execution_id}");
+                                }
+                            }
+                        } else {
+                            eprintln!("Error: Workflow '{name}' not found.");
+                            eprintln!(
+                                "Hint: Use 'wa workflow list' to see available workflows."
+                            );
+                            std::process::exit(1);
+                        }
+
+                        if let Err(e) = storage.shutdown().await {
+                            tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                        }
                     }
                 }
                 WorkflowCommands::Status {
@@ -15742,5 +16042,404 @@ mod tests {
         assert_eq!(rt_workflows.len(), 2);
         assert_eq!(rt_workflows[0]["name"], "handle_compaction");
         assert_eq!(rt_workflows[1]["name"], "handle_usage_limits");
+    }
+
+    // ========================================================================
+    // CLI Parsing Tests — workflow subcommands (bd-qvbz)
+    // ========================================================================
+
+    #[test]
+    fn cli_workflow_run_parses_name_and_pane() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "run", "handle_compaction", "3"])
+            .expect("workflow run should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command: RobotWorkflowCommands::Run { name, pane_id, .. },
+                }) => {
+                    assert_eq!(name, "handle_compaction");
+                    assert_eq!(pane_id, 3);
+                }
+                _ => panic!("expected Workflow::Run"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_run_rejects_missing_pane() {
+        let result = Cli::try_parse_from(["wa", "robot", "workflow", "run", "handle_compaction"]);
+        assert!(result.is_err(), "workflow run without pane_id should fail");
+    }
+
+    #[test]
+    fn cli_workflow_run_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "robot",
+            "workflow",
+            "run",
+            "handle_compaction",
+            "5",
+            "--dry-run",
+        ])
+        .expect("workflow run --dry-run should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command: RobotWorkflowCommands::Run { dry_run, .. },
+                }) => {
+                    assert!(dry_run, "dry_run flag should be true");
+                }
+                _ => panic!("expected Workflow::Run"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_list_parses() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "list"])
+            .expect("workflow list should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command: RobotWorkflowCommands::List,
+                }) => {}
+                _ => panic!("expected Workflow::List"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_status_by_execution_id() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "wf-abc123"])
+            .expect("workflow status should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command:
+                        RobotWorkflowCommands::Status {
+                            execution_id,
+                            pane,
+                            active,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(execution_id.as_deref(), Some("wf-abc123"));
+                    assert!(pane.is_none());
+                    assert!(!active);
+                }
+                _ => panic!("expected Workflow::Status"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_status_by_pane() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "--pane", "7"])
+            .expect("workflow status --pane should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command:
+                        RobotWorkflowCommands::Status {
+                            execution_id, pane, ..
+                        },
+                }) => {
+                    assert!(execution_id.is_none());
+                    assert_eq!(pane, Some(7));
+                }
+                _ => panic!("expected Workflow::Status"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_status_active_flag() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "status", "--active"])
+            .expect("workflow status --active should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command: RobotWorkflowCommands::Status { active, .. },
+                }) => {
+                    assert!(active);
+                }
+                _ => panic!("expected Workflow::Status"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_abort_parses_execution_id() {
+        let cli = Cli::try_parse_from(["wa", "robot", "workflow", "abort", "wf-xyz789"])
+            .expect("workflow abort should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command:
+                        RobotWorkflowCommands::Abort {
+                            execution_id,
+                            reason,
+                            force,
+                        },
+                }) => {
+                    assert_eq!(execution_id, "wf-xyz789");
+                    assert!(reason.is_none());
+                    assert!(!force);
+                }
+                _ => panic!("expected Workflow::Abort"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_abort_with_reason_and_force() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "robot",
+            "workflow",
+            "abort",
+            "wf-xyz789",
+            "--reason",
+            "Manual intervention",
+            "--force",
+        ])
+        .expect("workflow abort with reason and force should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Workflow {
+                    command:
+                        RobotWorkflowCommands::Abort {
+                            execution_id,
+                            reason,
+                            force,
+                        },
+                }) => {
+                    assert_eq!(execution_id, "wf-xyz789");
+                    assert_eq!(reason.as_deref(), Some("Manual intervention"));
+                    assert!(force);
+                }
+                _ => panic!("expected Workflow::Abort"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_workflow_abort_rejects_missing_execution_id() {
+        let result = Cli::try_parse_from(["wa", "robot", "workflow", "abort"]);
+        assert!(
+            result.is_err(),
+            "workflow abort without execution_id should fail"
+        );
+    }
+
+    #[test]
+    fn cli_events_unhandled_flag() {
+        let cli = Cli::try_parse_from(["wa", "robot", "events", "--unhandled"])
+            .expect("events --unhandled should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events { unhandled, .. }) => {
+                    assert!(unhandled, "--unhandled flag should be true");
+                }
+                _ => panic!("expected Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_events_unhandled_only_alias() {
+        let cli = Cli::try_parse_from(["wa", "robot", "events", "--unhandled-only"])
+            .expect("events --unhandled-only should parse");
+        match cli.command {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events { unhandled, .. }) => {
+                    assert!(
+                        unhandled,
+                        "--unhandled-only alias should set unhandled=true"
+                    );
+                }
+                _ => panic!("expected Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    // ========================================================================
+    // Error code stability — workflow-specific codes (bd-qvbz)
+    // ========================================================================
+
+    #[test]
+    fn robot_workflow_status_error_missing_params() {
+        // When no execution_id, --pane, or --active is provided, the handler
+        // should produce E_MISSING_ARGUMENT. Test the error envelope shape.
+        let response = RobotResponse::<RobotWorkflowStatusData>::error_with_code(
+            "E_MISSING_ARGUMENT",
+            "Provide --execution-id, --pane, or --active".to_string(),
+            Some("Use `wa robot workflow status --active` to list running workflows".to_string()),
+            5,
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error_code"], "E_MISSING_ARGUMENT");
+        assert!(json["hint"].is_string());
+    }
+
+    #[test]
+    fn robot_workflow_status_error_not_found() {
+        let response = RobotResponse::<RobotWorkflowStatusData>::error_with_code(
+            "E_EXECUTION_NOT_FOUND",
+            "No workflow execution found with ID: wf-nonexistent".to_string(),
+            Some("Use `wa robot workflow status --active` to list running workflows".to_string()),
+            3,
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error_code"], "E_EXECUTION_NOT_FOUND");
+        assert!(json["error"].as_str().unwrap().contains("wf-nonexistent"));
+    }
+
+    // ========================================================================
+    // Human workflow CLI parsing tests (wa-nu4.3.2.8)
+    // ========================================================================
+
+    #[test]
+    fn human_workflow_list_parses() {
+        let cli =
+            Cli::try_parse_from(["wa", "workflow", "list"]).expect("workflow list should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command: WorkflowCommands::List,
+            }) => {}
+            _ => panic!("expected Workflow::List"),
+        }
+    }
+
+    #[test]
+    fn human_workflow_run_parses_name_and_pane() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "workflow",
+            "run",
+            "handle_compaction",
+            "--pane",
+            "5",
+        ])
+        .expect("workflow run should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command: WorkflowCommands::Run { name, pane, dry_run },
+            }) => {
+                assert_eq!(name, "handle_compaction");
+                assert_eq!(pane, 5);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Workflow::Run"),
+        }
+    }
+
+    #[test]
+    fn human_workflow_run_dry_run_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "workflow",
+            "run",
+            "handle_usage_limits",
+            "--pane",
+            "3",
+            "--dry-run",
+        ])
+        .expect("workflow run --dry-run should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command: WorkflowCommands::Run { dry_run, .. },
+            }) => {
+                assert!(dry_run, "--dry-run flag should be true");
+            }
+            _ => panic!("expected Workflow::Run"),
+        }
+    }
+
+    #[test]
+    fn human_workflow_run_rejects_missing_pane() {
+        let result =
+            Cli::try_parse_from(["wa", "workflow", "run", "handle_compaction"]);
+        assert!(
+            result.is_err(),
+            "workflow run without --pane should fail"
+        );
+    }
+
+    #[test]
+    fn human_workflow_status_parses_execution_id() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "workflow",
+            "status",
+            "human-handle_compaction-123456",
+        ])
+        .expect("workflow status should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command:
+                    WorkflowCommands::Status {
+                        execution_id,
+                        verbose,
+                    },
+            }) => {
+                assert_eq!(execution_id, "human-handle_compaction-123456");
+                assert_eq!(verbose, 0);
+            }
+            _ => panic!("expected Workflow::Status"),
+        }
+    }
+
+    #[test]
+    fn human_workflow_status_verbose_flag() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "workflow",
+            "status",
+            "wf-abc",
+            "-v",
+        ])
+        .expect("workflow status -v should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command: WorkflowCommands::Status { verbose, .. },
+            }) => {
+                assert_eq!(verbose, 1, "-v should set verbose=1");
+            }
+            _ => panic!("expected Workflow::Status"),
+        }
+    }
+
+    #[test]
+    fn human_workflow_status_double_verbose() {
+        let cli = Cli::try_parse_from([
+            "wa",
+            "workflow",
+            "status",
+            "wf-abc",
+            "-vv",
+        ])
+        .expect("workflow status -vv should parse");
+        match cli.command {
+            Some(Commands::Workflow {
+                command: WorkflowCommands::Status { verbose, .. },
+            }) => {
+                assert_eq!(verbose, 2, "-vv should set verbose=2");
+            }
+            _ => panic!("expected Workflow::Status"),
+        }
     }
 }
