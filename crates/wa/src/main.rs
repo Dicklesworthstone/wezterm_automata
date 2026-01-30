@@ -4313,8 +4313,8 @@ async fn run_scheduled_backups(
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to compute next backup schedule; retrying");
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                    _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    () = wait_for_shutdown(shutdown_flag.clone()) => break,
                 }
                 continue;
             }
@@ -4332,8 +4332,8 @@ async fn run_scheduled_backups(
         );
 
         tokio::select! {
-            _ = tokio::time::sleep(sleep_duration) => {}
-            _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+            () = tokio::time::sleep(sleep_duration) => {}
+            () = wait_for_shutdown(shutdown_flag.clone()) => break,
         }
 
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -4381,8 +4381,8 @@ async fn run_scheduled_backups(
                     if attempt < 3 {
                         let backoff = Duration::from_secs(2_u64.pow(attempt - 1));
                         tokio::select! {
-                            _ = tokio::time::sleep(backoff) => {}
-                            _ = wait_for_shutdown(shutdown_flag.clone()) => break,
+                            () = tokio::time::sleep(backoff) => {}
+                            () = wait_for_shutdown(shutdown_flag.clone()) => break,
                         }
                     }
                 }
