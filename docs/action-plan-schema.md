@@ -69,6 +69,28 @@ Approvals should bind to the plan hash (or the derived `plan_id`) so the approve
 
 This section specifies the **prepare/commit** flow for plan-hash-bound approvals. The goal is to prevent TOCTOU and confused-deputy mistakes while keeping the UX understandable for humans and structured for robots/MCP.
 
+For the user-facing walkthrough and troubleshooting guide, see `docs/approvals.md`.
+
+### When to Use Prepare/Commit
+
+Use prepare/commit whenever an action can mutate a pane, run workflows, or otherwise perform a side effect. Concretely:
+
+- **Required** when policy returns `require_approval`.
+- **Recommended** when you want a deterministic preview before executing (even if approval is not required).
+- **Default mental model** for any potentially risky or irreversible action.
+
+If you are ever unsure, prefer `prepare` first. It is safe, shows exactly what will run, and produces the plan hash needed for approval binding.
+
+### Plan Hash Mental Model
+
+The plan hash is a digest of the **canonical** ActionPlan representation: actions, preconditions, verification steps, and on-failure behavior. It intentionally excludes volatile fields (timestamps, random IDs) so semantically identical plans always hash to the same value.
+
+Approvals are bound to this hash (or its `plan_id` derivative). That means:
+
+- An approval can **only** authorize the exact plan you previewed.
+- If the plan changes, the hash changes, and the approval is rejected.
+- The hash is the concrete proof that "what I approved" equals "what is about to run."
+
 ### Human CLI Flow
 
 **Prepare**
@@ -158,6 +180,17 @@ Commit MUST refuse execution if **any** binding check fails:
 | `E_PLAN_PRECONDITION_FAILED` | Plan preconditions no longer true | Re-run prepare |
 
 This design ensures **explicit user intent**: the plan preview is exactly what gets executed, and approvals cannot be replayed against different actions.
+
+### Troubleshooting Checklist
+
+If prepare/commit fails, use this checklist before retrying:
+
+1. **Plan expired** (`E_PLAN_EXPIRED`): plans have TTLs to prevent replay. Re-run `wa prepare ...` and approve again.
+2. **Hash mismatch** (`E_PLAN_HASH_MISMATCH`): the plan changed. Re-run prepare and use the new plan hash/ID.
+3. **Pane mismatch** (`E_PLAN_PANE_MISMATCH`): the pane identity changed (pane restarted, new session). Re-run prepare on the current pane.
+4. **Precondition failed** (`E_PLAN_PRECONDITION_FAILED`): environment drift (alt-screen, prompt state, etc.). Resolve the precondition and re-run prepare.
+
+If you keep hitting mismatches, capture the plan preview, compare it to the latest plan, and verify you are approving the most recent plan hash.
 
 ## Extension Guidance (Adding New Step Kinds Safely)
 

@@ -25,6 +25,15 @@ pub struct ApprovalScope {
     pub action_fingerprint: String,
 }
 
+/// Optional audit context for approval consumption
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalAuditContext {
+    /// Correlation identifier to attach to the audit record
+    pub correlation_id: Option<String>,
+    /// Decision context JSON to attach to the audit record
+    pub decision_context: Option<String>,
+}
+
 impl ApprovalScope {
     /// Build a scope from policy input
     #[must_use]
@@ -127,6 +136,17 @@ impl<'a> ApprovalStore<'a> {
         allow_once_code: &str,
         input: &PolicyInput,
     ) -> Result<Option<ApprovalTokenRecord>> {
+        self.consume_with_context(allow_once_code, input, None)
+            .await
+    }
+
+    /// Consume a previously issued allow-once approval with optional audit context
+    pub async fn consume_with_context(
+        &self,
+        allow_once_code: &str,
+        input: &PolicyInput,
+        audit_context: Option<ApprovalAuditContext>,
+    ) -> Result<Option<ApprovalTokenRecord>> {
         let code_hash = hash_allow_once_code(allow_once_code);
         let fingerprint = fingerprint_for_input(input);
         let record = self
@@ -141,7 +161,7 @@ impl<'a> ApprovalStore<'a> {
             .await?;
 
         if record.is_some() {
-            self.audit_approval_grant(input, &code_hash, &fingerprint)
+            self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
                 .await?;
         }
 
@@ -153,6 +173,7 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         code_hash: &str,
         fingerprint: &str,
+        audit_context: Option<&ApprovalAuditContext>,
     ) -> Result<()> {
         let verification = format!(
             "workspace={}, fingerprint={}, hash={}",
@@ -164,6 +185,7 @@ impl<'a> ApprovalStore<'a> {
             ts: now_ms(),
             actor_kind: "human".to_string(),
             actor_id: None,
+            correlation_id: audit_context.and_then(|ctx| ctx.correlation_id.clone()),
             pane_id: input.pane_id,
             domain: input.domain.clone(),
             action_kind: "approve_allow_once".to_string(),
@@ -172,7 +194,7 @@ impl<'a> ApprovalStore<'a> {
             rule_id: None,
             input_summary: Some(format!("allow_once approval for {}", input.action.as_str())),
             verification_summary: Some(verification),
-            decision_context: None,
+            decision_context: audit_context.and_then(|ctx| ctx.decision_context.clone()),
             result: "success".to_string(),
         };
 
@@ -290,7 +312,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput};
-    use crate::storage::{PaneRecord, StorageHandle};
+    use crate::storage::{AuditQuery, PaneRecord, StorageHandle};
 
     fn base_input() -> PolicyInput {
         PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -509,6 +531,65 @@ mod tests {
             .await
             .unwrap();
         assert!(consumed.is_none(), "Expired token should not be consumable");
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    #[tokio::test]
+    async fn consume_with_context_records_correlation() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!(
+            "wa_test_approval_context_{}.db",
+            std::process::id()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
+        let pane = PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+        let request = store.issue(&input, None).await.unwrap();
+
+        let audit_context = ApprovalAuditContext {
+            correlation_id: Some("sha256:testcorr".to_string()),
+            decision_context: Some("{\"stage\":\"approval\"}".to_string()),
+        };
+        let consumed = store
+            .consume_with_context(&request.allow_once_code, &input, Some(audit_context))
+            .await
+            .unwrap();
+        assert!(consumed.is_some());
+
+        let query = AuditQuery {
+            correlation_id: Some("sha256:testcorr".to_string()),
+            ..Default::default()
+        };
+        let audits = storage.get_audit_actions(query).await.unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].correlation_id.as_deref(), Some("sha256:testcorr"));
+        assert_eq!(
+            audits[0].decision_context.as_deref(),
+            Some("{\"stage\":\"approval\"}")
+        );
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

@@ -344,6 +344,7 @@ SCENARIO_REGISTRY=(
     "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
+    "prepare_commit_approvals:Validate prepare/commit approvals with hash mismatch guard"
     "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
     "rules_explain_trace:Validate rules test trace + lint artifacts (explain-match)"
     "stress_scale:Validate scaled stress test (panes + large transcript)"
@@ -2279,6 +2280,209 @@ run_scenario_policy_denial() {
     # Cleanup trap will handle the rest
     trap - EXIT
     cleanup_policy_denial
+
+    return $result
+}
+
+# ==============================================================================
+# Scenario: Prepare/Commit Approvals
+# ==============================================================================
+# Validates prepare -> commit approval flow and hash mismatch guard.
+# ==============================================================================
+
+run_scenario_prepare_commit_approvals() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-prepare-commit-XXXXXX)
+    local pane_id=""
+    local result=0
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Build a permissive config that forces approval for send_text
+    local config_path="$temp_workspace/wa.toml"
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$config_path"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cat >> "$config_path" <<'EOF'
+[safety]
+require_prompt_active = false
+block_alt_screen = false
+
+[safety.command_gate]
+enabled = false
+
+[safety.rules]
+enabled = true
+
+[[safety.rules.rules]]
+id = "e2e.require_approval_send_text"
+priority = 10
+decision = "require_approval"
+message = "E2E: require approval for send_text"
+
+[safety.rules.rules.match_on]
+actions = ["send_text"]
+actors = ["human"]
+EOF
+
+    export WA_CONFIG="$config_path"
+
+    cleanup_prepare_commit_approvals() {
+        log_verbose "Cleaning up prepare_commit_approvals scenario"
+        if [[ -n "$pane_id" ]]; then
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_prepare_commit_approvals EXIT
+
+    # Step 1: Spawn a shell pane
+    log_info "Step 1: Spawning shell pane..."
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn shell pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned pane: $pane_id"
+    echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+    echo "spawn_output: $spawn_output" >> "$scenario_dir/scenario.log"
+
+    local marker="WA_PREPARE_COMMIT_OK_$(date +%s%N)"
+    local send_text="echo $marker"
+
+    # Step 2: Prepare plan (expect approval required)
+    log_info "Step 2: Preparing plan (expect approval)..."
+    "$WA_BINARY" prepare send --pane "$pane_id" --format json --wait-for "$marker" --timeout-secs 10 \
+        "$send_text" > "$scenario_dir/prepare_output.json" 2>&1 || true
+
+    if jq -e '.plan_id and .plan_hash' "$scenario_dir/prepare_output.json" >/dev/null 2>&1; then
+        log_pass "Prepare output JSON looks valid"
+    else
+        log_fail "Prepare output missing plan_id/plan_hash"
+        result=1
+    fi
+
+    local plan_id
+    local plan_hash
+    local approval_code
+    local requires_approval
+    plan_id=$(jq -r '.plan_id // empty' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "")
+    plan_hash=$(jq -r '.plan_hash // empty' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "")
+    approval_code=$(jq -r '.approval.code // empty' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "")
+    requires_approval=$(jq -r '.requires_approval // false' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "false")
+
+    echo "plan_id: $plan_id" >> "$scenario_dir/scenario.log"
+    echo "plan_hash: $plan_hash" >> "$scenario_dir/scenario.log"
+    echo "requires_approval: $requires_approval" >> "$scenario_dir/scenario.log"
+
+    if [[ "$requires_approval" == "true" ]]; then
+        log_pass "Prepare requires approval"
+    else
+        log_fail "Prepare did not require approval"
+        result=1
+    fi
+
+    if [[ -n "$approval_code" ]]; then
+        log_pass "Approval code issued"
+        echo "approval_code: $approval_code" >> "$scenario_dir/scenario.log"
+    else
+        log_fail "Approval code missing in prepare output"
+        result=1
+    fi
+
+    if [[ -z "$plan_id" || -z "$approval_code" ]]; then
+        log_fail "Plan ID or approval code missing; cannot proceed"
+        return 1
+    fi
+
+    # Step 3: Commit with mismatched text (expect failure)
+    log_info "Step 3: Commit with mismatched text (expect failure)..."
+    local mismatch_rc=0
+    "$WA_BINARY" commit "$plan_id" --approval-code "$approval_code" \
+        --text "echo ${marker}_MISMATCH" > "$scenario_dir/commit_mismatch.log" 2>&1 || mismatch_rc=$?
+    echo "commit_mismatch_rc: $mismatch_rc" >> "$scenario_dir/scenario.log"
+
+    if [[ $mismatch_rc -ne 0 ]]; then
+        log_pass "Mismatch commit failed as expected"
+    else
+        log_fail "Mismatch commit succeeded unexpectedly"
+        result=1
+    fi
+
+    if grep -q "E_PLAN_HASH_MISMATCH" "$scenario_dir/commit_mismatch.log" 2>/dev/null; then
+        log_pass "Hash mismatch error surfaced"
+    else
+        log_fail "Expected E_PLAN_HASH_MISMATCH not found"
+        result=1
+    fi
+
+    # Step 4: Commit with correct text (expect success)
+    log_info "Step 4: Commit with correct text..."
+    local commit_rc=0
+    "$WA_BINARY" commit "$plan_id" --approval-code "$approval_code" \
+        --text "$send_text" > "$scenario_dir/commit_output.log" 2>&1 || commit_rc=$?
+    echo "commit_rc: $commit_rc" >> "$scenario_dir/scenario.log"
+
+    if [[ $commit_rc -eq 0 ]]; then
+        log_pass "Commit succeeded"
+    else
+        log_fail "Commit failed (rc=$commit_rc)"
+        result=1
+    fi
+
+    if grep -q "Commit succeeded" "$scenario_dir/commit_output.log" 2>/dev/null; then
+        log_pass "Commit output indicates success"
+    else
+        log_fail "Commit output missing success message"
+        result=1
+    fi
+
+    # Step 5: Capture audit actions (approval + send)
+    log_info "Step 5: Capturing audit trail..."
+    "$WA_BINARY" audit -f json -l 50 > "$scenario_dir/audit_actions.json" 2>&1 || true
+
+    if jq -e 'map(select(.action_kind == "approve_allow_once")) | length > 0' \
+        "$scenario_dir/audit_actions.json" >/dev/null 2>&1; then
+        log_pass "Approval audit record captured"
+    else
+        log_fail "Approval audit record missing"
+        result=1
+    fi
+
+    if jq -e 'map(select(.action_kind == "send_text")) | length > 0' \
+        "$scenario_dir/audit_actions.json" >/dev/null 2>&1; then
+        log_pass "Send-text audit record captured"
+    else
+        log_warn "Send-text audit record not found (check audit output)"
+    fi
+
+    # Step 6: Capture pane output for evidence
+    "$WA_BINARY" robot get-text "$pane_id" --tail 50 > "$scenario_dir/pane_text.txt" 2>&1 || true
+    if grep -q "$marker" "$scenario_dir/pane_text.txt" 2>/dev/null; then
+        log_pass "Marker observed in pane output"
+    else
+        log_warn "Marker not found in pane output"
+    fi
+
+    trap - EXIT
+    cleanup_prepare_commit_approvals
 
     return $result
 }
@@ -5122,6 +5326,9 @@ run_scenario() {
                 ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
+            ;;
+        prepare_commit_approvals)
+            run_scenario_prepare_commit_approvals "$scenario_dir" || result=$?
             ;;
         quickfix_suggestions)
             run_scenario_quickfix_suggestions "$scenario_dir" || result=$?

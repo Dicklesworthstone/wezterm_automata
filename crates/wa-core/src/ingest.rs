@@ -53,10 +53,9 @@ fn epoch_ms() -> i64 {
 /// Format: 32-character lowercase hex string (16 bytes / 128 bits)
 ///
 /// This approach:
-/// - Is idempotent: calling with same inputs produces same output
 /// - Is bounded: computed once at pane discovery, never updated
 /// - Is safe: purely read-based, no writes to WezTerm
-/// - Is auditable: deterministic from inputs
+/// - Is non-deterministic: random entropy is mixed in to avoid collisions
 #[must_use]
 pub fn generate_pane_uuid(domain: &str, pane_id: u64, created_at: i64) -> String {
     let mut hasher = Sha256::new();
@@ -226,7 +225,7 @@ pub struct PaneEntry {
 impl PaneEntry {
     /// Create a new pane entry
     ///
-    /// Generates a stable `pane_uuid` based on domain, pane_id, and creation time.
+    /// Generates a per-runtime `pane_uuid` based on domain, pane_id, and creation time.
     /// The UUID is assigned once and never changes for this pane's lifetime.
     #[must_use]
     pub fn new(

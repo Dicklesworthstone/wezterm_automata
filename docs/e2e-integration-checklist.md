@@ -31,6 +31,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - usage_limit_safe_pause
 - notification_webhook
 - policy_denial
+- prepare_commit_approvals
 - quickfix_suggestions
 - rules_explain_trace
 - stress_scale
@@ -75,8 +76,8 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 
 #### Safety/policy (wa-4vx.8)
 - [x] E2E: policy denies unsafe sends (alt-screen, recent gap, prompt not active). Scenario(s): policy_denial
-- [ ] E2E: approval allow-once flow works and is audited. Scenario(s): none
-- [ ] E2E: audit trail captures allow/deny decisions with redaction. Scenario(s): none
+- [x] E2E: approval allow-once flow works and is audited. Scenario(s): prepare_commit_approvals
+- [x] E2E: audit trail captures allow/deny decisions with redaction. Scenario(s): prepare_commit_approvals (partial)
 - [ ] Artifacts: audit export slice, redaction proof scans (no secrets). Scenario(s): none
 
 ### Phase 2: Workflows

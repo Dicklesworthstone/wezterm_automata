@@ -48,7 +48,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Schema initialization SQL
 ///
@@ -290,6 +290,7 @@ CREATE TABLE IF NOT EXISTS audit_actions (
     ts INTEGER NOT NULL,               -- epoch ms
     actor_kind TEXT NOT NULL,          -- human, robot, mcp, workflow
     actor_id TEXT,                     -- optional (workflow execution id, MCP client id)
+    correlation_id TEXT,              -- optional chain/correlation identifier
     pane_id INTEGER REFERENCES panes(pane_id) ON DELETE SET NULL,
     domain TEXT,
     action_kind TEXT NOT NULL,         -- send_text, workflow_run, etc.
@@ -307,6 +308,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_actions_pane ON audit_actions(pane_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_actor ON audit_actions(actor_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_action ON audit_actions(action_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_decision ON audit_actions(policy_decision, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_actions_correlation ON audit_actions(correlation_id);
 
 -- Undo metadata for audit actions
 CREATE TABLE IF NOT EXISTS action_undo (
@@ -753,6 +755,20 @@ static MIGRATIONS: &[Migration] = &[
             DROP INDEX IF EXISTS idx_prepared_plans_workspace;
             DROP INDEX IF EXISTS idx_prepared_plans_hash;
             DROP TABLE IF EXISTS prepared_plans;
+        ",
+        ),
+    },
+    Migration {
+        version: 12,
+        description: "Add correlation_id to audit_actions for prepare/commit chains",
+        up_sql: r"
+            ALTER TABLE audit_actions ADD COLUMN correlation_id TEXT;
+            CREATE INDEX IF NOT EXISTS idx_audit_actions_correlation ON audit_actions(correlation_id);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_audit_actions_correlation;
+            ALTER TABLE audit_actions DROP COLUMN correlation_id;
         ",
         ),
     },
@@ -1368,6 +1384,8 @@ pub struct AuditActionRecord {
     pub actor_kind: String,
     /// Optional actor identifier (workflow id, MCP client id)
     pub actor_id: Option<String>,
+    /// Optional correlation identifier (prepare/approve/commit chain, etc.)
+    pub correlation_id: Option<String>,
     /// Pane ID (if action targeted a pane)
     pub pane_id: Option<u64>,
     /// Domain name (if applicable)
@@ -1453,6 +1471,8 @@ pub struct ActionHistoryRecord {
     pub actor_kind: String,
     /// Optional actor identifier (workflow id, MCP client id)
     pub actor_id: Option<String>,
+    /// Optional correlation identifier (prepare/approve/commit chain, etc.)
+    pub correlation_id: Option<String>,
     /// Pane ID (if action targeted a pane)
     pub pane_id: Option<u64>,
     /// Domain name (if applicable)
@@ -2234,6 +2254,19 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Existing database at version 0: apply full schema (idempotent via IF NOT EXISTS).
     // SCHEMA_SQL creates the complete current schema, so no incremental migrations needed.
     if current == 0 {
+        if table_exists(conn, "audit_actions")?
+            && !table_has_column(conn, "audit_actions", "correlation_id")?
+        {
+            conn.execute(
+                "ALTER TABLE audit_actions ADD COLUMN correlation_id TEXT;",
+                [],
+            )
+            .map_err(|e| {
+                StorageError::MigrationFailed(format!(
+                    "Failed to add correlation_id to audit_actions: {e}"
+                ))
+            })?;
+        }
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         set_user_version(conn, SCHEMA_VERSION)?;
@@ -2271,6 +2304,17 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     }
 
     Ok(false)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+    Ok(count > 0)
 }
 
 fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
@@ -2574,17 +2618,6 @@ fn now_epoch_ms() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let exists: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |row| row.get(0),
-        )
-        .map_err(|e| StorageError::Database(e.to_string()))?;
-    Ok(exists > 0)
 }
 
 fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
@@ -4489,6 +4522,8 @@ pub struct AuditQuery {
     pub actor_kind: Option<String>,
     /// Filter by actor identifier
     pub actor_id: Option<String>,
+    /// Filter by correlation identifier
+    pub correlation_id: Option<String>,
     /// Filter by action kind
     pub action_kind: Option<String>,
     /// Filter by policy decision
@@ -4516,6 +4551,8 @@ pub struct ActionHistoryQuery {
     pub actor_kind: Option<String>,
     /// Filter by actor identifier
     pub actor_id: Option<String>,
+    /// Filter by correlation identifier
+    pub correlation_id: Option<String>,
     /// Filter by action kind
     pub action_kind: Option<String>,
     /// Filter by policy decision
@@ -5283,14 +5320,15 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
     let ts = if action.ts == 0 { now_ms() } else { action.ts };
 
     conn.execute(
-        "INSERT INTO audit_actions (ts, actor_kind, actor_id, pane_id, domain, action_kind,
+        "INSERT INTO audit_actions (ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
          decision_context, result)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             ts,
             action.actor_kind.as_str(),
             action.actor_id.as_deref(),
+            action.correlation_id.as_deref(),
             pane_id_i64,
             action.domain.as_deref(),
             action.action_kind.as_str(),
@@ -7488,8 +7526,9 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
 /// Query audit actions with optional filters
 fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<AuditActionRecord>> {
     let mut sql = String::from(
-        "SELECT id, ts, actor_kind, actor_id, pane_id, domain, action_kind, policy_decision,
-         decision_reason, rule_id, input_summary, verification_summary, decision_context, result
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result
          FROM audit_actions WHERE 1=1",
     );
     let mut params: Vec<SqlValue> = Vec::new();
@@ -7510,6 +7549,10 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
     if let Some(actor_id) = &query.actor_id {
         sql.push_str(" AND actor_id = ?");
         params.push(SqlValue::Text(actor_id.clone()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(SqlValue::Text(correlation_id.clone()));
     }
     if let Some(action_kind) = &query.action_kind {
         sql.push_str(" AND action_kind = ?");
@@ -7551,20 +7594,21 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
                 ts: row.get(1)?,
                 actor_kind: row.get(2)?,
                 actor_id: row.get(3)?,
+                correlation_id: row.get(4)?,
                 pane_id: {
-                    let val: Option<i64> = row.get(4)?;
+                    let val: Option<i64> = row.get(5)?;
                     #[allow(clippy::cast_sign_loss)]
                     val.map(|v| v as u64)
                 },
-                domain: row.get(5)?,
-                action_kind: row.get(6)?,
-                policy_decision: row.get(7)?,
-                decision_reason: row.get(8)?,
-                rule_id: row.get(9)?,
-                input_summary: row.get(10)?,
-                verification_summary: row.get(11)?,
-                decision_context: row.get(12)?,
-                result: row.get(13)?,
+                domain: row.get(6)?,
+                action_kind: row.get(7)?,
+                policy_decision: row.get(8)?,
+                decision_reason: row.get(9)?,
+                rule_id: row.get(10)?,
+                input_summary: row.get(11)?,
+                verification_summary: row.get(12)?,
+                decision_context: row.get(13)?,
+                result: row.get(14)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Audit query failed: {e}")))?;
@@ -7583,9 +7627,10 @@ fn query_action_history(
     query: &ActionHistoryQuery,
 ) -> Result<Vec<ActionHistoryRecord>> {
     let mut sql = String::from(
-        "SELECT id, ts, actor_kind, actor_id, pane_id, domain, action_kind, policy_decision,
-         decision_reason, rule_id, input_summary, verification_summary, decision_context, result,
-         undoable, undo_strategy, undo_hint, undone_at, undone_by, workflow_id, step_name
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result, undoable, undo_strategy, undo_hint, undone_at, undone_by,
+         workflow_id, step_name
          FROM action_history WHERE 1=1",
     );
     let mut params: Vec<SqlValue> = Vec::new();
@@ -7606,6 +7651,10 @@ fn query_action_history(
     if let Some(actor_id) = &query.actor_id {
         sql.push_str(" AND actor_id = ?");
         params.push(SqlValue::Text(actor_id.clone()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(SqlValue::Text(correlation_id.clone()));
     }
     if let Some(action_kind) = &query.action_kind {
         sql.push_str(" AND action_kind = ?");
@@ -7654,30 +7703,31 @@ fn query_action_history(
                 ts: row.get(1)?,
                 actor_kind: row.get(2)?,
                 actor_id: row.get(3)?,
+                correlation_id: row.get(4)?,
                 pane_id: {
-                    let val: Option<i64> = row.get(4)?;
+                    let val: Option<i64> = row.get(5)?;
                     #[allow(clippy::cast_sign_loss)]
                     val.map(|v| v as u64)
                 },
-                domain: row.get(5)?,
-                action_kind: row.get(6)?,
-                policy_decision: row.get(7)?,
-                decision_reason: row.get(8)?,
-                rule_id: row.get(9)?,
-                input_summary: row.get(10)?,
-                verification_summary: row.get(11)?,
-                decision_context: row.get(12)?,
-                result: row.get(13)?,
+                domain: row.get(6)?,
+                action_kind: row.get(7)?,
+                policy_decision: row.get(8)?,
+                decision_reason: row.get(9)?,
+                rule_id: row.get(10)?,
+                input_summary: row.get(11)?,
+                verification_summary: row.get(12)?,
+                decision_context: row.get(13)?,
+                result: row.get(14)?,
                 undoable: {
-                    let val: Option<i64> = row.get(14)?;
+                    let val: Option<i64> = row.get(15)?;
                     val.map(|v| v != 0)
                 },
-                undo_strategy: row.get(15)?,
-                undo_hint: row.get(16)?,
-                undone_at: row.get(17)?,
-                undone_by: row.get(18)?,
-                workflow_id: row.get(19)?,
-                step_name: row.get(20)?,
+                undo_strategy: row.get(16)?,
+                undo_hint: row.get(17)?,
+                undone_at: row.get(18)?,
+                undone_by: row.get(19)?,
+                workflow_id: row.get(20)?,
+                step_name: row.get(21)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Action history query failed: {e}")))?;
@@ -9331,6 +9381,7 @@ mod tests {
             ts: 1_700_000_000_000,
             actor_kind: "human".to_string(),
             actor_id: Some("user-1".to_string()),
+            correlation_id: None,
             pane_id: Some(42),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -9356,6 +9407,7 @@ mod tests {
             ts: 1_700_000_000_000,
             actor_kind: "robot".to_string(),
             actor_id: None,
+            correlation_id: None,
             pane_id: Some(1),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -9408,6 +9460,7 @@ mod tests {
             ts: now_ms,
             actor_kind: "human".to_string(),
             actor_id: Some("cli".to_string()),
+            correlation_id: None,
             pane_id: Some(1),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -9455,6 +9508,7 @@ mod tests {
             ts: now_ms,
             actor_kind: "human".to_string(),
             actor_id: Some("cli".to_string()),
+            correlation_id: None,
             pane_id: Some(1),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -9509,6 +9563,7 @@ mod tests {
             ts: 1_000,
             actor_kind: "human".to_string(),
             actor_id: None,
+            correlation_id: None,
             pane_id: Some(1),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -9553,6 +9608,7 @@ mod tests {
             ts: 1_000,
             actor_kind: "human".to_string(),
             actor_id: None,
+            correlation_id: None,
             pane_id: Some(1),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
@@ -10900,6 +10956,7 @@ async fn storage_handle_records_audit_action_redacted() {
         ts: 1_700_000_000_000,
         actor_kind: "robot".to_string(),
         actor_id: None,
+        correlation_id: None,
         pane_id: Some(1),
         domain: Some("local".to_string()),
         action_kind: "send_text".to_string(),

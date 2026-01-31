@@ -88,6 +88,9 @@ pub mod workflows;
 #[cfg(feature = "vendored")]
 pub mod vendored;
 
+#[cfg(feature = "vendored")]
+pub mod wezterm_native;
+
 #[cfg(feature = "browser")]
 pub mod browser;
 

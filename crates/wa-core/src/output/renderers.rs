@@ -960,6 +960,9 @@ impl AuditListRenderer {
         if let Some(actor_id) = &action.actor_id {
             output.push_str(&format!("  Actor ID:   {actor_id}\n"));
         }
+        if let Some(correlation_id) = &action.correlation_id {
+            output.push_str(&format!("  Correlation: {correlation_id}\n"));
+        }
         if let Some(pane_id) = action.pane_id {
             output.push_str(&format!("  Pane:       {pane_id}\n"));
         }
@@ -1428,6 +1431,7 @@ mod tests {
             ts: 1_737_446_400_000,
             actor_kind: "human".to_string(),
             actor_id: None,
+            correlation_id: None,
             pane_id: Some(5),
             domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),

@@ -30,9 +30,14 @@ wa triage [--severity <error|warning|info>] [--only <section>] [--verbose]
 ```bash
 wa send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 wa send <pane_id> "<text>" --no-paste --no-newline
+wa prepare send --pane-id <id> "<text>"
+wa prepare workflow run <name> --pane-id <id>
+wa commit <plan_id> [--text "<text>"] [--text-file <path>] [--approval-code <code>]
 wa approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
 wa audit [--limit <n>] [--pane <id>] [--action <kind>] [--decision <allow|deny|require_approval>]
 ```
+
+See `docs/approvals.md` for the prepare/commit mental model and troubleshooting.
 
 ### Reservations
 

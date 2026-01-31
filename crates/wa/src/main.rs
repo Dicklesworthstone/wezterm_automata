@@ -542,6 +542,10 @@ SEE ALSO:
         #[arg(long, short = 'a')]
         actor: Option<String>,
 
+        /// Filter by correlation id (plan hash for prepare/commit chains)
+        #[arg(long, visible_alias = "plan-hash")]
+        correlation_id: Option<String>,
+
         /// Filter by action kind (send_text, workflow_run, approve_allow_once, etc.)
         #[arg(long, short = 'k')]
         action: Option<String>,
@@ -2990,6 +2994,7 @@ async fn evaluate_approve(
         ts: consumed_at,
         actor_kind: actor_kind.to_string(),
         actor_id: None,
+        correlation_id: None,
         pane_id: consumed_token.pane_id,
         domain: None,
         action_kind: "approve_allow_once".to_string(),
@@ -3426,6 +3431,32 @@ fn redact_prepare_plan(plan: &wa_core::plan::ActionPlan) -> wa_core::plan::Actio
     }
 
     redacted
+}
+
+fn prepare_audit_action_kind(action_kind: &str) -> String {
+    format!("prepare.{action_kind}")
+}
+
+fn commit_audit_action_kind(action_kind: &str) -> String {
+    format!("commit.{action_kind}")
+}
+
+fn build_plan_audit_context(
+    plan_id: &str,
+    plan_hash: &str,
+    stage: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+) -> String {
+    serde_json::json!({
+        "correlation_id": plan_hash,
+        "plan_id": plan_id,
+        "plan_hash": plan_hash,
+        "stage": stage,
+        "action_kind": action_kind,
+        "pane_id": pane_id,
+    })
+    .to_string()
 }
 
 fn redact_payload_field(
@@ -9124,7 +9155,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     wa_core::policy::ActorKind::Human,
                 )
                 .with_pane(pane_id)
-                .with_domain(domain)
+                .with_domain(domain.clone())
                 .with_capabilities(capabilities)
                 .with_text_summary(&summary)
                 .with_command_text(&text);
@@ -9216,6 +9247,36 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if let Err(e) = storage.insert_prepared_plan(record).await {
                     eprintln!("Error: Failed to store prepared plan: {e}");
                     std::process::exit(1);
+                }
+
+                let prepare_context = build_plan_audit_context(
+                    &plan_id,
+                    &plan_hash,
+                    "prepare",
+                    wa_core::policy::ActionKind::SendText.as_str(),
+                    Some(pane_id),
+                );
+                let prepare_audit = wa_core::storage::AuditActionRecord {
+                    id: 0,
+                    ts: now,
+                    actor_kind: "human".to_string(),
+                    actor_id: None,
+                    correlation_id: Some(plan_hash.clone()),
+                    pane_id: Some(pane_id),
+                    domain: Some(domain.clone()),
+                    action_kind: prepare_audit_action_kind(
+                        wa_core::policy::ActionKind::SendText.as_str(),
+                    ),
+                    policy_decision: decision.as_str().to_string(),
+                    decision_reason: decision.reason().map(String::from),
+                    rule_id: decision.rule_id().map(String::from),
+                    input_summary: Some(summary.clone()),
+                    verification_summary: None,
+                    decision_context: Some(prepare_context),
+                    result: "success".to_string(),
+                };
+                if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
+                    eprintln!("Warning: Failed to record prepare audit: {e}");
                 }
 
                 let commit_command = if let Some(approval) = &approval_request {
@@ -9399,6 +9460,36 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
 
+                    let prepare_context = build_plan_audit_context(
+                        &plan_id,
+                        &plan_hash,
+                        "prepare",
+                        wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                        Some(pane_id),
+                    );
+                    let prepare_audit = wa_core::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now,
+                        actor_kind: "human".to_string(),
+                        actor_id: None,
+                        correlation_id: Some(plan_hash.clone()),
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: prepare_audit_action_kind(
+                            wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                        ),
+                        policy_decision: decision.as_str().to_string(),
+                        decision_reason: decision.reason().map(String::from),
+                        rule_id: decision.rule_id().map(String::from),
+                        input_summary: Some(format!("workflow={name}")),
+                        verification_summary: None,
+                        decision_context: Some(prepare_context),
+                        result: "success".to_string(),
+                    };
+                    if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
+                        eprintln!("Warning: Failed to record prepare audit: {e}");
+                    }
+
                     let commit_command = if let Some(approval) = &approval_request {
                         format!(
                             "wa commit {plan_id} --approval-code {}",
@@ -9559,6 +9650,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         timeout_secs,
                     );
                     let plan_hash = plan.compute_hash();
+                    let correlation_id = plan_hash.clone();
+                    let commit_context = build_plan_audit_context(
+                        &plan_id,
+                        &plan_hash,
+                        "commit",
+                        wa_core::policy::ActionKind::SendText.as_str(),
+                        Some(pane_id),
+                    );
                     if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
                         exit_on_commit_validation_error(err, &plan_id);
                     }
@@ -9618,7 +9717,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             config.safety.approval.clone(),
                             workspace_id.clone(),
                         );
-                        match store.consume(code, &input).await {
+                        let approval_context = wa_core::approval::ApprovalAuditContext {
+                            correlation_id: Some(correlation_id.clone()),
+                            decision_context: Some(build_plan_audit_context(
+                                &plan_id,
+                                &plan_hash,
+                                "approval",
+                                wa_core::policy::ActionKind::SendText.as_str(),
+                                Some(pane_id),
+                            )),
+                        };
+                        match store
+                            .consume_with_context(code, &input, Some(approval_context))
+                            .await
+                        {
                             Ok(Some(_)) => {
                                 decision = wa_core::policy::PolicyDecision::allow_with_rule(
                                     "approval.allow_once",
@@ -9654,6 +9766,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .send_text_with_options(pane_id, &text, no_paste, no_newline)
                         .await;
 
+                    let decision_for_audit = decision.clone();
                     let injection = match send_result {
                         Ok(()) => wa_core::policy::InjectionResult::Allowed {
                             decision,
@@ -9675,6 +9788,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         None,
                         Some(domain.clone()),
                     );
+                    audit_record.correlation_id = Some(correlation_id.clone());
                     audit_record.input_summary = Some(
                         wa_core::policy::build_send_text_audit_summary(&text, None, None),
                     );
@@ -9682,49 +9796,89 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         tracing::warn!(pane_id, "Failed to record audit: {e}");
                     }
 
-                    if !injection.is_allowed() {
-                        eprintln!("Commit failed: send denied or errored.");
-                        std::process::exit(1);
-                    }
+                    let send_error = injection
+                        .error_message()
+                        .map(|message| format!("send_error={message}"));
+                    let mut wait_summary: Option<String> = None;
 
-                    if let Some(pattern) = &wait_for {
-                        let matcher = if wait_for_regex {
-                            match fancy_regex::Regex::new(pattern) {
-                                Ok(compiled) => {
-                                    Some(wa_core::wezterm::WaitMatcher::regex(compiled))
+                    if injection.is_allowed() {
+                        if let Some(pattern) = &wait_for {
+                            let matcher = if wait_for_regex {
+                                match fancy_regex::Regex::new(pattern) {
+                                    Ok(compiled) => {
+                                        Some(wa_core::wezterm::WaitMatcher::regex(compiled))
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: Invalid wait-for regex: {e}");
+                                        None
+                                    }
                                 }
-                                Err(e) => {
-                                    eprintln!("Warning: Invalid wait-for regex: {e}");
-                                    None
+                            } else {
+                                Some(wa_core::wezterm::WaitMatcher::substring(pattern))
+                            };
+
+                            if let Some(matcher) = matcher {
+                                let options = wa_core::wezterm::WaitOptions {
+                                    tail_lines: 200,
+                                    escapes: false,
+                                    ..wa_core::wezterm::WaitOptions::default()
+                                };
+                                let waiter = wa_core::wezterm::PaneWaiter::new(&wezterm)
+                                    .with_options(options);
+                                let timeout = std::time::Duration::from_secs(timeout_secs);
+                                match waiter.wait_for(pane_id, &matcher, timeout).await {
+                                    Ok(wa_core::wezterm::WaitResult::Matched { .. }) => {
+                                        println!("Commit succeeded (wait-for matched).");
+                                        wait_summary = Some("wait_for=matched".to_string());
+                                    }
+                                    Ok(wa_core::wezterm::WaitResult::TimedOut { .. }) => {
+                                        eprintln!("Commit succeeded but wait-for timed out.");
+                                        wait_summary = Some("wait_for=timed_out".to_string());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Commit succeeded but wait-for failed: {e}");
+                                        wait_summary = Some(format!("wait_for=error:{e}"));
+                                    }
                                 }
                             }
                         } else {
-                            Some(wa_core::wezterm::WaitMatcher::substring(pattern))
-                        };
-
-                        if let Some(matcher) = matcher {
-                            let options = wa_core::wezterm::WaitOptions {
-                                tail_lines: 200,
-                                escapes: false,
-                                ..wa_core::wezterm::WaitOptions::default()
-                            };
-                            let waiter =
-                                wa_core::wezterm::PaneWaiter::new(&wezterm).with_options(options);
-                            let timeout = std::time::Duration::from_secs(timeout_secs);
-                            match waiter.wait_for(pane_id, &matcher, timeout).await {
-                                Ok(wa_core::wezterm::WaitResult::Matched { .. }) => {
-                                    println!("Commit succeeded (wait-for matched).");
-                                }
-                                Ok(wa_core::wezterm::WaitResult::TimedOut { .. }) => {
-                                    eprintln!("Commit succeeded but wait-for timed out.");
-                                }
-                                Err(e) => {
-                                    eprintln!("Commit succeeded but wait-for failed: {e}");
-                                }
-                            }
+                            println!("Commit succeeded.");
                         }
                     } else {
-                        println!("Commit succeeded.");
+                        eprintln!("Commit failed: send denied or errored.");
+                    }
+
+                    let commit_verification = wait_summary.or(send_error);
+                    let commit_result = if injection.is_allowed() {
+                        "success"
+                    } else {
+                        "failed"
+                    };
+                    let commit_audit = wa_core::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now,
+                        actor_kind: "human".to_string(),
+                        actor_id: None,
+                        correlation_id: Some(correlation_id.clone()),
+                        pane_id: Some(pane_id),
+                        domain: Some(domain.clone()),
+                        action_kind: commit_audit_action_kind(
+                            wa_core::policy::ActionKind::SendText.as_str(),
+                        ),
+                        policy_decision: decision_for_audit.as_str().to_string(),
+                        decision_reason: decision_for_audit.reason().map(String::from),
+                        rule_id: decision_for_audit.rule_id().map(String::from),
+                        input_summary: Some(summary.clone()),
+                        verification_summary: commit_verification,
+                        decision_context: Some(commit_context),
+                        result: commit_result.to_string(),
+                    };
+                    if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
+                        tracing::warn!(pane_id, "Failed to record commit audit: {e}");
+                    }
+
+                    if !injection.is_allowed() {
+                        std::process::exit(1);
                     }
                 }
                 PreparedPlanParams::WorkflowRun {
@@ -9763,6 +9917,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     )
                     .await;
                     let plan_hash = plan.compute_hash();
+                    let correlation_id = plan_hash.clone();
+                    let commit_context = build_plan_audit_context(
+                        &plan_id,
+                        &plan_hash,
+                        "commit",
+                        wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                        Some(pane_id),
+                    );
                     if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
                         exit_on_commit_validation_error(err, &plan_id);
                     }
@@ -9782,7 +9944,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .with_pane(pane_id)
                     .with_workflow(&workflow_name);
 
-                    let decision = engine.authorize(&input);
+                    let mut decision = engine.authorize(&input);
                     if decision.requires_approval() {
                         let Some(code) = approval_code.as_deref() else {
                             eprintln!("Error: Approval required (E_PLAN_APPROVAL_MISSING).");
@@ -9794,8 +9956,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             config.safety.approval.clone(),
                             workspace_id.clone(),
                         );
-                        match store.consume(code, &input).await {
-                            Ok(Some(_)) => {}
+                        let approval_context = wa_core::approval::ApprovalAuditContext {
+                            correlation_id: Some(correlation_id.clone()),
+                            decision_context: Some(build_plan_audit_context(
+                                &plan_id,
+                                &plan_hash,
+                                "approval",
+                                wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                                Some(pane_id),
+                            )),
+                        };
+                        match store
+                            .consume_with_context(code, &input, Some(approval_context))
+                            .await
+                        {
+                            Ok(Some(_)) => {
+                                decision = wa_core::policy::PolicyDecision::allow_with_rule(
+                                    "approval.allow_once",
+                                );
+                            }
                             Ok(None) => {
                                 eprintln!("Error: Invalid or expired approval code.");
                                 std::process::exit(1);
@@ -9878,7 +10057,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .await;
                     let elapsed = run_start.elapsed();
 
-                    match result {
+                    let (commit_result, commit_verification, exit_code) = match result {
                         wa_core::workflows::WorkflowExecutionResult::Completed {
                             steps_executed,
                             ..
@@ -9889,6 +10068,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 elapsed.as_secs_f64()
                             );
                             println!("Execution ID: {execution_id}");
+                            (
+                                "success",
+                                Some(format!("steps_executed={steps_executed}")),
+                                None,
+                            )
                         }
                         wa_core::workflows::WorkflowExecutionResult::Aborted {
                             reason,
@@ -9901,7 +10085,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             eprintln!(
                                 "\nHint: Use 'wa workflow status {execution_id}' for details."
                             );
-                            std::process::exit(1);
+                            (
+                                "failed",
+                                Some(format!("aborted step={step_index} reason={reason}")),
+                                Some(1),
+                            )
                         }
                         wa_core::workflows::WorkflowExecutionResult::PolicyDenied {
                             reason,
@@ -9911,13 +10099,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             eprintln!("Commit denied by policy at step {step_index}");
                             eprintln!("Reason: {reason}");
                             eprintln!("Execution ID: {execution_id}");
-                            std::process::exit(1);
+                            (
+                                "denied",
+                                Some(format!("policy_denied step={step_index} reason={reason}")),
+                                Some(1),
+                            )
                         }
                         wa_core::workflows::WorkflowExecutionResult::Error { error, .. } => {
                             eprintln!("Commit failed: {error}");
                             eprintln!("Execution ID: {execution_id}");
-                            std::process::exit(1);
+                            ("failed", Some(format!("error={error}")), Some(1))
                         }
+                    };
+
+                    let commit_audit = wa_core::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now,
+                        actor_kind: "human".to_string(),
+                        actor_id: None,
+                        correlation_id: Some(correlation_id.clone()),
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: commit_audit_action_kind(
+                            wa_core::policy::ActionKind::WorkflowRun.as_str(),
+                        ),
+                        policy_decision: decision.as_str().to_string(),
+                        decision_reason: decision.reason().map(String::from),
+                        rule_id: decision.rule_id().map(String::from),
+                        input_summary: Some(format!("workflow={workflow_name}")),
+                        verification_summary: commit_verification,
+                        decision_context: Some(commit_context),
+                        result: commit_result.to_string(),
+                    };
+                    if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
+                        tracing::warn!(pane_id, "Failed to record commit audit: {e}");
+                    }
+
+                    if let Some(code) = exit_code {
+                        std::process::exit(code);
                     }
 
                     if let Err(e) = storage.shutdown().await {
@@ -10107,6 +10326,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             limit,
             pane_id,
             actor,
+            correlation_id,
             action,
             decision,
             result,
@@ -10162,6 +10382,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 limit: Some(limit),
                 pane_id,
                 actor_kind: actor.clone(),
+                correlation_id: correlation_id.clone(),
                 action_kind: action.clone(),
                 policy_decision: decision.clone(),
                 result: result.clone(),
@@ -10177,6 +10398,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 if let Some(actor) = &actor {
                     eprintln!("Filter:    actor={actor}");
+                }
+                if let Some(correlation_id) = &correlation_id {
+                    eprintln!("Filter:    correlation_id={correlation_id}");
                 }
                 if let Some(action) = &action {
                     eprintln!("Filter:    action={action}");
@@ -11560,25 +11784,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { command }) => {
             mcp::run_mcp(command, &config, &workspace_root)?;
-        }
-
-        Some(Commands::Prepare { command: _ }) => {
-            // TODO: Implement prepare command (wa-upg.4 - action plan preview)
-            eprintln!("Error: 'wa prepare' is not yet implemented.");
-            eprintln!("This feature is planned for action plan preview workflow.");
-            return Err(anyhow::anyhow!("wa prepare not yet implemented"));
-        }
-
-        Some(Commands::Commit {
-            plan_id: _,
-            text: _,
-            text_file: _,
-            approval_code: _,
-        }) => {
-            // TODO: Implement commit command (wa-upg.4 - action plan execution)
-            eprintln!("Error: 'wa commit' is not yet implemented.");
-            eprintln!("This feature is planned for action plan execution workflow.");
-            return Err(anyhow::anyhow!("wa commit not yet implemented"));
         }
 
         None => {
