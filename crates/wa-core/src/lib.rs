@@ -100,6 +100,7 @@ pub mod browser;
 pub mod tui;
 
 #[cfg(feature = "web")]
+#[path = "web/mod.rs"]
 pub mod web;
 
 #[cfg(feature = "distributed")]
@@ -107,9 +108,6 @@ pub mod distributed;
 
 #[cfg(feature = "sync")]
 pub mod sync;
-
-#[cfg(feature = "web")]
-pub mod web;
 
 pub use error::{Error, Result, StorageError};
 

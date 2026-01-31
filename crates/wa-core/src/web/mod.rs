@@ -4,7 +4,7 @@
 //! management for graceful shutdown.
 
 use crate::{Error, Result, VERSION};
-use fastapi::{get, prelude::*, ServerConfig, ServerError, TcpServer};
+use fastapi::{ServerConfig, ServerError, TcpServer, get, prelude::*};
 use fastapi::core::{ControlFlow, Cx, Handler, Middleware, RequestContext, StartupOutcome};
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -227,7 +227,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut term = signal(SignalKind::terminate())
             .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;

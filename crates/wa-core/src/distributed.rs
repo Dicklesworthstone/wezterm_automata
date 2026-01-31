@@ -257,6 +257,8 @@ mod tests {
     #[cfg(feature = "distributed")]
     use tokio::net::TcpListener;
     #[cfg(feature = "distributed")]
+    use tokio::time::{Duration, timeout};
+    #[cfg(feature = "distributed")]
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     #[cfg(feature = "distributed")]
@@ -380,5 +382,110 @@ mod tests {
 
         let received = server_task.await.expect("join");
         assert_eq!(&received, b"ok");
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn tls_handshake_rejects_untrusted_server() {
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+        let client_ca = temp_pem(CLIENT_CERT);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+
+        let server_config =
+            build_server_config(&config.tls, DistributedAuthMode::Token).expect("server config");
+        let client_config = build_client_config(
+            &config.tls,
+            DistributedAuthMode::Token,
+            Some(client_ca.path()),
+        )
+        .expect("client config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let acceptor = TlsAcceptor::from(server_config);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await
+        });
+
+        let connector = TlsConnector::from(client_config);
+        let server_name = ServerName::try_from("localhost").expect("server name");
+        let client_result = connector
+            .connect(
+                server_name,
+                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            )
+            .await;
+
+        assert!(client_result.is_err());
+
+        let server_result = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server timeout")
+            .expect("join");
+        assert!(server_result.is_err());
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn mtls_handshake_rejects_missing_client_cert() {
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+        let client_ca = temp_pem(CLIENT_CERT);
+
+        let mut server_config = DistributedConfig::default();
+        server_config.enabled = true;
+        server_config.auth_mode = DistributedAuthMode::Mtls;
+        server_config.tls.enabled = true;
+        server_config.tls.cert_path = Some(server_cert.path().display().to_string());
+        server_config.tls.key_path = Some(server_key.path().display().to_string());
+        server_config.tls.client_ca_path = Some(client_ca.path().display().to_string());
+
+        let mut client_config = DistributedConfig::default();
+        client_config.enabled = true;
+        client_config.auth_mode = DistributedAuthMode::Token;
+        client_config.tls.enabled = true;
+
+        let server_tls =
+            build_server_config(&server_config.tls, server_config.auth_mode).expect("server");
+        let client_tls = build_client_config(
+            &client_config.tls,
+            client_config.auth_mode,
+            Some(server_cert.path()),
+        )
+        .expect("client");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let acceptor = TlsAcceptor::from(server_tls);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await
+        });
+
+        let connector = TlsConnector::from(client_tls);
+        let server_name = ServerName::try_from("localhost").expect("server name");
+        let client_result = connector
+            .connect(
+                server_name,
+                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            )
+            .await;
+
+        assert!(client_result.is_err());
+
+        let server_result = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server timeout")
+            .expect("join");
+        assert!(server_result.is_err());
     }
 }
