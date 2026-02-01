@@ -53,26 +53,22 @@ pub fn validate_user_code(code: &str) -> Result<String, UserCodeError> {
     // Normalize to uppercase
     let normalized = trimmed.to_ascii_uppercase();
 
-    // Check format: XXXX-XXXX where X is an ASCII letter
+    // Check format: 4+ alphanumeric, hyphen, 4+ alphanumeric
     let parts: Vec<&str> = normalized.split('-').collect();
     if parts.len() != 2 {
         return Err(UserCodeError::InvalidFormat {
-            code: trimmed.to_string(),
-            expected: "XXXX-XXXX (4 letters, hyphen, 4 letters)".to_string(),
+            expected: "XXXX-YYYY (4+ alphanumeric, hyphen, 4+ alphanumeric)".to_string(),
         });
     }
 
     for part in &parts {
-        if part.len() != 4 {
+        if part.len() < 4 {
             return Err(UserCodeError::InvalidFormat {
-                code: trimmed.to_string(),
-                expected: "XXXX-XXXX (4 letters, hyphen, 4 letters)".to_string(),
+                expected: "XXXX-YYYY (4+ alphanumeric, hyphen, 4+ alphanumeric)".to_string(),
             });
         }
-        if !part.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(UserCodeError::InvalidCharacters {
-                code: trimmed.to_string(),
-            });
+        if !part.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(UserCodeError::InvalidCharacters);
         }
     }
 
@@ -84,23 +80,23 @@ pub fn validate_user_code(code: &str) -> Result<String, UserCodeError> {
 pub enum UserCodeError {
     /// Code string was empty or whitespace-only.
     Empty,
-    /// Code did not match the expected XXXX-XXXX format.
-    InvalidFormat { code: String, expected: String },
-    /// Code contained non-ASCII-alphabetic characters in letter positions.
-    InvalidCharacters { code: String },
+    /// Code did not match the expected XXXX-YYYY format.
+    InvalidFormat { expected: String },
+    /// Code contained non-ASCII or non-alphanumeric characters.
+    InvalidCharacters,
 }
 
 impl std::fmt::Display for UserCodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => write!(f, "user code is empty"),
-            Self::InvalidFormat { code, expected } => {
-                write!(f, "invalid user code format '{code}': expected {expected}")
+            Self::InvalidFormat { expected } => {
+                write!(f, "invalid user code format: expected {expected}")
             }
-            Self::InvalidCharacters { code } => {
+            Self::InvalidCharacters => {
                 write!(
                     f,
-                    "user code '{code}' contains invalid characters (expected ASCII letters only)"
+                    "user code contains invalid characters (expected ASCII letters or digits only)"
                 )
             }
         }
@@ -849,6 +845,18 @@ mod tests {
     }
 
     #[test]
+    fn validate_valid_code_with_digits() {
+        let result = validate_user_code("AB12-CD34");
+        assert_eq!(result.unwrap(), "AB12-CD34");
+    }
+
+    #[test]
+    fn validate_valid_code_longer_parts() {
+        let result = validate_user_code("WXYZ-98765");
+        assert_eq!(result.unwrap(), "WXYZ-98765");
+    }
+
+    #[test]
     fn validate_code_with_whitespace() {
         let result = validate_user_code("  ABCD-EFGH  ");
         assert_eq!(result.unwrap(), "ABCD-EFGH");
@@ -879,27 +887,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_too_long_parts() {
-        let result = validate_user_code("ABCDE-FGHIJ");
-        assert!(matches!(result, Err(UserCodeError::InvalidFormat { .. })));
-    }
-
-    #[test]
-    fn validate_digits_in_code() {
+    fn validate_digits_in_code_allowed() {
         let result = validate_user_code("AB12-CD34");
-        assert!(matches!(
-            result,
-            Err(UserCodeError::InvalidCharacters { .. })
-        ));
+        assert_eq!(result.unwrap(), "AB12-CD34");
     }
 
     #[test]
     fn validate_special_chars() {
         let result = validate_user_code("AB@D-EF!H");
-        assert!(matches!(
-            result,
-            Err(UserCodeError::InvalidCharacters { .. })
-        ));
+        assert!(matches!(result, Err(UserCodeError::InvalidCharacters)));
     }
 
     #[test]
@@ -912,7 +908,7 @@ mod tests {
     fn validate_unicode_letters() {
         // Unicode letters should fail (only ASCII allowed)
         let result = validate_user_code("ÀBCD-ÉFGH");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(UserCodeError::InvalidCharacters)));
     }
 
     // =========================================================================
@@ -928,20 +924,16 @@ mod tests {
     #[test]
     fn user_code_error_display_format() {
         let err = UserCodeError::InvalidFormat {
-            code: "BAD".to_string(),
-            expected: "XXXX-XXXX".to_string(),
+            expected: "XXXX-YYYY".to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("BAD"));
-        assert!(msg.contains("XXXX-XXXX"));
+        assert!(msg.contains("XXXX-YYYY"));
     }
 
     #[test]
     fn user_code_error_display_chars() {
-        let err = UserCodeError::InvalidCharacters {
-            code: "AB12-CD34".to_string(),
-        };
-        assert!(err.to_string().contains("AB12-CD34"));
+        let err = UserCodeError::InvalidCharacters;
+        assert!(err.to_string().contains("letters or digits"));
     }
 
     // =========================================================================
