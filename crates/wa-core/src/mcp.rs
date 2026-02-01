@@ -12,11 +12,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::accounts::AccountRecord;
+use crate::approval::ApprovalStore;
+use crate::caut::{CautClient, CautError, CautService};
 use crate::config::{Config, PaneFilterConfig};
 use crate::error::{Error, StorageError, WeztermError};
+use crate::ingest::Osc133State;
 use crate::patterns::{AgentType, PatternEngine};
+use crate::policy::{
+    ActionKind, ActorKind, InjectionResult, PaneCapabilities, PolicyDecision, PolicyEngine,
+    PolicyGatedInjector, PolicyInput,
+};
 use crate::storage::{EventQuery, PaneReservation, SearchOptions, StorageHandle};
-use crate::wezterm::{PaneInfo, WeztermClient};
+use crate::wezterm::{PaneInfo, PaneWaiter, WaitMatcher, WaitOptions, WaitResult, WeztermClient};
+use crate::workflows::{
+    HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
+    HandleSessionEnd, HandleUsageLimits, PaneWorkflowLockManager, WorkflowEngine,
+    WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+};
 
 const MCP_VERSION: &str = "v1";
 
@@ -31,6 +44,7 @@ const MCP_ERR_TIMEOUT: &str = "WA-MCP-0009";
 const MCP_ERR_NOT_IMPLEMENTED: &str = "WA-MCP-0010";
 const MCP_ERR_FTS_QUERY: &str = "WA-MCP-0011";
 const MCP_ERR_RESERVATION_CONFLICT: &str = "WA-MCP-0012";
+const MCP_ERR_CAUT: &str = "WA-MCP-0013";
 
 #[derive(Debug, Default, Deserialize)]
 struct StateParams {
@@ -166,6 +180,91 @@ struct McpEventItem {
     workflow_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SendParams {
+    pane_id: u64,
+    text: String,
+    #[serde(default)]
+    dry_run: bool,
+    wait_for: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default)]
+    wait_for_regex: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitForParams {
+    pane_id: u64,
+    pattern: String,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default = "default_wait_tail")]
+    tail: usize,
+    #[serde(default)]
+    regex: bool,
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+fn default_wait_tail() -> usize {
+    200
+}
+
+#[derive(Debug, Serialize)]
+struct McpWaitForData {
+    pane_id: u64,
+    pattern: String,
+    matched: bool,
+    elapsed_ms: u64,
+    polls: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    is_regex: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct McpSendData {
+    pane_id: u64,
+    injection: InjectionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_for: Option<McpWaitForData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_error: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunParams {
+    name: String,
+    pane_id: u64,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct McpWorkflowRunData {
+    workflow_name: String,
+    pane_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps_executed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RulesListParams {
     agent_type: Option<String>,
@@ -294,11 +393,26 @@ struct AccountsParams {
     service: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AccountsRefreshParams {
+    #[serde(default)]
+    service: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct McpAccountsData {
     accounts: Vec<McpAccountInfo>,
     total: usize,
     service: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpAccountsRefreshData {
+    service: String,
+    refreshed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_at: Option<String>,
+    accounts: Vec<McpAccountInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,6 +526,7 @@ pub fn build_server(config: &Config) -> Result<Server> {
 /// Build the MCP server with explicit db_path for tools that need storage access.
 pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
     let filter = config.ingest.panes.clone();
+    let config = Arc::new(config.clone());
     let db_path = db_path.map(Arc::new);
 
     let mut builder = Server::new("wezterm-automata", crate::VERSION)
@@ -425,6 +540,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         })
         .tool(WaStateTool::new(filter))
         .tool(WaGetTextTool)
+        .tool(WaWaitForTool)
         .tool(WaRulesListTool)
         .tool(WaRulesTestTool);
 
@@ -433,9 +549,18 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             .tool(WaSearchTool::new(Arc::clone(db_path)))
             .tool(WaEventsTool::new(Arc::clone(db_path)))
             .tool(WaReservationsTool::new(Arc::clone(db_path)))
-            .tool(WaReserveTool::new(Arc::clone(db_path)))
-            .tool(WaReleaseTool::new(Arc::clone(db_path)))
-            .tool(WaAccountsTool::new(Arc::clone(db_path)));
+            .tool(WaReserveTool::new(Arc::clone(&config), Arc::clone(db_path)))
+            .tool(WaReleaseTool::new(Arc::clone(&config), Arc::clone(db_path)))
+            .tool(WaSendTool::new(Arc::clone(&config), Arc::clone(db_path)))
+            .tool(WaWorkflowRunTool::new(
+                Arc::clone(&config),
+                Arc::clone(db_path),
+            ))
+            .tool(WaAccountsTool::new(Arc::clone(db_path)))
+            .tool(WaAccountsRefreshTool::new(
+                Arc::clone(&config),
+                Arc::clone(db_path),
+            ));
     }
 
     let server = builder.build();
@@ -640,6 +765,359 @@ fn apply_tail_truncation(text: &str, tail_lines: usize) -> (String, bool, Option
             returned_lines,
         }),
     )
+}
+
+// wa.wait_for tool
+struct WaWaitForTool;
+
+impl ToolHandler for WaWaitForTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.wait_for".to_string(),
+            description: Some("Wait for a pattern match in pane output (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to wait on" },
+                    "pattern": { "type": "string", "description": "Pattern to match (substring or regex)" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "Timeout in seconds" },
+                    "tail": { "type": "integer", "minimum": 0, "default": 200, "description": "Tail lines to search (0 = full buffer)" },
+                    "regex": { "type": "boolean", "default": false, "description": "Treat pattern as regex" }
+                },
+                "required": ["pane_id", "pattern"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: WaitForParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some(
+                        "Expected object with pane_id, pattern, timeout_secs, tail, regex"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let matcher = if params.regex {
+            match fancy_regex::Regex::new(&params.pattern) {
+                Ok(compiled) => WaitMatcher::regex(compiled),
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid regex pattern: {err}"),
+                        Some("Check the regex syntax".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        } else {
+            WaitMatcher::substring(&params.pattern)
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let pattern = params.pattern.clone();
+        let pane_id = params.pane_id;
+        let tail = params.tail;
+        let timeout_secs = params.timeout_secs;
+        let is_regex = params.regex;
+
+        let result = runtime.block_on(async move {
+            let wezterm = WeztermClient::new();
+            let panes = wezterm.list_panes().await?;
+            if !panes.iter().any(|p| p.pane_id == pane_id) {
+                return Err(WeztermError::PaneNotFound(pane_id).into());
+            }
+
+            let options = WaitOptions {
+                tail_lines: tail,
+                escapes: false,
+                ..WaitOptions::default()
+            };
+            let waiter = PaneWaiter::new(&wezterm).with_options(options);
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            waiter.wait_for(pane_id, &matcher, timeout).await
+        });
+
+        match result {
+            Ok(WaitResult::Matched { elapsed_ms, polls }) => {
+                let data = McpWaitForData {
+                    pane_id,
+                    pattern,
+                    matched: true,
+                    elapsed_ms,
+                    polls,
+                    is_regex,
+                };
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Ok(WaitResult::TimedOut {
+                elapsed_ms, polls, ..
+            }) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_TIMEOUT,
+                    format!(
+                        "Timeout waiting for pattern '{pattern}' after {elapsed_ms}ms ({polls} polls)"
+                    ),
+                    Some("Increase timeout_secs or verify the pattern.".to_string()),
+                    elapsed_ms(start),
+                );
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.send tool
+struct WaSendTool {
+    config: Arc<Config>,
+    db_path: Arc<PathBuf>,
+}
+
+impl WaSendTool {
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
+    }
+}
+
+impl ToolHandler for WaSendTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.send".to_string(),
+            description: Some("Send text to a pane with policy gating (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to send to" },
+                    "text": { "type": "string", "description": "Text to send" },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview without sending" },
+                    "wait_for": { "type": "string", "description": "Wait for a pattern after sending" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "Wait-for timeout (seconds)" },
+                    "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
+                },
+                "required": ["pane_id", "text"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: SendParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some(
+                        "Expected object with pane_id, text, dry_run, wait_for, timeout_secs, wait_for_regex"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let config = Arc::clone(&self.config);
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result = runtime.block_on(async move {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let wezterm = WeztermClient::new();
+            let pane_info = wezterm.get_pane(params.pane_id).await?;
+            let domain = pane_info.inferred_domain();
+
+            let resolution =
+                resolve_pane_capabilities(&config, Some(&storage), params.pane_id).await;
+            let capabilities = resolution.capabilities;
+
+            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+            let summary = engine.redact_secrets(&params.text);
+
+            let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
+                .with_pane(params.pane_id)
+                .with_domain(domain)
+                .with_capabilities(capabilities.clone())
+                .with_text_summary(summary.clone())
+                .with_command_text(&params.text);
+
+            if let Some(title) = &pane_info.title {
+                input = input.with_pane_title(title.clone());
+            }
+            if let Some(cwd) = &pane_info.cwd {
+                input = input.with_pane_cwd(cwd.clone());
+            }
+
+            if params.dry_run {
+                let decision = engine.authorize(&input);
+                let injection = injection_from_decision(
+                    decision,
+                    summary,
+                    params.pane_id,
+                    ActionKind::SendText,
+                );
+                return Ok(McpSendData {
+                    pane_id: params.pane_id,
+                    injection,
+                    wait_for: None,
+                    verification_error: None,
+                    dry_run: true,
+                });
+            }
+
+            let wezterm_for_injector = WeztermClient::new();
+            let mut injector =
+                PolicyGatedInjector::with_storage(engine, wezterm_for_injector, storage.clone());
+            let mut injection = injector
+                .send_text(
+                    params.pane_id,
+                    &params.text,
+                    ActorKind::Mcp,
+                    &capabilities,
+                    None,
+                )
+                .await;
+
+            if let InjectionResult::RequiresApproval {
+                decision,
+                summary,
+                pane_id,
+                action,
+                audit_action_id,
+            } = injection
+            {
+                let workspace_id = resolve_workspace_id(&config)?;
+                let store =
+                    ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                let updated = store
+                    .attach_to_decision(decision, &input, Some(summary.clone()))
+                    .await?;
+                injection = InjectionResult::RequiresApproval {
+                    decision: updated,
+                    summary,
+                    pane_id,
+                    action,
+                    audit_action_id,
+                };
+            }
+
+            let mut wait_for_data = None;
+            let mut verification_error = None;
+            if injection.is_allowed() {
+                if let Some(pattern) = params.wait_for.as_ref() {
+                    let matcher = if params.wait_for_regex {
+                        match fancy_regex::Regex::new(pattern) {
+                            Ok(compiled) => Some(WaitMatcher::regex(compiled)),
+                            Err(e) => {
+                                verification_error = Some(format!("Invalid wait-for regex: {e}"));
+                                None
+                            }
+                        }
+                    } else {
+                        Some(WaitMatcher::substring(pattern))
+                    };
+
+                    if let Some(matcher) = matcher {
+                        let options = WaitOptions {
+                            tail_lines: 200,
+                            escapes: false,
+                            ..WaitOptions::default()
+                        };
+                        let waiter = PaneWaiter::new(&wezterm).with_options(options);
+                        let timeout = std::time::Duration::from_secs(params.timeout_secs);
+                        match waiter.wait_for(params.pane_id, &matcher, timeout).await {
+                            Ok(WaitResult::Matched { elapsed_ms, polls }) => {
+                                wait_for_data = Some(McpWaitForData {
+                                    pane_id: params.pane_id,
+                                    pattern: pattern.clone(),
+                                    matched: true,
+                                    elapsed_ms,
+                                    polls,
+                                    is_regex: params.wait_for_regex,
+                                });
+                            }
+                            Ok(WaitResult::TimedOut {
+                                elapsed_ms, polls, ..
+                            }) => {
+                                wait_for_data = Some(McpWaitForData {
+                                    pane_id: params.pane_id,
+                                    pattern: pattern.clone(),
+                                    matched: false,
+                                    elapsed_ms,
+                                    polls,
+                                    is_regex: params.wait_for_regex,
+                                });
+                                verification_error =
+                                    Some(format!("Timeout waiting for pattern '{pattern}'"));
+                            }
+                            Err(e) => {
+                                verification_error = Some(format!("wait-for failed: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(McpSendData {
+                pane_id: params.pane_id,
+                injection,
+                wait_for: wait_for_data,
+                verification_error,
+                dry_run: false,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
 }
 
 // wa.search tool
@@ -891,6 +1369,244 @@ impl ToolHandler for WaEventsTool {
                 let (code, hint) = map_mcp_error(&err);
                 let envelope =
                     McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.workflow_run tool
+struct WaWorkflowRunTool {
+    config: Arc<Config>,
+    db_path: Arc<PathBuf>,
+}
+
+impl WaWorkflowRunTool {
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
+    }
+}
+
+impl ToolHandler for WaWorkflowRunTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.workflow_run".to_string(),
+            description: Some("Execute a workflow (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Workflow name" },
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "Target pane ID" },
+                    "force": { "type": "boolean", "default": false, "description": "Force run (bypass handled guard)" },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview without executing" }
+                },
+                "required": ["name", "pane_id"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "workflow".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: WorkflowRunParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected object with name, pane_id, force, dry_run".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let config = Arc::clone(&self.config);
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: Result<McpWorkflowRunData, McpToolError> = runtime.block_on(async move {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .map_err(McpToolError::from_error)?;
+            let storage = Arc::new(storage);
+
+            let wezterm = WeztermClient::new();
+            let pane_info = wezterm
+                .get_pane(params.pane_id)
+                .await
+                .map_err(McpToolError::from_error)?;
+            let domain = pane_info.inferred_domain();
+
+            let resolution =
+                resolve_pane_capabilities(&config, Some(storage.as_ref()), params.pane_id).await;
+            let capabilities = resolution.capabilities;
+
+            let mut policy_engine =
+                build_policy_engine(&config, config.safety.require_prompt_active);
+            let summary = format!("workflow run {}", params.name);
+
+            let mut input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
+                .with_pane(params.pane_id)
+                .with_domain(domain)
+                .with_capabilities(capabilities.clone())
+                .with_text_summary(summary.clone());
+
+            if let Some(title) = &pane_info.title {
+                input = input.with_pane_title(title.clone());
+            }
+            if let Some(cwd) = &pane_info.cwd {
+                input = input.with_pane_cwd(cwd.clone());
+            }
+
+            let decision = policy_engine.authorize(&input);
+            if decision.is_denied() {
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Workflow denied by policy")
+                    .to_string();
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+            }
+            if decision.requires_approval() {
+                let workspace_id =
+                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                let store = ApprovalStore::new(
+                    storage.as_ref(),
+                    config.safety.approval.clone(),
+                    workspace_id,
+                );
+                let updated = store
+                    .attach_to_decision(decision, &input, Some(summary))
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let reason = policy_reason(&updated)
+                    .unwrap_or("Workflow requires approval")
+                    .to_string();
+                let hint = approval_command(&updated);
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+            }
+
+            if params.dry_run {
+                return Ok(McpWorkflowRunData {
+                    workflow_name: params.name,
+                    pane_id: params.pane_id,
+                    execution_id: None,
+                    status: "dry_run".to_string(),
+                    message: Some("Dry-run: workflow not executed".to_string()),
+                    result: None,
+                    steps_executed: None,
+                    step_index: None,
+                    elapsed_ms: Some(elapsed_ms(start)),
+                });
+            }
+
+            let engine = WorkflowEngine::new(10);
+            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+            let injector_engine = build_policy_engine(&config, config.safety.require_prompt_active);
+            let injector = Arc::new(tokio::sync::Mutex::new(PolicyGatedInjector::with_storage(
+                injector_engine,
+                WeztermClient::new(),
+                storage.as_ref().clone(),
+            )));
+            let runner = WorkflowRunner::new(
+                engine,
+                lock_manager,
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+            register_builtin_workflows(&runner, &config);
+
+            let _ = params.force;
+            let workflow = runner.find_workflow_by_name(&params.name).ok_or_else(|| {
+                McpToolError::new(
+                    MCP_ERR_WORKFLOW,
+                    format!("Workflow '{}' not found", params.name),
+                    Some(
+                        "Ensure workflows are enabled or run wa watch for event-driven workflows."
+                            .to_string(),
+                    ),
+                )
+            })?;
+
+            let execution_id = format!("mcp-{}-{}", params.name, now_ms());
+            let result = runner
+                .run_workflow(params.pane_id, workflow, &execution_id, 0)
+                .await;
+
+            let (status, message, result_value, steps_executed, step_index) = match result {
+                WorkflowExecutionResult::Completed {
+                    result,
+                    steps_executed,
+                    ..
+                } => ("completed", None, Some(result), Some(steps_executed), None),
+                WorkflowExecutionResult::Aborted {
+                    reason, step_index, ..
+                } => ("aborted", Some(reason), None, None, Some(step_index)),
+                WorkflowExecutionResult::PolicyDenied {
+                    reason, step_index, ..
+                } => ("policy_denied", Some(reason), None, None, Some(step_index)),
+                WorkflowExecutionResult::Error { error, .. } => {
+                    ("error", Some(error), None, None, None)
+                }
+            };
+
+            Ok(McpWorkflowRunData {
+                workflow_name: params.name,
+                pane_id: params.pane_id,
+                execution_id: Some(execution_id),
+                status: status.to_string(),
+                message,
+                result: result_value,
+                steps_executed,
+                step_index,
+                elapsed_ms: Some(elapsed_ms(start)),
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let status = data.status.as_str();
+                if status == "completed" || status == "dry_run" {
+                    let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                    envelope_to_content(envelope)
+                } else if status == "policy_denied" {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_POLICY,
+                        "Workflow denied by policy".to_string(),
+                        Some("Review safety configuration or use dry_run.".to_string()),
+                        elapsed_ms(start),
+                    );
+                    envelope_to_content(envelope)
+                } else {
+                    let message = data
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "workflow failed".to_string());
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_WORKFLOW,
+                        message,
+                        None,
+                        elapsed_ms(start),
+                    );
+                    envelope_to_content(envelope)
+                }
+            }
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -1179,12 +1895,13 @@ impl ToolHandler for WaReservationsTool {
 
 // wa.reserve tool - create a pane reservation
 struct WaReserveTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaReserveTool {
-    fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -1226,22 +1943,59 @@ impl ToolHandler for WaReserveTool {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
                     format!("Invalid params: {err}"),
-                    Some("Expected object with pane_id, owner_kind, owner_id (required), reason, ttl_ms".to_string()),
+                    Some(
+                        "Expected object with pane_id, owner_kind, owner_id (required), reason, ttl_ms"
+                            .to_string(),
+                    ),
                     elapsed_ms(start),
                 );
                 return envelope_to_content(envelope);
             }
         };
 
+        let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            storage
+        let result: Result<McpReserveData, McpToolError> = runtime.block_on(async move {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .map_err(McpToolError::from_error)?;
+
+            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+            let mut input = PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
+                .with_pane(params.pane_id)
+                .with_capabilities(PaneCapabilities::unknown())
+                .with_text_summary(format!("reserve pane {}", params.pane_id));
+            input = input.with_command_text("reserve_pane");
+
+            let decision = engine.authorize(&input);
+            if decision.is_denied() {
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Reservation denied by policy")
+                    .to_string();
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+            }
+            if decision.requires_approval() {
+                let workspace_id =
+                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                let store =
+                    ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                let updated = store
+                    .attach_to_decision(decision, &input, None)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let reason = policy_reason(&updated)
+                    .unwrap_or("Reservation requires approval")
+                    .to_string();
+                let hint = approval_command(&updated);
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+            }
+
+            let reservation = storage
                 .create_reservation(
                     params.pane_id,
                     &params.owner_kind,
@@ -1250,28 +2004,29 @@ impl ToolHandler for WaReserveTool {
                     params.ttl_ms,
                 )
                 .await
+                .map_err(McpToolError::from_error)?;
+
+            Ok(McpReserveData {
+                reservation: reservation_to_mcp_info(&reservation),
+            })
         });
 
         match result {
-            Ok(reservation) => {
-                let data = McpReserveData {
-                    reservation: reservation_to_mcp_info(&reservation),
-                };
+            Ok(data) => {
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
             Err(err) => {
                 // Check if this is a conflict error
-                let (code, hint) = if err.to_string().contains("already has active reservation") {
+                let (code, hint) = if err.message.contains("already has active reservation") {
                     (
                         MCP_ERR_RESERVATION_CONFLICT,
                         Some("Use wa.reservations to check existing reservations".to_string()),
                     )
                 } else {
-                    map_mcp_error(&err)
+                    (err.code, err.hint)
                 };
-                let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                let envelope = McpEnvelope::<()>::error(code, err.message, hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -1280,12 +2035,13 @@ impl ToolHandler for WaReserveTool {
 
 // wa.release tool - release a pane reservation
 struct WaReleaseTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaReleaseTool {
-    fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -1330,30 +2086,77 @@ impl ToolHandler for WaReleaseTool {
             }
         };
 
+        let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
-        let result = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            storage.release_reservation(params.reservation_id).await
+        let result: Result<McpReleaseData, McpToolError> = runtime.block_on(async move {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .map_err(McpToolError::from_error)?;
+
+            let active = storage
+                .list_active_reservations()
+                .await
+                .map_err(McpToolError::from_error)?;
+            let pane_id = active
+                .iter()
+                .find(|r| r.id == params.reservation_id)
+                .map(|r| r.pane_id);
+
+            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+            let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
+                .with_capabilities(PaneCapabilities::unknown())
+                .with_text_summary(format!("release reservation {}", params.reservation_id));
+            if let Some(pane_id) = pane_id {
+                input = input.with_pane(pane_id);
+            }
+            input = input.with_command_text("release_reservation");
+
+            let decision = engine.authorize(&input);
+            if decision.is_denied() {
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Release denied by policy")
+                    .to_string();
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+            }
+            if decision.requires_approval() {
+                let workspace_id =
+                    resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                let store =
+                    ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
+                let updated = store
+                    .attach_to_decision(decision, &input, None)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let reason = policy_reason(&updated)
+                    .unwrap_or("Release requires approval")
+                    .to_string();
+                let hint = approval_command(&updated);
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+            }
+
+            let released = storage
+                .release_reservation(params.reservation_id)
+                .await
+                .map_err(McpToolError::from_error)?;
+            Ok(McpReleaseData {
+                reservation_id: params.reservation_id,
+                released,
+            })
         });
 
         match result {
-            Ok(released) => {
-                let data = McpReleaseData {
-                    reservation_id: params.reservation_id,
-                    released,
-                };
+            Ok(data) => {
                 let envelope = McpEnvelope::success(data, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
                 let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
@@ -1483,6 +2286,541 @@ impl ToolHandler for WaAccountsTool {
                 envelope_to_content(envelope)
             }
         }
+    }
+}
+
+// wa.accounts_refresh tool - refresh account usage via caut
+struct WaAccountsRefreshTool {
+    config: Arc<Config>,
+    db_path: Arc<PathBuf>,
+}
+
+impl WaAccountsRefreshTool {
+    fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
+    }
+}
+
+impl ToolHandler for WaAccountsRefreshTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.accounts_refresh".to_string(),
+            description: Some("Refresh account usage via caut (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string", "description": "Service name (openai)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "accounts".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: AccountsRefreshParams = if arguments.is_null() {
+            AccountsRefreshParams { service: None }
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(p) => p,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional service".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let config = Arc::clone(&self.config);
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: Result<McpAccountsRefreshData, McpToolError> = runtime.block_on(async move {
+            let service = params
+                .service
+                .unwrap_or_else(|| "openai".to_string());
+            let caut_service = parse_caut_service(&service).ok_or_else(|| {
+                McpToolError::new(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Unknown service: {service}"),
+                    Some("Supported services: openai".to_string()),
+                )
+            })?;
+
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .map_err(McpToolError::from_error)?;
+
+            let mut engine = build_policy_engine(&config, false);
+            let summary = format!("caut refresh {service}");
+            let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+                .with_text_summary(summary.clone())
+                .with_command_text(summary.clone());
+            let decision = engine.authorize(&input);
+            if decision.is_denied() {
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Refresh denied by policy")
+                    .to_string();
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+            }
+            if decision.requires_approval() {
+                let workspace_id = resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                let store = ApprovalStore::new(
+                    &storage,
+                    config.safety.approval.clone(),
+                    workspace_id,
+                );
+                let updated = store
+                    .attach_to_decision(decision, &input, Some(summary))
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let reason = policy_reason(&updated)
+                    .unwrap_or("Refresh requires approval")
+                    .to_string();
+                let hint = approval_command(&updated);
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+            }
+
+            if let Ok(accounts) = storage.get_accounts_by_service(&service).await {
+                let now_check = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let most_recent = accounts
+                    .iter()
+                    .map(|a| a.last_refreshed_at)
+                    .max()
+                    .unwrap_or(0);
+                if let Some((secs_ago, wait_secs)) =
+                    check_refresh_cooldown(most_recent, now_check, MCP_REFRESH_COOLDOWN_MS)
+                {
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        format!(
+                            "Refresh rate limited: last refresh was {secs_ago}s ago (cooldown: {}s)",
+                            MCP_REFRESH_COOLDOWN_MS / 1000
+                        ),
+                        Some(format!(
+                            "Wait {wait_secs}s before refreshing again, or use wa.accounts to view cached data."
+                        )),
+                    ));
+                }
+            }
+
+            let caut = CautClient::new();
+            let refresh_result = caut
+                .refresh(caut_service)
+                .await
+                .map_err(McpToolError::from_caut_error)?;
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+
+            let mut account_infos = Vec::new();
+            for usage in &refresh_result.accounts {
+                let record = AccountRecord::from_caut(usage, caut_service, now_ms);
+                if let Err(e) = storage.upsert_account(record.clone()).await {
+                    tracing::warn!("Failed to upsert account {}: {e}", record.account_id);
+                }
+                account_infos.push(McpAccountInfo {
+                    account_id: record.account_id,
+                    service: record.service,
+                    name: record.name,
+                    percent_remaining: record.percent_remaining,
+                    reset_at: record.reset_at,
+                    tokens_used: record.tokens_used,
+                    tokens_remaining: record.tokens_remaining,
+                    tokens_limit: record.tokens_limit,
+                    last_refreshed_at: record.last_refreshed_at,
+                    last_used_at: record.last_used_at,
+                });
+            }
+
+            Ok(McpAccountsRefreshData {
+                service,
+                refreshed_count: account_infos.len(),
+                refreshed_at: refresh_result.refreshed_at,
+                accounts: account_infos,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+const SEND_OSC_SEGMENT_LIMIT: usize = 200;
+const MCP_REFRESH_COOLDOWN_MS: i64 = 30_000;
+
+struct McpToolError {
+    code: &'static str,
+    message: String,
+    hint: Option<String>,
+}
+
+impl McpToolError {
+    fn new(code: &'static str, message: String, hint: Option<String>) -> Self {
+        Self {
+            code,
+            message,
+            hint,
+        }
+    }
+
+    fn from_error(err: &Error) -> Self {
+        let (code, hint) = map_mcp_error(err);
+        Self {
+            code,
+            message: err.to_string(),
+            hint,
+        }
+    }
+
+    fn from_caut_error(err: CautError) -> Self {
+        let (code, hint) = map_caut_error(&err);
+        Self {
+            code,
+            message: err.to_string(),
+            hint,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IpcPaneState {
+    pane_id: u64,
+    known: bool,
+    #[serde(default)]
+    observed: Option<bool>,
+    #[serde(default)]
+    alt_screen: Option<bool>,
+    #[serde(default)]
+    last_status_at: Option<i64>,
+    #[serde(default)]
+    in_gap: Option<bool>,
+    #[serde(default)]
+    cursor_alt_screen: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+struct CapabilityResolution {
+    capabilities: PaneCapabilities,
+    warnings: Vec<String>,
+}
+
+fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEngine {
+    PolicyEngine::new(
+        config.safety.rate_limit_per_pane,
+        config.safety.rate_limit_global,
+        require_prompt_active,
+    )
+    .with_command_gate_config(config.safety.command_gate.clone())
+    .with_policy_rules(config.safety.rules.clone())
+}
+
+fn injection_from_decision(
+    decision: PolicyDecision,
+    summary: String,
+    pane_id: u64,
+    action: ActionKind,
+) -> InjectionResult {
+    match decision {
+        PolicyDecision::Allow { .. } => InjectionResult::Allowed {
+            decision,
+            summary,
+            pane_id,
+            action,
+            audit_action_id: None,
+        },
+        PolicyDecision::Deny { .. } => InjectionResult::Denied {
+            decision,
+            summary,
+            pane_id,
+            action,
+            audit_action_id: None,
+        },
+        PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
+            decision,
+            summary,
+            pane_id,
+            action,
+            audit_action_id: None,
+        },
+    }
+}
+
+fn policy_reason(decision: &PolicyDecision) -> Option<&str> {
+    match decision {
+        PolicyDecision::Deny { reason, .. } | PolicyDecision::RequireApproval { reason, .. } => {
+            Some(reason)
+        }
+        _ => None,
+    }
+}
+
+fn approval_command(decision: &PolicyDecision) -> Option<String> {
+    match decision {
+        PolicyDecision::RequireApproval {
+            approval: Some(approval),
+            ..
+        } => Some(approval.command.clone()),
+        _ => None,
+    }
+}
+
+fn resolve_workspace_id(config: &Config) -> Result<String> {
+    let layout = config.workspace_layout(None)?;
+    Ok(layout.root.to_string_lossy().to_string())
+}
+
+fn parse_caut_service(service: &str) -> Option<CautService> {
+    match service {
+        "openai" => Some(CautService::OpenAI),
+        _ => None,
+    }
+}
+
+fn check_refresh_cooldown(
+    most_recent_refresh_ms: i64,
+    now_ms_val: i64,
+    cooldown_ms: i64,
+) -> Option<(i64, i64)> {
+    if most_recent_refresh_ms <= 0 {
+        return None;
+    }
+    let elapsed = now_ms_val - most_recent_refresh_ms;
+    if elapsed < cooldown_ms {
+        Some((elapsed / 1000, (cooldown_ms - elapsed) / 1000))
+    } else {
+        None
+    }
+}
+
+async fn derive_osc_state_from_storage(
+    storage: &StorageHandle,
+    pane_id: u64,
+) -> Result<Option<Osc133State>, String> {
+    let segments = storage
+        .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
+        .await
+        .map_err(|e| format!("failed to read segments: {e}"))?;
+    if segments.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = Osc133State::new();
+    for segment in segments.iter().rev() {
+        crate::ingest::process_osc133_output(&mut state, &segment.content);
+    }
+
+    if state.markers_seen == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(state))
+}
+
+#[cfg(unix)]
+async fn fetch_pane_state_from_ipc(
+    socket_path: &std::path::Path,
+    pane_id: u64,
+) -> Result<Option<IpcPaneState>, String> {
+    let client = crate::ipc::IpcClient::new(socket_path);
+    match client.pane_state(pane_id).await {
+        Ok(response) => {
+            if !response.ok {
+                let detail = response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(detail);
+            }
+            if let Some(data) = response.data {
+                serde_json::from_value::<IpcPaneState>(data)
+                    .map(Some)
+                    .map_err(|e| format!("invalid pane state payload: {e}"))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn fetch_pane_state_from_ipc(
+    _socket_path: &std::path::Path,
+    _pane_id: u64,
+) -> Result<Option<IpcPaneState>, String> {
+    Err("IPC not supported on this platform".to_string())
+}
+
+fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
+    if !state.known {
+        return None;
+    }
+    if let Some(cursor_state) = state.cursor_alt_screen {
+        return Some(cursor_state);
+    }
+    if state.last_status_at.is_some() {
+        return state.alt_screen;
+    }
+    None
+}
+
+async fn resolve_pane_capabilities(
+    config: &Config,
+    storage: Option<&StorageHandle>,
+    pane_id: u64,
+) -> CapabilityResolution {
+    let mut warnings = Vec::new();
+    let mut osc_state = None;
+
+    if let Some(storage) = storage {
+        match derive_osc_state_from_storage(storage, pane_id).await {
+            Ok(state) => osc_state = state,
+            Err(err) => warnings.push(format!("OSC 133 state unavailable: {err}")),
+        }
+    } else {
+        warnings.push("Storage unavailable; prompt state unknown.".to_string());
+    }
+
+    let mut alt_screen = None;
+    let mut in_gap = true;
+    let mut gap_known = false;
+
+    let ipc_socket_path = match config.workspace_layout(None) {
+        Ok(layout) => Some(layout.ipc_socket_path),
+        Err(err) => {
+            warnings.push(format!("Workspace layout unavailable: {err}"));
+            None
+        }
+    };
+
+    if let Some(socket_path) = ipc_socket_path.as_deref() {
+        match fetch_pane_state_from_ipc(socket_path, pane_id).await {
+            Ok(Some(state)) => {
+                if state.pane_id != pane_id {
+                    warnings.push(format!(
+                        "Watcher returned state for pane {} (expected {})",
+                        state.pane_id, pane_id
+                    ));
+                }
+                if !state.known {
+                    let reason = state.reason.as_deref().unwrap_or("unknown");
+                    warnings.push(format!("Watcher has no state for this pane ({reason})."));
+                } else if state.observed == Some(false) {
+                    warnings.push(
+                        "Pane is not observed by watcher; state may be incomplete.".to_string(),
+                    );
+                }
+                alt_screen = resolve_alt_screen_state(&state);
+                if state.in_gap.is_some() {
+                    gap_known = true;
+                    in_gap = state.in_gap.unwrap_or(true);
+                }
+                if alt_screen.is_none() {
+                    warnings
+                        .push("Alt-screen state unknown; approval may be required.".to_string());
+                }
+                if in_gap {
+                    if gap_known {
+                        warnings.push(
+                            "Recent capture gap detected; approval may be required.".to_string(),
+                        );
+                    } else {
+                        warnings.push(
+                            "Capture continuity unknown; treating as recent gap.".to_string(),
+                        );
+                    }
+                } else if !gap_known {
+                    warnings
+                        .push("Capture continuity unknown; treating as recent gap.".to_string());
+                }
+            }
+            Ok(None) => {
+                warnings.push("Watcher IPC returned no pane state.".to_string());
+            }
+            Err(err) => {
+                warnings.push(format!("Watcher IPC unavailable: {err}"));
+            }
+        }
+    } else {
+        warnings.push("IPC socket unavailable; alt-screen/gap unknown.".to_string());
+    }
+
+    let mut capabilities =
+        PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
+
+    if let Some(storage) = storage {
+        match storage.get_active_reservation(pane_id).await {
+            Ok(Some(reservation)) => {
+                capabilities.is_reserved = true;
+                capabilities.reserved_by = Some(reservation.owner_id);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warnings.push(format!("Reservation lookup failed: {err}"));
+            }
+        }
+    }
+
+    CapabilityResolution {
+        capabilities,
+        warnings,
+    }
+}
+
+fn register_builtin_workflows(runner: &WorkflowRunner, config: &Config) {
+    runner.register_workflow(Arc::new(
+        HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
+    ));
+    runner.register_workflow(Arc::new(HandleUsageLimits::new()));
+    runner.register_workflow(Arc::new(HandleSessionEnd::new()));
+    runner.register_workflow(Arc::new(HandleAuthRequired::new()));
+    runner.register_workflow(Arc::new(HandleClaudeCodeLimits::new()));
+    runner.register_workflow(Arc::new(HandleGeminiQuota::new()));
+}
+
+fn map_caut_error(error: &CautError) -> (&'static str, Option<String>) {
+    match error {
+        CautError::NotInstalled => (
+            MCP_ERR_CONFIG,
+            Some("Install caut and ensure it is on PATH.".to_string()),
+        ),
+        CautError::Timeout { .. } => (
+            MCP_ERR_TIMEOUT,
+            Some("Retry the refresh or increase caut timeout.".to_string()),
+        ),
+        _ => (MCP_ERR_CAUT, Some(error.remediation().summary.to_string())),
     }
 }
 
